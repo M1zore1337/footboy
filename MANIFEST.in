@@ -1,0 +1,7 @@
+include CHANGELOG.md .gitattributes .gitignore
+include .githooks/pre-commit
+recursive-include docs *.md
+global-exclude AGENT.md AGENTS.md
+prune .codex
+prune .agents
+prune .claude

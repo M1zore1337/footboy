@@ -1,0 +1,636 @@
+from __future__ import annotations
+
+import datetime as dt
+import math
+import queue
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+import cv2
+import numpy as np
+
+from footboy.mux.ffmpeg import FfmpegMuxer, _sanitize_ffmpeg_line
+from footboy.probe.ocr import ProbeConfig, StoppedClock
+from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
+from footboy.serve.http import ControlServer
+from footboy.sources.bili import BiliResolver
+from footboy.sources.media_probe import MediaProbeError, ffprobe_source
+from footboy.sources.models import Source
+from footboy.sources.sniffer import StreamSniffer
+from footboy.state import StateStore
+
+
+@dataclass(slots=True)
+class SupervisorConfig:
+    video_page_url: str
+    bili_room_url: str
+    output_dir: Path
+    state_file: Path
+    host: str = "0.0.0.0"
+    port: int = 8080
+    ffmpeg: str = "ffmpeg"
+    ffprobe: str = "ffprobe"
+    cookies_file: Path | None = None
+    ocr_backend: str = "auto"
+    tesseract_command: str | None = None
+    auto_measure: bool = True
+    initial_offset: float | None = None
+    verify_interval: float = 120.0
+    video_direct: bool = False
+    bili_direct: bool = False
+    video_headers: dict[str, str] = field(default_factory=dict)
+    bili_headers: dict[str, str] = field(default_factory=dict)
+    headless_sniff: bool = False
+
+
+class Supervisor:
+    """Own one session, applying worker results only to their source generation.
+
+    The event loop owns ffmpeg. Network/OCR workers cannot overwrite a newer
+    manual revision, and never block the HTTP controller.
+    """
+
+    def __init__(self, config: SupervisorConfig) -> None:
+        self.config = config
+        self.store = StateStore(config.state_file)
+        self.muxer = FfmpegMuxer(config.output_dir, ffmpeg=config.ffmpeg)
+        self.server = ControlServer(self, config.output_dir, host=config.host, port=config.port)
+        self.bili_resolver = BiliResolver(config.cookies_file)
+        self.sniffer = StreamSniffer(ffprobe=config.ffprobe)
+        self.video: Source | None = None
+        self.bili: Source | None = None
+        stored = self.store.offset(self._offset_key)
+        self.offset = config.initial_offset if config.initial_offset is not None else stored or 0.0
+        if not math.isfinite(self.offset):
+            raise ValueError("偏移必须是有限数值")
+        self.applied_offset: float | None = None
+        self.aligned = config.initial_offset is not None and not config.auto_measure
+        self.confidence: dict[str, Any] | None = {"method": "manual"} if self.aligned else None
+        self.last_verified_at: str | None = None
+        self.message = "尚未启动"
+        self.phase = "INIT"
+        self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._adjust_deadline: float | None = None
+        self._revision = 0
+        self._source_generation = 0
+        self._verify_candidate: float | None = None
+        self._video_http_failures = 0
+        self._last_dts_count = 0
+        self._last_segment_change = time.monotonic()
+        self._last_segment_signature: tuple[str, int] | None = None
+        self._last_anomaly_signature: tuple[str, int] | None = None
+        self._anomaly_active = False
+        self._next_verify = float("inf")
+        self._next_recover = 0.0
+        self._recovery_attempts = 0
+        self._measurement_thread: threading.Thread | None = None
+        self._measurement_cancel = threading.Event()
+        self._pending_measurement: str | None = None
+        self._refresh_thread: threading.Thread | None = None
+        self._preview_bytes: dict[str, bytes] = {}
+        self._preview_meta: dict[str, dict[str, Any]] = {}
+        self._needs_roi: list[str] = []
+
+    def run(self, *, serve: bool = True) -> None:
+        try:
+            if serve:
+                self.server.start()
+            self._bootstrap()
+            self._run_loop()
+        except Exception as exc:
+            if not self._stop.is_set():
+                self._set_phase("ERROR", f"启动失败: {_sanitize_ffmpeg_line(str(exc))}")
+        finally:
+            self._stop.set()
+            self.sniffer.stop()
+            self._measurement_cancel.set()
+            self.muxer.stop()
+            for worker in (self._measurement_thread, self._refresh_thread):
+                if worker is not None:
+                    worker.join(timeout=8)
+            if serve:
+                self.server.stop()
+            if self.phase != "ERROR":
+                self._set_phase("STOPPED", "任务已停止")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.sniffer.stop()
+        self._measurement_cancel.set()
+        self._events.put(("stop", None))
+        if self.phase not in {"STOPPED", "ERROR"}:
+            self._set_phase("STOPPING", "正在停止取流并刷新播放列表")
+
+    def request_offset_delta(self, delta_ms: int) -> None:
+        self._queue_adjust(delta_ms)
+
+    def request_remeasure(self) -> None:
+        self._events.put(("remeasure", None))
+
+    def request_resniff(self) -> None:
+        self._events.put(("resniff", None))
+
+    def request_select_source(self, identifier: int | None) -> None:
+        self.sniffer.select(identifier)
+
+    def request_roi(self, label: str, value: dict[str, Any]) -> None:
+        if label not in {"video", "bili"}:
+            raise ValueError("source 必须为 video 或 bili")
+        config = ProbeConfig.from_dict(value)
+        key = self._video_probe_key if label == "video" else self._bili_probe_key
+        with self._lock:
+            saved = self.store.source_probe(key) or {}
+            self.store.set_source_probe(key, {**saved, **config.to_dict()})
+            self._revision += 1
+            self._verify_candidate = None
+            self._needs_roi = [item for item in self._needs_roi if item != label]
+            self._measurement_cancel.set()
+        self._events.put(("remeasure", None))
+
+    def preview(self, label: str) -> bytes | None:
+        with self._lock:
+            return self._preview_bytes.get(label)
+
+    def public_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "state": self.phase,
+                "aligned": self.aligned,
+                "offset_seconds": round(self.offset, 3),
+                "applied_offset_seconds": self.applied_offset,
+                "adjust_pending": self._adjust_deadline is not None,
+                "confidence": self.confidence,
+                "last_verified_at": self.last_verified_at,
+                "message": self.message,
+                "ffmpeg": self.muxer.health.public_dict(),
+                "estimated_latency_seconds": "较慢源自身延迟 + HLS 缓冲约 6–10",
+                "video": self.video.public_dict() if self.video else None,
+                "bili": self.bili.public_dict() if self.bili else None,
+                "auto_measure": self.config.auto_measure,
+                "sniffer": self.sniffer.public_status(),
+                "measurement": {
+                    "running": self._measurement_thread is not None,
+                    "needs_roi": list(self._needs_roi),
+                    "sources": {
+                        label: {
+                            **self._preview_meta.get(label, {}),
+                            "config": self.store.source_probe(key),
+                        }
+                        for label, key in (
+                            ("video", self._video_probe_key),
+                            ("bili", self._bili_probe_key),
+                        )
+                    },
+                },
+            }
+
+    @property
+    def _offset_key(self) -> str:
+        domain = urlsplit(self.config.video_page_url).hostname or "unknown"
+        return f"{_bili_room_id(self.config.bili_room_url)}@{domain.lower()}"
+
+    @property
+    def _video_probe_key(self) -> str:
+        return f"video:{(urlsplit(self.config.video_page_url).hostname or 'unknown').lower()}"
+
+    @property
+    def _bili_probe_key(self) -> str:
+        return f"bili:{_bili_room_id(self.config.bili_room_url)}"
+
+    def _check_cancelled(self) -> None:
+        if self._stop.is_set():
+            raise RuntimeError("任务已取消")
+
+    def _resolve_bili(self) -> Source:
+        self._check_cancelled()
+        source = (
+            _direct_source(self.config.bili_room_url, self.config.bili_headers)
+            if self.config.bili_direct
+            else self.bili_resolver.resolve(self.config.bili_room_url)
+        )
+        self._check_cancelled()
+        ffprobe_source(source, ffprobe=self.config.ffprobe)
+        if not source.has_audio:
+            raise MediaProbeError("B站输入不含音频，请更换直播间或直链")
+        return source
+
+    def _sniff_video(self, *, headless: bool) -> Source:
+        self._check_cancelled()
+        saved = self.store.source_probe(self._video_probe_key) or {}
+        source = self.sniffer.sniff(
+            self.config.video_page_url,
+            preferred_line_text=self.video.line_text if self.video else saved.get("line_text"),
+            headless=headless,
+        )
+        self._check_cancelled()
+        if source.line_text:
+            latest = self.store.source_probe(self._video_probe_key) or {}
+            self.store.set_source_probe(
+                self._video_probe_key, {**latest, "line_text": source.line_text}
+            )
+        return source
+
+    def _bootstrap(self) -> None:
+        self._set_phase("RESOLVE", "正在解析并验收 B 站直播流")
+        self.bili = self._resolve_bili()
+        self._check_cancelled()
+        self._set_phase("SNIFF", "正在获取比赛画面，请在打开的浏览器里播放目标线路")
+        if self.config.video_direct:
+            self.video = _direct_source(self.config.video_page_url, self.config.video_headers)
+            ffprobe_source(self.video, ffprobe=self.config.ffprobe)
+        else:
+            self.video = self._sniff_video(headless=self.config.headless_sniff)
+        self._check_cancelled()
+        with self._lock:
+            self._source_generation += 1
+            self.muxer.start(self.video, self.bili, self.offset, fresh=True)
+            self.applied_offset = self.offset
+            self._adjust_deadline = None
+        self._reset_health_window()
+        self._set_phase("RUN", "混流已启动；可随时手动调整声音时间")
+        if self.config.auto_measure:
+            self._start_measurement("initial")
+
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                action, payload = self._events.get(timeout=0.2)
+            except queue.Empty:
+                action, payload = "tick", None
+            if action == "stop":
+                break
+            if action == "remeasure":
+                self._start_measurement("manual")
+            elif action == "resniff":
+                self._start_refresh(force_sniff=True)
+            elif action == "measurement_done":
+                self._finish_measurement(*payload)
+            elif action == "refresh_done":
+                self._finish_refresh(*payload)
+            now = time.monotonic()
+            if self._adjust_deadline is not None and now >= self._adjust_deadline:
+                if self._refresh_thread is None and self.muxer.health.running:
+                    try:
+                        self._apply_adjustment()
+                    except Exception as exc:
+                        self._recover(f"调整失败: {exc}")
+            if now >= self._next_verify and self._adjust_deadline is None:
+                if self._refresh_thread is None and self.muxer.health.running:
+                    self._start_measurement("verify")
+            self._check_health(time.monotonic())
+
+    def _queue_adjust(self, delta_ms: int) -> None:
+        if isinstance(delta_ms, bool) or not isinstance(delta_ms, int) or abs(delta_ms) > 300_000:
+            raise ValueError("delta_ms 必须是 ±300000 以内的整数")
+        with self._lock:
+            self.offset = round(self.offset + delta_ms / 1000.0, 3)
+            self._revision += 1
+            self._verify_candidate = None
+            self.aligned = True
+            self.confidence = {"method": "manual"}
+            self.message = "手动偏移已更新，1.5 秒后应用"
+            self._adjust_deadline = time.monotonic() + 1.5
+            self.store.set_offset(self._offset_key, self.offset)
+
+    def _apply_adjustment(self) -> None:
+        assert self.video is not None and self.bili is not None
+        with self._lock:
+            value, revision = self.offset, self._revision
+        self._set_phase("ADJUST", f"正在应用偏移 D={value:.3f}s")
+        self.muxer.restart(self.video, self.bili, value)
+        with self._lock:
+            self.applied_offset = value
+            if revision == self._revision:
+                self._adjust_deadline = None
+        self._reset_health_window()
+        self._set_phase("RUN", "偏移已应用，等待新分片后继续播放")
+
+    def _start_measurement(self, mode: str) -> None:
+        if self.video is None or self.bili is None or self._stop.is_set():
+            return
+        if self._refresh_thread is not None:
+            self._pending_measurement = mode
+            self._next_verify = float("inf")
+            return
+        if self._measurement_thread is not None:
+            if mode == "manual":
+                self._pending_measurement = mode
+                self._measurement_cancel.set()
+            return
+        with self._lock:
+            self._measurement_cancel = threading.Event()
+            cancellation = self._measurement_cancel
+            revision, generation = self._revision, self._source_generation
+            video, bili = self.video, self.bili
+            self._next_verify = float("inf")
+            self.message = "正在采样两路比赛时钟，播放和手动调节继续可用"
+
+        def capture_preview(label: str, frame: np.ndarray) -> None:
+            if cancellation.is_set() or self._stop.is_set():
+                return
+            height, width = frame.shape[:2]
+            image = frame
+            if width > 1280:
+                image = cv2.resize(frame, (1280, round(height * 1280 / width)))
+            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ok:
+                with self._lock:
+                    if generation == self._source_generation:
+                        self._preview_bytes[label] = encoded.tobytes()
+                        self._preview_meta[label] = {
+                            "available": True,
+                            "width": width,
+                            "height": height,
+                            "version": time.time_ns() // 1_000_000,
+                            "captured_at": _now_iso(),
+                        }
+
+        def worker() -> None:
+            result, error = None, None
+            try:
+                result = measure_offset(
+                    video,
+                    bili,
+                    state=self.store,
+                    video_key=self._video_probe_key,
+                    bili_key=self._bili_probe_key,
+                    ocr_backend=self.config.ocr_backend,
+                    tesseract_command=self.config.tesseract_command,
+                    allow_manual=False,
+                    on_preview=capture_preview,
+                    stop_event=cancellation,
+                    persist=False,
+                )
+            except Exception as exc:
+                error = exc
+            self._events.put(("measurement_done", (mode, revision, generation, result, error)))
+
+        self._measurement_thread = threading.Thread(target=worker, name="ocr-measure", daemon=True)
+        self._measurement_thread.start()
+
+    def _finish_measurement(
+        self,
+        mode: str,
+        revision: int,
+        generation: int,
+        result: OffsetMeasurement | None,
+        error: Exception | None,
+    ) -> None:
+        with self._lock:
+            self._apply_measurement_result(mode, revision, generation, result, error)
+
+    def _apply_measurement_result(
+        self,
+        mode: str,
+        revision: int,
+        generation: int,
+        result: OffsetMeasurement | None,
+        error: Exception | None,
+    ) -> None:
+        self._measurement_thread = None
+        self._schedule_verify()
+        if self._stop.is_set():
+            return
+        if self._pending_measurement:
+            if self._refresh_thread is not None:
+                return
+            pending, self._pending_measurement = self._pending_measurement, None
+            self._start_measurement(pending)
+            return
+        if revision != self._revision or generation != self._source_generation:
+            self.message = "已保留最新手动设置；过期的 OCR 结果已忽略"
+            self._verify_candidate = None
+            return
+        self.last_verified_at = _now_iso()
+        if error is not None:
+            self._verify_candidate = None
+            self.aligned = False
+            if isinstance(error, StoppedClock):
+                self.message = f"检测到停表，保留 D={self.offset:.3f}s；60 秒后重试"
+                self.confidence = {"method": "ocr", "stopped": True}
+                self._schedule_verify(delay=60)
+            else:
+                self.message = (
+                    f"未对齐，保留 D={self.offset:.3f}s：{_sanitize_ffmpeg_line(str(error))}"
+                )
+                self.confidence = None
+                self._needs_roi = error.needs_roi if isinstance(error, MeasurementError) else []
+            return
+        assert result is not None
+        for key, source_result in (
+            (self._video_probe_key, result.video),
+            (self._bili_probe_key, result.bili),
+        ):
+            saved = self.store.source_probe(key) or {}
+            self.store.set_source_probe(key, {**saved, **source_result.config.to_dict()})
+        self._needs_roi = []
+        self.confidence = {"method": "ocr", **result.confidence.public_dict()}
+        difference = result.offset - self.offset
+        if mode == "verify":
+            if abs(difference) <= 1.0:
+                self._verify_candidate = None
+                self.aligned = True
+                self.message = f"复核通过，偏移变化 {difference:+.3f}s"
+                return
+            previous = self._verify_candidate
+            if previous is None or abs(result.offset - previous) > 1.0:
+                self._verify_candidate = result.offset
+                self.aligned = False
+                self.message = f"检测到 {difference:+.3f}s 漂移，等待下一次复核确认"
+                return
+        self._verify_candidate = None
+        with self._lock:
+            self.offset = round(result.offset, 3)
+            self.aligned = True
+            self.store.set_offset(self._offset_key, self.offset)
+            if self.applied_offset is None or abs(self.offset - self.applied_offset) > 0.001:
+                self._adjust_deadline = time.monotonic() + 1.5
+            self.message = f"OCR 已锁定，D={self.offset:.3f}s"
+
+    def _schedule_verify(self, delay: float | None = None) -> None:
+        self._next_verify = (
+            time.monotonic() + (delay if delay is not None else self.config.verify_interval)
+            if self.config.auto_measure
+            else float("inf")
+        )
+
+    def _start_refresh(self, *, force_sniff: bool = False) -> None:
+        if self._refresh_thread is not None or self._stop.is_set():
+            return
+        assert self.video is not None
+        previous = self.video
+        if force_sniff and self.config.video_direct:
+            self.message = "当前使用直链；如需更换地址，请停止后重新连接"
+            return
+        self._set_phase("SNIFF" if force_sniff else "RECOVER", "正在重新获取直播源")
+        self._measurement_cancel.set()
+        self._source_generation += 1
+        self._verify_candidate = None
+        self.aligned = False
+
+        def worker() -> None:
+            sources, error = None, None
+            try:
+                bili = self._resolve_bili()
+                self._check_cancelled()
+                if force_sniff:
+                    video = self._sniff_video(headless=self.config.headless_sniff)
+                else:
+                    video = previous
+                    try:
+                        ffprobe_source(video, ffprobe=self.config.ffprobe)
+                    except MediaProbeError:
+                        self._video_http_failures += 1
+                        if self._video_http_failures < 2 or self.config.video_direct:
+                            raise
+                        video = self._sniff_video(headless=True)
+                    self._video_http_failures = 0
+                self._check_cancelled()
+                sources = (video, bili)
+            except Exception as exc:
+                error = exc
+            self._events.put(("refresh_done", (sources, error, force_sniff)))
+
+        self._refresh_thread = threading.Thread(target=worker, name="source-refresh", daemon=True)
+        self._refresh_thread.start()
+
+    def _finish_refresh(
+        self,
+        sources: tuple[Source, Source] | None,
+        error: Exception | None,
+        forced: bool,
+    ) -> None:
+        self._refresh_thread = None
+        if self._stop.is_set():
+            return
+        if error is not None:
+            self._recovery_attempts += 1
+            delay = min(30, 5 * self._recovery_attempts)
+            self._next_recover = time.monotonic() + delay
+            self._set_phase(
+                "RUN" if forced and self.muxer.health.running else "RECOVER",
+                f"取流失败，保留设置并在 {delay} 秒后重试: {_sanitize_ffmpeg_line(str(error))}",
+            )
+            return
+        assert sources is not None
+        self.video, self.bili = sources
+        try:
+            with self._lock:
+                value, revision = self.offset, self._revision
+            self.muxer.restart(self.video, self.bili, value)
+            with self._lock:
+                self.applied_offset = value
+                if revision == self._revision:
+                    self._adjust_deadline = None
+        except Exception as exc:
+            self._next_recover = time.monotonic() + 5
+            self.message = f"混流重启失败，5 秒后重试: {exc}"
+            return
+        self._recovery_attempts = 0
+        self._reset_health_window()
+        self._set_phase("RUN", "已使用上次偏移恢复，源时间轴需要重新确认")
+        if self.config.auto_measure:
+            if self._measurement_thread is not None:
+                self._pending_measurement = "initial"
+            else:
+                pending, self._pending_measurement = self._pending_measurement, None
+                self._start_measurement(pending or "initial")
+
+    def _reset_health_window(self) -> None:
+        self._last_segment_change = time.monotonic()
+        self._last_segment_signature = None
+        self._last_anomaly_signature = None
+        self._anomaly_active = False
+        self._last_dts_count = 0
+
+    def _check_health(self, now: float) -> None:
+        if self._refresh_thread is not None or now < self._next_recover:
+            return
+        code = self.muxer.poll()
+        if code is not None or not self.muxer.health.running:
+            self._recover(f"ffmpeg 已退出，code={code}")
+            return
+        signature = self._latest_segment_signature()
+        if signature is not None and signature != self._last_segment_signature:
+            self._last_segment_signature = signature
+            self._last_segment_change = now
+        # D contains the PTS origin difference, so abs(D) is not buffer time.
+        deadline = 150 if self._last_segment_signature is None else 30
+        if now - self._last_segment_change > deadline:
+            self._recover(f"{deadline} 秒没有新 HLS 分片")
+            return
+        dts_count = self.muxer.health.non_monotonic_dts
+        if dts_count - self._last_dts_count >= 20:
+            self._last_dts_count = dts_count
+            if self.config.auto_measure and self._measurement_thread is None:
+                self._next_verify = min(self._next_verify, now)
+        if signature != self._last_anomaly_signature:
+            self._last_anomaly_signature = signature
+            anomalous = self._playlist_duration_anomaly()
+            if anomalous and not self._anomaly_active and self.config.auto_measure:
+                self._next_verify = min(self._next_verify, now)
+            self._anomaly_active = anomalous
+
+    def _recover(self, reason: str) -> None:
+        if self._stop.is_set() or self._refresh_thread is not None:
+            return
+        self._set_phase("RECOVER", reason)
+        self.muxer.stop()
+        self.muxer.keep_playlist_live()
+        self._start_refresh()
+
+    def _latest_segment_signature(self) -> tuple[str, int] | None:
+        try:
+            paths = list(self.config.output_dir.iterdir())
+        except OSError:
+            return None
+        newest = None
+        for path in paths:
+            if path.name.startswith("seg_") and path.suffix in {".ts", ".m4s"}:
+                try:
+                    stamp = path.stat().st_mtime_ns
+                except OSError:
+                    continue
+                if self.muxer.health.started_at and stamp / 1e9 < self.muxer.health.started_at:
+                    continue
+                if newest is None or stamp > newest[1]:
+                    newest = (path.name, stamp)
+        return newest
+
+    def _playlist_duration_anomaly(self) -> bool:
+        try:
+            text = (self.config.output_dir / "live.m3u8").read_text(encoding="utf-8")
+            durations = [float(value) for value in re.findall(r"#EXTINF:([0-9.]+)", text)]
+        except (OSError, UnicodeError, ValueError):
+            return False
+        return bool(durations and max(durations) > 8.0)
+
+    def _set_phase(self, phase: str, message: str) -> None:
+        with self._lock:
+            self.phase, self.message = phase, message
+        print(f"[{phase}] {message}", flush=True)
+
+
+def _direct_source(url: str, headers: dict[str, str]) -> Source:
+    path = urlsplit(url).path.lower()
+    kind = "hls" if ".m3u8" in path else "flv" if ".flv" in path else "unknown"
+    return Source(url=url, headers=dict(headers), kind=kind)
+
+
+def _bili_room_id(url: str) -> str:
+    parts = urlsplit(url)
+    match = re.fullmatch(r"/(?:blanc/)?(\d+)/?", parts.path)
+    if parts.hostname == "live.bilibili.com" and match:
+        return match.group(1)
+    return (parts.hostname or "unknown") + parts.path
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")

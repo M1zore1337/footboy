@@ -1,0 +1,26 @@
+/.venv/
+/build/
+/dist/
+*.egg-info/
+/hls_out/*
+!/hls_out/.gitkeep
+/state.json
+/.pytest_cache/
+/.ruff_cache/
+/test-results/
+/playwright-report/
+/.coverage
+/htmlcov/
+/.env
+/.env.*
+*cookies*.txt
+*.log
+/**/__pycache__/
+*.py[cod]
+
+# 本地协作文件与工具配置
+AGENT.md
+AGENTS.md
+.codex
+.agents
+.claude

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if ! git cat-file -e :CHANGELOG.md 2>/dev/null; then
+    printf '%s\n' '提交必须包含 CHANGELOG.md；请记录本次变更并暂存。' >&2
+    exit 1
+fi
+if git diff --cached --quiet -- CHANGELOG.md; then
+    printf '%s\n' '每次提交都必须更新 CHANGELOG.md。请补充本次变更和验证结果，再 git add CHANGELOG.md。' >&2
+    exit 1
+fi
