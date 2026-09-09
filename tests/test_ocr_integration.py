@@ -75,6 +75,80 @@ def test_tesseract_stopped_clock_is_rejected():
         )
 
 
+def compact_clock_frames(*, flip="none"):
+    """Synthetic condensed digits with scoreboard clutter and a decoy countdown."""
+    frames = []
+    for index in range(7):
+        image = np.full((720, 1280, 3), (48, 92, 44), dtype=np.uint8)
+        cv2.rectangle(image, (330, 0), (950, 83), (15, 15, 15), -1)
+        cv2.putText(
+            image,
+            "TEAM A   11.2K   2 - 1   10.8K   TEAM B",
+            (355, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.rectangle(image, (0, 0), (150, 35), (15, 15, 15), -1)
+        cv2.putText(
+            image,
+            f"03:{30 - index * 3:02}",
+            (14, 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (245, 245, 245),
+            1,
+            cv2.LINE_AA,
+        )
+        clock = 281 + index * 3
+        glyph = np.zeros((50, 180, 3), dtype=np.uint8)
+        cv2.putText(
+            glyph,
+            f"{clock // 60:02}:{clock % 60:02}",
+            (3, 37),
+            cv2.FONT_HERSHEY_DUPLEX,
+            1.2,
+            (245, 245, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        x, y, w, h = cv2.boundingRect(cv2.findNonZero(cv2.cvtColor(glyph, cv2.COLOR_BGR2GRAY)))
+        image[53:69, 628:652] = cv2.resize(
+            glyph[y : y + h, x : x + w], (24, 16), interpolation=cv2.INTER_AREA
+        )
+        frames.append((1000.125 + index * 3, flip_frame(image, flip)))
+    return frames
+
+
+def test_tesseract_locates_small_top_center_clock_and_rejects_countdown():
+    result = probe_clock(compact_clock_frames(), TesseractBackend(TESSERACT), allow_manual=False)
+    assert result.k == pytest.approx(-719.125, abs=0.1)
+    assert len(result.samples) >= 3
+    x, y, width, height = result.config.roi
+    assert x < 0.5 < x + width and y < 0.08 < y + height
+    assert width < 0.1 and height < 0.1
+
+
+@pytest.mark.parametrize("flip", ["none", "h", "v", "hv"])
+def test_tesseract_retries_condensed_style_inside_saved_roi(flip):
+    saved = ProbeConfig((624 / 1280, 49 / 720, 32 / 1280, 24 / 720), flip, True)
+    result = probe_clock(
+        compact_clock_frames(flip=flip),
+        TesseractBackend(TESSERACT),
+        saved=saved,
+        allow_manual=False,
+    )
+    assert result.k == pytest.approx(-719.125, abs=0.1)
+    assert result.config.roi == saved.roi
+    assert result.config.flip == flip
+    assert result.config.inverted == saved.inverted
+    assert result.config.style == "condensed"
+    assert len(result.samples) == 7
+    assert ProbeConfig.from_dict(result.config.to_dict()) == result.config
+
+
 @pytest.mark.parametrize(
     ("bili_origin", "bili_clock", "expected"),
     [(1000.5, 2712, 11.625), (1000.5, 2688, -12.375), (9000.5, 2688, -8012.375)],

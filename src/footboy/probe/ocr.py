@@ -6,7 +6,7 @@ import statistics
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
 import cv2
@@ -14,6 +14,7 @@ import numpy as np
 
 CLOCK_RE = re.compile(r"(?<![\d:：.])(\d{1,3})\s*[:：.]\s*(\d{2})(?![\d:：.])")
 FLIPS = ("none", "h", "v", "hv")
+STYLES = ("standard", "condensed")
 
 
 class OcrError(RuntimeError):
@@ -37,6 +38,7 @@ class ProbeConfig:
     roi: tuple[float, float, float, float]
     flip: str
     inverted: bool
+    style: str = "standard"
 
     def __post_init__(self) -> None:
         if len(self.roi) != 4 or not all(math.isfinite(v) for v in self.roi):
@@ -53,13 +55,20 @@ class ProbeConfig:
             raise ValueError("ROI 必须位于画面内，坐标范围为 0..1")
         if self.flip not in FLIPS or not isinstance(self.inverted, bool):
             raise ValueError("翻转或极性无效")
+        if self.style not in STYLES:
+            raise ValueError("OCR 预处理样式无效")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ProbeConfig:
         roi = tuple(float(item) for item in value["roi"])
         if len(roi) != 4 or value.get("flip") not in FLIPS:
             raise ValueError("invalid probe config")
-        return cls(roi=roi, flip=str(value["flip"]), inverted=value["inverted"])  # type: ignore[arg-type]
+        return cls(
+            roi=roi,  # type: ignore[arg-type]
+            flip=str(value["flip"]),
+            inverted=value["inverted"],
+            style=value.get("style", "standard"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,12 +107,12 @@ class TesseractBackend:
             raise OcrError("未找到 Tesseract 程序；请安装或指定 --tesseract-command") from exc
         self._module = pytesseract
 
-    def read(self, image: np.ndarray) -> str:
+    def read(self, image: np.ndarray, *, raw_line: bool = False) -> str:
         try:
             return str(
                 self._module.image_to_string(
                     image,
-                    config="--psm 7 -c tessedit_char_whitelist=0123456789:",
+                    config=f"--psm {13 if raw_line else 7} -c tessedit_char_whitelist=0123456789:",
                     timeout=2,
                 )
             )
@@ -159,11 +168,20 @@ def flip_frame(frame: np.ndarray, mode: str) -> np.ndarray:
     return frame if code is None else cv2.flip(frame, code)
 
 
-def preprocess(crop: np.ndarray, inverted: bool) -> np.ndarray:
-    scaled = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+def preprocess(crop: np.ndarray, inverted: bool, style: str = "standard") -> np.ndarray:
+    condensed = style == "condensed"
+    scaled = cv2.resize(crop, None, fx=8 if condensed else 4, fy=4, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY) if scaled.ndim == 3 else scaled
     mode = cv2.THRESH_BINARY_INV if inverted else cv2.THRESH_BINARY
-    _, binary = cv2.threshold(gray, 0, 255, mode | cv2.THRESH_OTSU)
+    if condensed:
+        # Small, bright broadcast digits need separation from antialiasing and
+        # background graphics; Otsu can merge their narrow strokes and colon.
+        _, binary = cv2.threshold(gray, 175, 255, mode)
+        binary = cv2.copyMakeBorder(
+            binary, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255 if inverted else 0
+        )
+    else:
+        _, binary = cv2.threshold(gray, 0, 255, mode | cv2.THRESH_OTSU)
     return binary
 
 
@@ -172,7 +190,10 @@ def read_with_config(frame: np.ndarray, config: ProbeConfig, backend: OcrBackend
     crop = _crop_normalized(transformed, config.roi)
     if crop.size == 0:
         return None
-    return parse_clock(backend.read(preprocess(crop, config.inverted)))
+    image = preprocess(crop, config.inverted, config.style)
+    if config.style == "condensed" and isinstance(backend, TesseractBackend):
+        return parse_clock(backend.read(image, raw_line=True))
+    return parse_clock(backend.read(image))
 
 
 def probe_clock(
@@ -196,10 +217,14 @@ def probe_clock(
 
     if saved:
         try:
-            samples = _read_series(frames, saved, backend, check_budget=check_budget)
-            result = _validate_series(samples, saved)
-            if result:
-                return result
+            # Retry the selected region before considering any other location.
+            # Old state files and manual selections start with the standard style.
+            for style in (saved.style, *(item for item in STYLES if item != saved.style)):
+                config = replace(saved, style=style)
+                samples = _read_series(frames, config, backend, check_budget=check_budget)
+                result = _validate_series(samples, config)
+                if result:
+                    return result
         except StoppedClock:
             raise
         except OcrError:
@@ -235,15 +260,48 @@ def _discover_candidates(
     frame: np.ndarray, backend: OcrBackend, *, check_budget: Any = lambda: None
 ) -> Iterator[ProbeConfig]:
     for flip in FLIPS:
+        check_budget()
         transformed = flip_frame(frame, flip)
-        for roi in _candidate_rois():
+        localized = _text_rois(transformed)
+        for roi in dict.fromkeys([*localized, *_candidate_rois()]):
             crop = _crop_normalized(transformed, roi)
             if not _has_edges(crop):
                 continue
-            for inverted in (False, True):
-                check_budget()
-                if parse_clock(backend.read(preprocess(crop, inverted))) is not None:
-                    yield ProbeConfig(roi=roi, flip=flip, inverted=inverted)
+            for style in STYLES if roi in localized else ("standard",):
+                for inverted in (False, True):
+                    check_budget()
+                    config = ProbeConfig(roi=roi, flip=flip, inverted=inverted, style=style)
+                    if read_with_config(frame, config, backend) is not None:
+                        yield config
+
+
+def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
+    """Locate short text lines, keeping scoreboard neighbours outside the crop."""
+    height, width = frame.shape[:2]
+    if width > 1280:
+        frame = cv2.resize(frame, (1280, round(height * 1280 / width)))
+    height, width = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    kernel = np.ones((1, max(2, round(width * 0.004))), dtype=np.uint8)
+    boxes = set()
+    for threshold, mode in ((175, cv2.THRESH_BINARY), (80, cv2.THRESH_BINARY_INV)):
+        _, mask = cv2.threshold(gray, threshold, 255, mode)
+        mask[round(height * 0.25) : round(height * 0.38), :] = 0
+        mask[round(height * 0.62) : round(height * 0.75), :] = 0
+        mask[round(height * 0.38) : round(height * 0.62), : round(width * 0.24)] = 0
+        mask[round(height * 0.38) : round(height * 0.62), round(width * 0.76) :] = 0
+        joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(joined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if not max(6, height * 0.008) <= h <= height * 0.08 or not 1.3 <= w / h <= 8:
+                continue
+            pad_x, pad_y = max(2, math.ceil(h * 0.3)), max(2, math.ceil(h * 0.12))
+            left, top = max(0, x - pad_x), max(0, y - pad_y)
+            right, bottom = min(width, x + w + pad_x), min(height, y + h + pad_y)
+            boxes.add((left, top, right - left, bottom - top))
+    ordered = sorted(boxes, key=lambda box: (box[1], box[0]))
+    return [(x / width, y / height, w / width, h / height) for x, y, w, h in ordered[:64]]
 
 
 def _candidate_rois() -> list[tuple[float, float, float, float]]:
@@ -252,8 +310,10 @@ def _candidate_rois() -> list[tuple[float, float, float, float]]:
         anchors = (
             (0.0, 0.0),
             (1.0 - width, 0.0),
+            ((1.0 - width) / 2, 0.0),
             (0.0, 1.0 - height),
             (1.0 - width, 1.0 - height),
+            ((1.0 - width) / 2, 1.0 - height),
             ((1.0 - width) / 2, (1.0 - height) / 2),
         )
         result.extend((x, y, width, height) for x, y in anchors)
@@ -380,8 +440,9 @@ def _manual_config(frame: np.ndarray, backend: OcrBackend) -> ProbeConfig:
         raise OcrError("没有选择 OCR 区域")
     frame_height, frame_width = transformed.shape[:2]
     roi = (x / frame_width, y / frame_height, width / frame_width, height / frame_height)
-    crop = _crop_normalized(transformed, roi)
-    for inverted in (False, True):
-        if parse_clock(backend.read(preprocess(crop, inverted))) is not None:
-            return ProbeConfig(roi=roi, flip=mode, inverted=inverted)
+    for style in STYLES:
+        for inverted in (False, True):
+            config = ProbeConfig(roi=roi, flip=mode, inverted=inverted, style=style)
+            if read_with_config(frame, config, backend) is not None:
+                return config
     raise OcrError("框选区域未识别到 mm:ss")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "footboy"
-version = "0.1.2"
+version = "0.1.3"
 description = "Synchronize a football video stream with Bilibili live audio and publish it as LAN HLS."
 readme = "README.md"
 requires-python = ">=3.10"

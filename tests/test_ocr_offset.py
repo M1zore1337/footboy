@@ -92,3 +92,14 @@ def test_non_increasing_pts_cannot_lock_clock() -> None:
 def test_invalid_roi_cannot_be_saved(roi) -> None:
     with pytest.raises(ValueError):
         ProbeConfig(roi, "none", False)
+
+
+def test_legacy_probe_config_keeps_standard_preprocessing() -> None:
+    config = ProbeConfig.from_dict({"roi": [0, 0, 0.3, 0.2], "flip": "h", "inverted": False})
+    assert config.style == "standard"
+
+
+@pytest.mark.parametrize("style", ["unknown", None, True, []])
+def test_invalid_ocr_style_cannot_be_saved(style) -> None:
+    with pytest.raises(ValueError, match="预处理样式"):
+        ProbeConfig((0, 0, 0.3, 0.2), "none", False, style)
