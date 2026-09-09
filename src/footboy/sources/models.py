@@ -4,6 +4,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+# HLS forwards only nonempty HTTP options to its segment/key requests.
+# FFmpeg only uses http:// proxy URLs; this non-HTTP marker forces direct access
+# while surviving that propagation, unlike an empty http_proxy option.
+DIRECT_HTTP_PROXY = "direct://"
+
 
 @dataclass(slots=True)
 class Source:
@@ -17,6 +22,7 @@ class Source:
     audio_codec: str | None = None
     has_audio: bool | None = None
     line_text: str | None = None
+    no_proxy: bool = False
 
     @property
     def user_agent(self) -> str:
@@ -86,7 +92,10 @@ class Source:
         }
         if self.kind == "hls":
             options["allowed_extensions"] = "ALL"
-        return {key: value for key, value in options.items() if value}
+        options = {key: value for key, value in options.items() if value}
+        if self.no_proxy:
+            options["http_proxy"] = DIRECT_HTTP_PROXY
+        return options
 
     def public_dict(self) -> dict[str, Any]:
         """Return diagnostics without leaking URLs, cookies, or signed tokens."""
@@ -99,6 +108,7 @@ class Source:
             "audio_codec": self.audio_codec,
             "has_audio": self.has_audio,
             "line_text": self.line_text,
+            "no_proxy": self.no_proxy,
         }
 
     def to_dict(self) -> dict[str, Any]:

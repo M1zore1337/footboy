@@ -35,6 +35,10 @@ footboy
 
 命令行默认设置会同步到 WebUI，例如 `footboy --no-auto-measure --offset 0`。用 `--ffmpeg /path/to/ffmpeg --ffprobe /path/to/ffprobe` 可指定程序位置；Ctrl+C 会停止取流、关闭浏览器并让 FFmpeg 刷新播放列表。
 
+比赛网站需要直连时，在“直链与初始偏移”中勾选“比赛源直连（不走代理）”，或启动时传 `footboy --video-no-proxy`。该设置覆盖比赛页面嗅探、媒体探测、OCR 采样、混流以及 HLS 分片和密钥请求；B 站继续使用原有代理设置。`footboy-p0` 也支持 `--video-no-proxy`。
+
+如果控制台报告 FFmpeg 异常终止（例如 `SIGSEGV`），本次任务会停止自动重试，控制页仍可重新连接。请更换兼容的 FFmpeg/ffprobe 构建，并通过上述参数指定新程序。`--check` 检查可执行文件和最低版本，具体构建的 HLS 兼容性仍需媒体验证；新版 `N-…` Git 构建也能通过版本检查。
+
 同一局域网的其他设备使用终端打印的内网地址，或打开对应的 `/live.m3u8`。`--host 127.0.0.1` 可仅监听本机。
 
 ## 先做 P0
@@ -86,17 +90,17 @@ footboy --video-page ... --bili-room ... --no-auto-measure --offset 0
 - `POST /api/roi`，JSON 为 `{"source":"video", "roi":[0.1,0.1,0.2,0.1], "flip":"none", "inverted":false}`
 - `GET /api/snapshot/video.jpg` 和 `GET /api/snapshot/bili.jpg`
 
-`/api/start` 还接受 `video_direct`、`bili_direct`、`auto_measure`、`offset_seconds`、`video_headers`、`bili_headers`。ROI 是翻转后画面上的归一化 `[x,y,width,height]`，范围为 0–1；`source` 为 `video/bili`，`flip` 为 `none/h/v/hv`。POST 成功返回 202，参数错误返回 400，任务冲突返回 409。
+`/api/start` 还接受 `video_direct`、`video_no_proxy`、`bili_direct`、`auto_measure`、`offset_seconds`、`video_headers`、`bili_headers`。`video_no_proxy` 为布尔值，省略时沿用命令行默认值。ROI 是翻转后画面上的归一化 `[x,y,width,height]`，范围为 0–1；`source` 为 `video/bili`，`flip` 为 `none/h/v/hv`。POST 成功返回 202，参数错误返回 400，任务冲突返回 409。
 
 `state.json` 只保存房间/域名对应的识别区域、翻转、线路文本和最后偏移。Cookie、请求头、带签名的直链不写入其中。保存过的偏移仅作为起点，不会静默标记为自动已对齐。可用 `--bili-cookies cookies.txt` 提供 Netscape 格式的 B 站 Cookie 文件。
 
 ## 当前实现边界
 
-当前 `0.1.0` 为 P0/P1/P2 可运行基线，含 P3 的周期 OCR 复核、连续两次漂移确认、B 站重解析及第三方错误重嗅探。音频 GCC-PHAT 模块尚未接入控制流程，时钟跳变处逐帧精细化留待后续阶段。
+当前 `0.1.1` 在 P0/P1/P2 可运行基线上补齐比赛源直连和 FFmpeg 崩溃处理，含 P3 的周期 OCR 复核、连续两次漂移确认、B 站重解析及第三方错误重嗅探。音频 GCC-PHAT 模块尚未接入控制流程，时钟跳变处逐帧精细化留待后续阶段。
 
 H.264 输出 MPEG-TS；HEVC 输出 fMP4，使用每次启动独立的初始化文件，浏览器仍需具备 HEVC 解码能力。AAC 音频直接复制，其他音频转 AAC，视频始终不转码。启动后 30 秒无新分片触发恢复；首次启动留出 150 秒缓冲窗口。`D` 包含源 PTS 起点差异，不能直接当作实际缓冲时长。
 
-本地合成流、真实 Tesseract 和浏览器验证见 [验证记录](docs/validation.md)。真实比赛连续 2 小时运行、实际长延迟双路缓冲、手机 Safari 连播 30 分钟仍需实播验收；合成测试不能替代这些检查。
+本地合成流、真实 Tesseract 和浏览器验证见 [0.1.1 验证记录](docs/validation-0.1.1.md) 和 [基线验证](docs/validation.md)。真实比赛连续 2 小时运行、实际长延迟双路缓冲、手机 Safari 连播 30 分钟仍需实播验收；合成测试不能替代这些检查。
 
 ## 运行测试
 

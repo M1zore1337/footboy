@@ -92,6 +92,7 @@ $('source-form').addEventListener('submit', async event => {
     await post('/api/start', {
       video_url: $('video-url').value.trim(), bili_url: $('bili-url').value.trim(),
       video_direct: $('video-direct').checked, bili_direct: $('bili-direct').checked,
+      video_no_proxy: $('video-no-proxy').checked,
       auto_measure: $('auto-measure').checked, offset_seconds: offset,
       video_headers: parseHeaders($('video-headers').value),
       bili_headers: parseHeaders($('bili-headers').value)
@@ -128,7 +129,7 @@ function updateStatus(status) {
   currentStatus = status;
   if (!defaultsApplied && status.defaults) {
     defaultsApplied = true;
-    for (const [id, key] of [['auto-measure', 'auto_measure'], ['video-direct', 'video_direct'], ['bili-direct', 'bili_direct']]) {
+    for (const [id, key] of [['auto-measure', 'auto_measure'], ['video-direct', 'video_direct'], ['bili-direct', 'bili_direct'], ['video-no-proxy', 'video_no_proxy']]) {
       $(id).checked = status.defaults[key];
     }
     if (status.defaults.offset_seconds != null) $('initial-offset').value = status.defaults.offset_seconds;

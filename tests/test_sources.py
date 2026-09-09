@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from footboy.sources.bili import BiliResolveError, BiliResolver, _room_id
-from footboy.sources.media_probe import MediaProbeError
+from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 from footboy.sources.sniffer import Candidate, SniffError, StreamSniffer, _playlist_segments
 
@@ -19,6 +20,52 @@ def test_stopping_before_sniff_cannot_reopen_browser():
     with pytest.raises(SniffError, match="嗅探已取消"):
         sniffer.sniff("https://video.example/match")
     assert not sniffer.running
+
+
+@pytest.mark.parametrize("no_proxy", [False, True])
+def test_browser_fallback_keeps_the_requested_proxy_policy(no_proxy):
+    launches = []
+    browser = object()
+
+    def launch(**kwargs):
+        launches.append(kwargs)
+        if "channel" in kwargs:
+            raise RuntimeError("Browser channel not installed")
+        return browser
+
+    playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+    assert (
+        StreamSniffer._launch_browser(playwright, RuntimeError, headless=True, no_proxy=no_proxy)
+        is browser
+    )
+    assert len(launches) == 3
+    assert all(("--no-proxy-server" in call["args"]) == no_proxy for call in launches)
+
+
+def test_sniffed_source_retains_direct_access_for_probe_and_subsequent_readers(monkeypatch):
+    sniffer = StreamSniffer(no_proxy=True)
+    sniffer._context = SimpleNamespace(cookies=lambda _: [])
+    probed = []
+
+    def probe(source, **kwargs):
+        probed.append(source)
+        return source
+
+    monkeypatch.setattr("footboy.sources.sniffer.ffprobe_source", probe)
+    candidate = Candidate("https://cdn.example/live.m3u8", "hls", {}, 0, 0)
+    source = sniffer._confirm(candidate)
+    assert source.no_proxy and probed == [source]
+    assert source.pyav_options()["http_proxy"]
+    assert Source(**source.to_dict()).no_proxy
+
+
+def test_probe_crash_reports_binary_failure_instead_of_rejecting_the_source(monkeypatch):
+    monkeypatch.setattr(
+        "footboy.sources.media_probe.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=-signal.SIGSEGV, stderr="", stdout=""),
+    )
+    with pytest.raises(MediaProbeError, match="ffprobe 异常终止.*SIGSEGV"):
+        ffprobe_source(Source("https://cdn.example/live.m3u8"))
 
 
 def response(url, body="", content_type="application/vnd.apple.mpegurl", status=200):

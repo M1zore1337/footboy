@@ -21,6 +21,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--video-page", help="第三方比赛页面 URL；省略后从 WebUI 输入")
     result.add_argument("--bili-room", help="B站直播间 URL；与 --video-page 同时填写")
     result.add_argument("--video-direct", action="store_true", help="比赛地址为媒体直链")
+    result.add_argument(
+        "--video-no-proxy", action="store_true", help="比赛页面与媒体流直连，不使用代理"
+    )
     result.add_argument("--bili-direct", action="store_true", help="B站地址为媒体直链（P0）")
     result.add_argument("--output-dir", type=Path, default=Path("hls_out"))
     result.add_argument("--state-file", type=Path, default=Path("state.json"))
@@ -77,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_offset=args.offset,
         verify_interval=args.verify_interval,
         video_direct=args.video_direct,
+        video_no_proxy=args.video_no_proxy,
         bili_direct=args.bili_direct,
         headless_sniff=args.headless_sniff,
     )

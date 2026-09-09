@@ -55,6 +55,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--bili-url", required=True)
     result.add_argument("--offset", required=True, type=float, help="D 秒；正值推后 B 站音频")
     result.add_argument("--video-header", action="append", default=[], metavar="NAME:VALUE")
+    result.add_argument("--video-no-proxy", action="store_true", help="比赛媒体流直连，不使用代理")
     result.add_argument("--bili-header", action="append", default=[], metavar="NAME:VALUE")
     result.add_argument("--output-dir", type=Path, default=Path("hls_out"))
     result.add_argument("--host", default="0.0.0.0")
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             args.video_url,
             headers=_headers(args.video_header),
             kind=_kind(args.video_url),
+            no_proxy=args.video_no_proxy,
         )
         bili = Source(args.bili_url, headers=_headers(args.bili_header), kind=_kind(args.bili_url))
         ffprobe_source(video, ffprobe=args.ffprobe)

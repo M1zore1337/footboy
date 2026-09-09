@@ -121,6 +121,7 @@ class Application:
                 "auto_measure": self.defaults.auto_measure,
                 "offset_seconds": self.defaults.initial_offset,
                 "video_direct": self.defaults.video_direct,
+                "video_no_proxy": self.defaults.video_no_proxy,
                 "bili_direct": self.defaults.bili_direct,
             }
             return value
@@ -151,6 +152,7 @@ def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> Supervis
         video_page_url=video,
         bili_room_url=bili,
         video_direct=video_direct,
+        video_no_proxy=_boolean(body, "video_no_proxy", defaults.video_no_proxy),
         bili_direct=bili_direct,
         video_headers=_headers(body.get("video_headers", defaults.video_headers)),
         bili_headers=_headers(body.get("bili_headers", defaults.bili_headers)),

@@ -5,7 +5,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .models import Source
+from footboy.environment import binary_crash_reason
+
+from .models import DIRECT_HTTP_PROXY, Source
 
 
 class MediaProbeError(RuntimeError):
@@ -35,6 +37,8 @@ def ffprobe_source(
         command.extend(["-cookies", cookies])
     if source.kind == "hls":
         command.extend(["-allowed_extensions", "ALL"])
+    if source.no_proxy:
+        command.extend(["-http_proxy", DIRECT_HTTP_PROXY])
     command.extend(
         [
             "-show_entries",
@@ -57,6 +61,9 @@ def ffprobe_source(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise MediaProbeError(f"ffprobe 启动或探测失败: {exc}") from exc
     if result.returncode != 0:
+        crash = binary_crash_reason(result.returncode)
+        if crash:
+            raise MediaProbeError(f"ffprobe 异常终止（{crash}），请检查或更换 FFmpeg/ffprobe 构建")
         detail = result.stderr.strip().splitlines()[-1:] or ["未知错误"]
         raise MediaProbeError(f"ffprobe 拒绝该线路: {detail[0]}")
     try:

@@ -9,15 +9,18 @@ import shutil
 import subprocess
 import threading
 import time
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import av
 import numpy as np
 import pytest
 
 from footboy.mux.ffmpeg import FfmpegMuxer
-from footboy.sources.media_probe import ffprobe_source
+from footboy.probe.frames import keyframes
+from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 
 FFMPEG = os.environ.get("FOOTBOY_FFMPEG") or shutil.which("ffmpeg")
@@ -131,6 +134,51 @@ def media_server(tmp_path):
         worker.join(2)
 
 
+@pytest.fixture
+def recording_proxy(monkeypatch):
+    requests = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            requests.append(self.path)
+            target = urlsplit(self.path)
+            # Only the Bilibili fixture can use the proxy. Video must go direct.
+            if target.hostname != "127.0.0.1" or target.path != "/bili.flv":
+                self.send_error(502, "Fixture proxy refuses video")
+                return
+            upstream = HTTPConnection(target.hostname, target.port, timeout=5)
+            try:
+                upstream.request("GET", target.path, headers=dict(self.headers))
+                response = upstream.getresponse()
+                data = response.read()
+                self.send_response(response.status)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Type", response.getheader("Content-Type"))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                upstream.close()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.setenv(name, f"http://127.0.0.1:{server.server_port}")
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.setenv(name, "")
+    try:
+        yield requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+
+
 def first_pts(path: Path) -> dict[str, float]:
     result = subprocess.run(
         [
@@ -142,6 +190,7 @@ def first_pts(path: Path) -> dict[str, float]:
             "packet=codec_type,pts_time",
             "-of",
             "json",
+            *(["-allowed_extensions", "ALL"] if path.suffix == ".m3u8" else []),
             str(path),
         ],
         capture_output=True,
@@ -156,7 +205,8 @@ def first_pts(path: Path) -> dict[str, float]:
 
 
 def first_picture(path: Path) -> np.ndarray:
-    with av.open(str(path)) as container:
+    options = {"allowed_extensions": "ALL"} if path.suffix == ".m3u8" else {}
+    with av.open(str(path), options=options) as container:
         return next(container.decode(video=0)).to_ndarray(format="rgb24")
 
 
@@ -263,6 +313,87 @@ def test_live_restart_produces_new_segments_and_closes_process(tmp_path, media_s
     assert "#EXT-X-ENDLIST" in (output / "live.m3u8").read_text()
 
 
+@pytest.mark.parametrize("encrypted", [False, True], ids=["plain", "aes128"])
+def test_hls_direct_access_preserves_pts_and_bili_proxy(
+    tmp_path, media_server, recording_proxy, encrypted
+):
+    base, requests = media_server
+    make_clip(tmp_path / "video.flv", 1000)
+    make_clip(tmp_path / "bili.flv", 990)
+    playlist = tmp_path / "input.m3u8"
+    encryption = []
+    if encrypted:
+        key = tmp_path / "key.bin"
+        key.write_bytes(bytes(range(16)))
+        info = tmp_path / "key-info.txt"
+        info.write_text(f"{base}/key.bin\n{key}\n", encoding="utf-8")
+        encryption = ["-hls_key_info_file", str(info)]
+    subprocess.run(
+        [
+            str(FFMPEG),
+            "-v",
+            "error",
+            "-copyts",
+            "-i",
+            str(tmp_path / "video.flv"),
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "vod",
+            *encryption,
+            str(playlist),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    reference = playlist
+    if encrypted:
+        # Offline comparisons use the same encrypted packets with a local key.
+        reference = tmp_path / "reference.m3u8"
+        reference.write_text(
+            playlist.read_text(encoding="utf-8").replace(f"{base}/key.bin", "key.bin"),
+            encoding="utf-8",
+        )
+    video, bili = source(base + "/input.m3u8"), source(base + "/bili.flv")
+    video.kind = "hls"
+    with pytest.raises(MediaProbeError):
+        ffprobe_source(video, ffprobe=str(FFPROBE))
+    assert video.url in recording_proxy
+    recording_proxy.clear()
+
+    video.no_proxy = True
+    ffprobe_source(video, ffprobe=str(FFPROBE))
+    frames = list(keyframes(video, duration=3, max_frames=3))
+    assert len(frames) == 3
+    assert frames[0][0] == pytest.approx(first_pts(reference)["video"])
+    assert recording_proxy == []
+    ffprobe_source(bili, ffprobe=str(FFPROBE))
+
+    output = tmp_path / "hls"
+    mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+    try:
+        mux.start(video, bili, 10)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        result = first_pts(output / "live.m3u8")
+        expected = first_pts(reference)["video"] - (first_pts(tmp_path / "bili.flv")["audio"] + 10)
+        assert result["video"] - result["audio"] == pytest.approx(expected, abs=0.025)
+        assert np.array_equal(first_picture(reference), first_picture(output / "live.m3u8"))
+        assert mux.health.non_monotonic_dts == 0
+        assert len(recording_proxy) >= 2
+        assert all(url == bili.url for url in recording_proxy)
+        assert all(row.get("Cookie") == "sid=fixture" for row in requests)
+    finally:
+        mux.stop()
+
+
 @pytest.mark.skipif(
     os.environ.get("FOOTBOY_BROWSER_TESTS") != "1",
     reason="设置 FOOTBOY_BROWSER_TESTS=1 并安装 Playwright Chromium 后运行",
@@ -290,6 +421,7 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             auto_measure=False,
             initial_offset=10,
             video_direct=True,
+            video_no_proxy=True,
             bili_direct=True,
         )
     )
@@ -322,6 +454,7 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             page.locator("#bili-url").fill(base + "/bili.flv?paced=1")
             page.locator(".advanced > summary").click()
             expect(page.locator("#video-direct")).to_be_checked()
+            expect(page.locator("#video-no-proxy")).to_be_checked()
             expect(page.locator("#bili-direct")).to_be_checked()
             expect(page.locator("#auto-measure")).not_to_be_checked()
             expect(page.locator("#initial-offset")).to_have_value("10")
@@ -331,6 +464,7 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             expect(page.locator("#phase-text")).to_have_text("直播运行中")
             page.wait_for_function("document.getElementById('player').readyState >= 2")
             assert app.session is not None
+            assert app.session.video.no_proxy and not app.session.bili.no_proxy
             initial_generation = app.session.muxer.generation
 
             page.locator("#remeasure").click()

@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 
-from footboy.mux.ffmpeg import FfmpegMuxer, _sanitize_ffmpeg_line
+from footboy.environment import binary_crash_reason
+from footboy.mux.ffmpeg import FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
 from footboy.probe.ocr import ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
 from footboy.serve.http import ControlServer
@@ -46,6 +47,7 @@ class SupervisorConfig:
     video_headers: dict[str, str] = field(default_factory=dict)
     bili_headers: dict[str, str] = field(default_factory=dict)
     headless_sniff: bool = False
+    video_no_proxy: bool = False
 
 
 class Supervisor:
@@ -61,7 +63,7 @@ class Supervisor:
         self.muxer = FfmpegMuxer(config.output_dir, ffmpeg=config.ffmpeg)
         self.server = ControlServer(self, config.output_dir, host=config.host, port=config.port)
         self.bili_resolver = BiliResolver(config.cookies_file)
-        self.sniffer = StreamSniffer(ffprobe=config.ffprobe)
+        self.sniffer = StreamSniffer(ffprobe=config.ffprobe, no_proxy=config.video_no_proxy)
         self.video: Source | None = None
         self.bili: Source | None = None
         stored = self.store.offset(self._offset_key)
@@ -106,7 +108,7 @@ class Supervisor:
             self._run_loop()
         except Exception as exc:
             if not self._stop.is_set():
-                self._set_phase("ERROR", f"启动失败: {_sanitize_ffmpeg_line(str(exc))}")
+                self._set_phase("ERROR", f"任务失败: {_sanitize_ffmpeg_line(str(exc))}")
         finally:
             self._stop.set()
             self.sniffer.stop()
@@ -244,6 +246,7 @@ class Supervisor:
         self._set_phase("SNIFF", "正在获取比赛画面，请在打开的浏览器里播放目标线路")
         if self.config.video_direct:
             self.video = _direct_source(self.config.video_page_url, self.config.video_headers)
+            self.video.no_proxy = self.config.video_no_proxy
             ffprobe_source(self.video, ffprobe=self.config.ffprobe)
         else:
             self.video = self._sniff_video(headless=self.config.headless_sniff)
@@ -555,6 +558,14 @@ class Supervisor:
             return
         code = self.muxer.poll()
         if code is not None or not self.muxer.health.running:
+            crash = binary_crash_reason(code)
+            if crash:
+                self.aligned = False
+                self.confidence = None
+                raise MuxError(
+                    f"FFmpeg 异常终止（{crash}），已停止自动重试；"
+                    "请检查或更换 FFmpeg 构建后重新连接"
+                )
             self._recover(f"ffmpeg 已退出，code={code}")
             return
         signature = self._latest_segment_signature()

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from footboy.sources.models import Source
+from footboy.sources.models import DIRECT_HTTP_PROXY, Source
 
 SPEED_RE = re.compile(r"speed=\s*([0-9.]+)x")
 DTS_RE = re.compile(r"non[- ]monoton(?:ic|ous).*dts", re.IGNORECASE)
@@ -122,6 +122,8 @@ def _input_options(source: Source, *, video_input: bool) -> list[str]:
     options = ["-thread_queue_size", "16384", "-rw_timeout", "15000000"]
     if source.url.startswith(("http://", "https://")):
         options.extend(["-user_agent", source.user_agent])
+        if source.no_proxy:
+            options.extend(["-http_proxy", DIRECT_HTTP_PROXY])
     headers = source.ffmpeg_headers(include_cookies=False)
     if headers:
         options.extend(["-headers", headers])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 from pathlib import Path
 
@@ -28,6 +29,7 @@ def body(**changes):
         {"video_url": "http://x.invalid:70000/"},
         {"bili_url": "https://evil.example/live.bilibili.com/123"},
         {"auto_measure": "false"},
+        {"video_no_proxy": "false"},
         {"offset_seconds": float("nan")},
         {"video_headers": {"Referer": "value\r\nInjected: true"}},
     ],
@@ -52,6 +54,14 @@ def test_direct_mode_carries_cookie_header_and_manual_mode(tmp_path) -> None:
     assert config.video_headers["Cookie"] == "sid=abc"
     assert config.initial_offset == -12.5
     assert config.auto_measure is False
+
+
+def test_video_proxy_setting_inherits_cli_default_and_allows_web_override(tmp_path) -> None:
+    config = defaults(tmp_path)
+    config.video_no_proxy = True
+    assert Application(config).public_status()["defaults"]["video_no_proxy"] is True
+    assert session_config(config, body()).video_no_proxy is True
+    assert session_config(config, body(video_no_proxy=False)).video_no_proxy is False
 
 
 def test_console_survives_stop_and_allows_another_session(tmp_path, monkeypatch) -> None:
@@ -95,3 +105,21 @@ def test_environment_failure_is_visible_in_console(tmp_path, monkeypatch) -> Non
     assert app.public_status()["state"] == "ERROR"
     assert "ffmpeg" in app.public_status()["message"]
     assert not app.public_status()["active"]
+
+
+def test_native_crash_leaves_console_available_for_a_new_session(tmp_path, monkeypatch) -> None:
+    app = Application(defaults(tmp_path))
+    monkeypatch.setattr("footboy.app.check_binary", lambda *args, **kwargs: None)
+    monkeypatch.setattr("footboy.app.Supervisor._bootstrap", lambda _: None)
+    monkeypatch.setattr("footboy.supervisor.FfmpegMuxer.poll", lambda _: -signal.SIGSEGV)
+    try:
+        for _ in range(2):
+            previous = app.session
+            app.request_start(body())
+            app._thread.join(2)
+            assert app.session is not previous
+            status = app.public_status()
+            assert status["state"] == "ERROR" and not status["active"]
+            assert "SIGSEGV" in status["message"]
+    finally:
+        app.close()

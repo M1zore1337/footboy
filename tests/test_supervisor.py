@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from pathlib import Path
@@ -158,3 +159,50 @@ def test_large_signed_pts_offset_does_not_trigger_30_second_startup_recovery(
     supervisor._last_segment_signature = ("seg_1.ts", 1)
     supervisor._check_health(time.monotonic())
     assert recovered == ["30 秒没有新 HLS 分片"]
+
+
+def test_direct_mode_only_disables_proxy_for_the_video_source(tmp_path, monkeypatch) -> None:
+    supervisor = supervisor_at(
+        tmp_path, video_direct=True, bili_direct=True, video_no_proxy=True, auto_measure=False
+    )
+    probed, started = [], []
+
+    def probe(source, **kwargs):
+        source.has_audio = True
+        probed.append(source)
+        return source
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr(
+        supervisor.muxer,
+        "start",
+        lambda video, bili, *_args, **_kwargs: started.extend((video, bili)),
+    )
+    supervisor._bootstrap()
+    assert supervisor.sniffer.no_proxy
+    assert started == [supervisor.video, supervisor.bili]
+    assert supervisor.video.no_proxy and not supervisor.bili.no_proxy
+    assert [source.no_proxy for source in probed] == [False, True]
+
+
+def test_native_mux_crash_stops_recovery_and_cancels_stale_measurements(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path, initial_offset=3.5, auto_measure=False)
+    monkeypatch.setattr(supervisor, "_bootstrap", lambda: None)
+    monkeypatch.setattr(supervisor.muxer, "poll", lambda: -signal.SIGSEGV)
+    monkeypatch.setattr(supervisor, "_recover", lambda *_: pytest.fail("Must not retry a crash"))
+    supervisor.run(serve=False)
+    assert supervisor.phase == "ERROR"
+    assert "SIGSEGV" in supervisor.message and "更换 FFmpeg" in supervisor.message
+    assert supervisor._stop.is_set() and supervisor._measurement_cancel.is_set()
+    assert not supervisor.aligned
+    finish(supervisor, 80, mode="initial")
+    assert supervisor.offset == 3.5
+
+
+def test_ordinary_mux_exit_still_uses_source_recovery(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path)
+    monkeypatch.setattr(supervisor.muxer, "poll", lambda: 1)
+    recovered = []
+    monkeypatch.setattr(supervisor, "_recover", recovered.append)
+    supervisor._check_health(time.monotonic())
+    assert recovered == ["ffmpeg 已退出，code=1"]

@@ -58,9 +58,12 @@ class Candidate:
 
 
 class StreamSniffer:
-    def __init__(self, *, ffprobe: str | Path = "ffprobe", timeout: float = 300) -> None:
+    def __init__(
+        self, *, ffprobe: str | Path = "ffprobe", timeout: float = 300, no_proxy: bool = False
+    ) -> None:
         self.ffprobe = ffprobe
         self.timeout = timeout
+        self.no_proxy = no_proxy
         self._candidates: dict[str, Candidate] = {}
         self._lock = threading.RLock()
         self._commands: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -98,7 +101,9 @@ class StreamSniffer:
         keyboard.start()
         try:
             with sync_playwright() as playwright:
-                browser = self._launch_browser(playwright, PlaywrightError, headless=headless)
+                browser = self._launch_browser(
+                    playwright, PlaywrightError, headless=headless, no_proxy=self.no_proxy
+                )
                 try:
                     self._context = browser.new_context()
                     self._page = self._context.new_page()
@@ -164,9 +169,15 @@ class StreamSniffer:
 
     @staticmethod
     def _launch_browser(
-        playwright: Any, error_type: type[Exception], *, headless: bool = False
+        playwright: Any,
+        error_type: type[Exception],
+        *,
+        headless: bool = False,
+        no_proxy: bool = False,
     ) -> Any:
         args = ["--autoplay-policy=no-user-gesture-required", "--mute-audio"]
+        if no_proxy:
+            args.append("--no-proxy-server")
         failures = []
         for channel in ("chrome", "msedge", None):
             try:
@@ -369,6 +380,7 @@ class StreamSniffer:
             cookies=cookies,
             kind=candidate.kind,
             line_text=candidate.line_text,
+            no_proxy=self.no_proxy,
         )
         probed = ffprobe_source(source, ffprobe=self.ffprobe, timeout=15)
         print(
