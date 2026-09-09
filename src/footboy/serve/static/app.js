@@ -18,6 +18,8 @@ const context = canvas.getContext('2d');
 let dragStart = null;
 let submitting = false;
 let defaultsApplied = false;
+let lineSubmitting = false;
+let lineOptionsKey = '';
 
 const phaseNames = {
   IDLE: '等待连接', CHECK: '检查环境', INIT: '准备连接', RESOLVE: '获取直播间',
@@ -93,6 +95,7 @@ $('source-form').addEventListener('submit', async event => {
       video_url: $('video-url').value.trim(), bili_url: $('bili-url').value.trim(),
       video_direct: $('video-direct').checked, bili_direct: $('bili-direct').checked,
       video_no_proxy: $('video-no-proxy').checked,
+      video_line_text: $('video-direct').checked ? null : $('video-line-text').value.trim() || null,
       auto_measure: $('auto-measure').checked, offset_seconds: offset,
       video_headers: parseHeaders($('video-headers').value),
       bili_headers: parseHeaders($('bili-headers').value)
@@ -109,6 +112,16 @@ action($('remeasure'), '/api/remeasure', {}, '正在重新采样比赛时钟');
 action($('resniff'), '/api/resniff', {}, '请在本机浏览器重新选择比赛线路');
 action($('stop'), '/api/stop', {}, '正在停止任务');
 action($('cancel-source'), '/api/source', {id: null}, '已暂停当前线路的自动选择');
+$('line-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (lineSubmitting || !$('line-choice').value) return;
+  lineSubmitting = true; $('switch-line').disabled = true;
+  try {
+    await post('/api/line', {text: $('line-choice').value});
+    toast('正在获取所选线路，通过探测后切换');
+  } catch (error) { toast(error.message, true); }
+  finally { lineSubmitting = false; refresh(); }
+});
 
 function activeSession(status) {
   return status.active ?? !['IDLE', 'STOPPED', 'ERROR', 'INIT'].includes(status.state);
@@ -133,6 +146,7 @@ function updateStatus(status) {
       $(id).checked = status.defaults[key];
     }
     if (status.defaults.offset_seconds != null) $('initial-offset').value = status.defaults.offset_seconds;
+    if (status.defaults.video_line_text) $('video-line-text').value = status.defaults.video_line_text;
   }
   const active = activeSession(status);
   const controllable = active && status.state !== 'STOPPING';
@@ -144,13 +158,15 @@ function updateStatus(status) {
   $('phase').classList.toggle('running', Boolean(status.ffmpeg?.running));
   $('phase').classList.toggle('busy', active && !['RUN', 'P0-RUN', 'ERROR'].includes(status.state));
   $('source-fields').disabled = active;
+  $('video-line-text').disabled = $('video-direct').checked;
   $('start').disabled = active || submitting;
   const sessionsSupported = Boolean(status.capabilities?.session_controls);
   $('source-form').hidden = !sessionsSupported;
   $('session-actions').hidden = !active || !sessionsSupported;
   document.querySelector('.source-panel').classList.toggle('connected', active);
   $('stop').disabled = !controllable;
-  $('resniff').disabled = !controllable || !status.video || Boolean(status.sniffer?.running);
+  $('resniff').disabled = !controllable || !status.video || status.video_direct
+    || Boolean(status.sniffer?.running) || Boolean(status.source_switching);
   document.querySelectorAll('[data-delta]').forEach(button => { button.disabled = !controllable; });
   $('remeasure').disabled = !controllable || !status.video || !status.capabilities?.roi;
   $('flip').disabled = !controllable;
@@ -186,13 +202,14 @@ function updateStatus(status) {
   ].join('\n');
   $('source-info').hidden = !active;
   $('source-info').textContent = [
-    status.video ? `画面 · ${status.video.domain} · ${status.video.video_codec || '探测中'}${status.video.height ? ` / ${status.video.height}p` : ''}` : '',
+    status.video ? `画面 · ${status.video.line_text || status.video.domain} · ${status.video.video_codec || '探测中'}${status.video.height ? ` / ${status.video.height}p` : ''}` : '',
     status.bili ? `音源 · ${status.bili.domain} · ${status.bili.audio_codec || '探测中'}` : ''
   ].filter(Boolean).join('  ｜  ') || (active ? '正在获取直播信息…' : '');
   $('measurement-state').textContent = status.measurement?.running ? '正在采样与识别…'
     : status.measurement?.needs_roi?.length ? '请框选未识别的时钟' : aligned && !manual ? '时钟已锁定' : '等待采样';
   $('measurement-state').classList.toggle('busy', Boolean(status.measurement?.running));
   updateCandidates(status.sniffer);
+  updateLines(status, controllable);
   updatePreview(status);
   if (!active) {
     if (playerGeneration !== null) detachPlayer();
@@ -205,6 +222,32 @@ function updateStatus(status) {
     $('player-state').textContent = status.ffmpeg?.running ? '正在缓冲' : '正在连接';
   }
   if (active && status.ffmpeg?.running) ensurePlayback(status);
+}
+
+$('video-direct').addEventListener('change', () => {
+  $('video-line-text').disabled = $('video-direct').checked;
+});
+
+function updateLines(status, controllable) {
+  const sniffer = status.sniffer || {};
+  const lines = sniffer.lines || [];
+  $('line-form').hidden = !controllable || !status.capabilities?.switch_line
+    || status.video_direct || !lines.length;
+  const select = $('line-choice');
+  const key = JSON.stringify([lastSession, lines]);
+  if (key !== lineOptionsKey) {
+    const previous = select.value;
+    select.replaceChildren(...lines.map(text => new Option(text, text)));
+    const preferred = previous || sniffer.pending_line || sniffer.selected_line || status.video?.line_text;
+    if (lines.includes(preferred)) select.value = preferred;
+    lineOptionsKey = key;
+  }
+  $('switch-line').disabled = lineSubmitting || !controllable || !select.value
+    || (status.source_switching && !sniffer.running);
+  const current = status.video?.line_text;
+  const pending = sniffer.pending_line || (sniffer.running ? sniffer.selected_line : null);
+  $('current-line').textContent = [current ? `当前：${current}` : '等待线路验收',
+    pending ? `正在获取：${pending}` : ''].filter(Boolean).join(' · ');
 }
 
 function updateCandidates(sniffer) {
@@ -226,7 +269,7 @@ function updateCandidates(sniffer) {
       const url = document.createElement('p'); url.className = 'candidate-url';
       row.append(head, url); $('candidates').append(row);
     }
-    row.querySelector('.candidate-label').textContent = `线路 ${item.id} · ${item.cancelled ? '已暂停自动选择' : item.active ? `正在播放${item.countdown != null ? ` · ${item.countdown}s` : ''}` : '等待分片'}`;
+    row.querySelector('.candidate-label').textContent = `${item.line_text || `线路 ${item.id}`} · ${item.cancelled ? '已暂停自动选择' : item.browser_blocked ? '等待媒体探测' : item.active ? `正在播放${item.countdown != null ? ` · ${item.countdown}s` : ''}` : '等待分片'}`;
     row.querySelector('.candidate-url').textContent = item.url;
   }
   $('candidates').querySelectorAll('.candidate').forEach(row => {

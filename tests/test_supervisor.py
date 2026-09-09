@@ -206,3 +206,94 @@ def test_ordinary_mux_exit_still_uses_source_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_recover", recovered.append)
     supervisor._check_health(time.monotonic())
     assert recovered == ["ffmpeg 已退出，code=1"]
+
+
+def test_named_line_routing_and_conflicts(tmp_path):
+    supervisor = supervisor_at(tmp_path)
+    supervisor.video = Source("https://cdn.example/old.flv", line_text="中文高清")
+    supervisor.request_switch_line("高清直播5")
+    assert supervisor._events.get_nowait() == ("switch_line", "高清直播5")
+    assert supervisor.public_status()["source_switching"]
+    with pytest.raises(RuntimeError, match="正在获取"):
+        supervisor.request_switch_line("中文高清")
+    supervisor.sniffer.running = True
+    supervisor.request_switch_line("高清直播⑤")
+    assert supervisor.sniffer.public_status()["pending_line"] == "高清直播⑤"
+    supervisor.config.video_direct = True
+    with pytest.raises(ValueError, match="媒体直链"):
+        supervisor.request_switch_line("中文高清")
+
+
+def test_explicit_line_overrides_saved_preference_and_resniff_waits_for_choice(
+    tmp_path, monkeypatch
+):
+    supervisor = supervisor_at(tmp_path, video_line_text="高清直播5")
+    supervisor.store.set_source_probe(supervisor._video_probe_key, {"line_text": "中文高清"})
+    calls = []
+
+    def sniff(url, **kwargs):
+        calls.append(kwargs)
+        return Source("https://cdn.example/new.flv", line_text="高清直播⑤")
+
+    monkeypatch.setattr(supervisor.sniffer, "sniff", sniff)
+    supervisor._sniff_video(headless=True)
+    assert calls[-1]["preferred_line_text"] == "高清直播5"
+    assert supervisor.store.source_probe(supervisor._video_probe_key)["line_text"] == "高清直播⑤"
+    supervisor._sniff_video(headless=True, reuse_line=False)
+    assert calls[-1]["preferred_line_text"] is None and not calls[-1]["auto_select"]
+    supervisor._sniff_video(headless=True, line_text="中文高清", reuse_line=False)
+    assert calls[-1]["preferred_line_text"] == "中文高清" and calls[-1]["auto_select"]
+
+
+@pytest.mark.parametrize("manual_during_switch", [False, True])
+def test_switch_keeps_playing_until_ready_and_invalidates_old_ocr(
+    tmp_path, monkeypatch, manual_during_switch
+):
+    supervisor = supervisor_at(tmp_path, initial_offset=1)
+    old = Source("https://cdn.example/old.flv", line_text="中文高清")
+    new = Source("https://cdn.example/new.flv", line_text="高清直播⑤")
+    supervisor.video = old
+    supervisor.bili = Source("https://bili.example/live.flv")
+    supervisor.muxer.health.running = True
+    supervisor._preview_bytes["video"] = b"old-frame"
+    entered, release = threading.Event(), threading.Event()
+    restarts, measurements = [], []
+    monkeypatch.setattr(supervisor, "_resolve_bili", lambda: supervisor.bili)
+
+    def sniff(**kwargs):
+        assert kwargs["line_text"] == "高清直播5" and not kwargs["reuse_line"]
+        entered.set()
+        assert release.wait(3)
+        return new
+
+    monkeypatch.setattr(supervisor, "_sniff_video", sniff)
+    monkeypatch.setattr(supervisor.muxer, "restart", lambda *args: restarts.append(args))
+    monkeypatch.setattr(supervisor, "_start_measurement", measurements.append)
+    supervisor._start_refresh(force_sniff=True, line_text="高清直播5")
+    assert entered.wait(1)
+    assert supervisor.video is old and supervisor.muxer.health.running and not restarts
+    supervisor._finish_measurement("initial", 0, 0, measurement(999), None)
+    assert supervisor.offset == 1
+    if manual_during_switch:
+        supervisor.request_offset_delta(500)
+    release.set()
+    action, payload = supervisor._events.get(timeout=2)
+    assert action == "refresh_done"
+    supervisor._finish_refresh(*payload)
+    expected = 1.5 if manual_during_switch else 1
+    assert supervisor.video is new and restarts == [(new, supervisor.bili, expected)]
+    assert supervisor.applied_offset == expected and not supervisor._preview_bytes
+    assert measurements == ([] if manual_during_switch else ["initial"])
+    if manual_during_switch:
+        assert supervisor.confidence == {"method": "manual"}
+
+
+def test_failed_line_switch_keeps_original_source_and_offset(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path, initial_offset=2)
+    old = Source("https://cdn.example/old.flv", line_text="中文高清")
+    supervisor.video = old
+    supervisor.muxer.health.running = True
+    monkeypatch.setattr(supervisor.muxer, "restart", lambda *_: pytest.fail("Keep old playback"))
+    supervisor._finish_refresh(None, RuntimeError("目标线路暂不可用"), True)
+    assert supervisor.video is old and supervisor.offset == 2
+    assert supervisor.phase == "RUN" and "保留原线路" in supervisor.message

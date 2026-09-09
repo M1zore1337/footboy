@@ -131,6 +131,49 @@ def test_tesseract_locates_small_top_center_clock_and_rejects_countdown():
     assert width < 0.1 and height < 0.1
 
 
+def test_tesseract_discovers_spaced_football_clock_below_scoreboard():
+    frames = []
+    for index in range(4):
+        image = np.full((1080, 1920, 3), (48, 92, 44), dtype=np.uint8)
+        cv2.rectangle(image, (45, 40), (520, 145), (40, 15, 10), -1)
+        cv2.putText(
+            image,
+            "TEAM A  3 - 1  TEAM B",
+            (60, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (245, 245, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        clock = 4916 + index * 4
+        x = 245
+        for text in (str(clock // 60), ":", f"{clock % 60:02}"):
+            glyph = np.zeros((45, 80, 3), dtype=np.uint8)
+            cv2.putText(
+                glyph,
+                text,
+                (3, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (245, 245, 245),
+                2,
+                cv2.LINE_AA,
+            )
+            left, _, width, _ = cv2.boundingRect(
+                cv2.findNonZero(cv2.cvtColor(glyph, cv2.COLOR_BGR2GRAY))
+            )
+            crop = glyph[:, left : left + width]
+            region = image[95:140, x : x + width]
+            region[crop.any(axis=2)] = crop[crop.any(axis=2)]
+            x += width + 8
+        frames.append((6373.76 + index * 4, image))
+    result = probe_clock(frames, TesseractBackend(TESSERACT), allow_manual=False)
+    assert [sample.clock for sample in result.samples] == [4916, 4920, 4924, 4928]
+    assert result.k == pytest.approx(-1457.76, abs=0.001)
+    assert result.residual == 0
+
+
 @pytest.mark.parametrize("flip", ["none", "h", "v", "hv"])
 def test_tesseract_retries_condensed_style_inside_saved_roi(flip):
     saved = ProbeConfig((624 / 1280, 49 / 720, 32 / 1280, 24 / 720), flip, True)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+from .lines import LINE_SELECTOR, is_line_label, normalize_line_text, validate_line_text
 from .media_probe import MediaProbeError, ffprobe_source
 from .models import Source
 
@@ -42,6 +43,7 @@ class Candidate:
     identifier: int = 0
     segments: set[str] = field(default_factory=set)
     request_open: bool = False
+    browser_blocked: bool = False
 
     def active(self, now: float) -> bool:
         # A continuously downloaded FLV has no child segment requests; its own
@@ -67,17 +69,32 @@ class StreamSniffer:
         self._candidates: dict[str, Candidate] = {}
         self._lock = threading.RLock()
         self._commands: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self._line_commands: queue.SimpleQueue[str] = queue.SimpleQueue()
         self._stop_keyboard = threading.Event()
         self._abort = threading.Event()
         self._page: Any = None
         self._context: Any = None
         self._recent_requests: dict[str, float] = {}
         self._started = 0.0
+        self._lines: list[str] = []
+        self._selected_line: str | None = None
+        self._pending_line: str | None = None
+        self._auto_select = True
+        self._generation = 0
+        self._next_identifier = 1
+        self._request_generations: dict[int, int] = {}
+        self._blocked_requests: list[tuple[str, dict[str, str], int, str | None]] = []
+        self._blocked_seen: set[str] = set()
         self.running = False
         self.message = ""
 
     def sniff(
-        self, page_url: str, *, preferred_line_text: str | None = None, headless: bool = False
+        self,
+        page_url: str,
+        *,
+        preferred_line_text: str | None = None,
+        headless: bool = False,
+        auto_select: bool = True,
     ) -> Source:
         if self._abort.is_set():
             raise SniffError("嗅探已取消")
@@ -92,6 +109,16 @@ class StreamSniffer:
         self._candidates.clear()
         self._recent_requests.clear()
         self._commands = queue.SimpleQueue()
+        self._line_commands = queue.SimpleQueue()
+        self._request_generations.clear()
+        self._blocked_requests.clear()
+        self._blocked_seen.clear()
+        self._lines = []
+        self._selected_line = None
+        self._pending_line = validate_line_text(preferred_line_text, optional=True)
+        self._auto_select = auto_select
+        self._generation += 1
+        self.message = "正在查找页面线路"
         self._started = time.monotonic()
         self.running = True
         self._stop_keyboard.clear()
@@ -112,21 +139,31 @@ class StreamSniffer:
                     self._context.on("response", self._on_response)
                     self._context.on("request", self._on_request)
                     self._context.on("requestfinished", self._on_request_finished)
-                    self._context.on("requestfailed", self._on_request_finished)
+                    self._context.on("requestfailed", self._on_request_failed)
+                    self._context.expose_binding("__footboy_line_clicked", self._on_line_click)
                     self._page.add_init_script(
                         """
                         document.addEventListener('click', event => {
-                          const el = event.target && event.target.closest('button,a,[role=button]');
-                          if (el) window.__footboy_last_click = (el.innerText || el.textContent || '').trim();
+                          if (!event.isTrusted) return;
+                          const el = event.target && event.target.closest('button,a,[role=button],[onclick],[data-play]');
+                          if (el) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            window.__footboy_last_click = text;
+                            window.__footboy_line_clicked(text).catch(() => {});
+                          }
                         }, true);
                         """
                     )
                     try:
-                        self._page.goto(page_url, wait_until="domcontentloaded", timeout=15_000)
+                        response = self._page.goto(
+                            page_url, wait_until="domcontentloaded", timeout=15_000
+                        )
+                        if response is not None and response.status >= 400:
+                            raise SniffError(
+                                f"比赛页面拒绝访问（HTTP {response.status}），无法获取线路列表"
+                            )
                     except PlaywrightError as exc:
                         print(f"页面加载未完全结束，将继续嗅探: {exc}", file=sys.stderr)
-                    if preferred_line_text:
-                        self._reuse_line(preferred_line_text)
                     return self._selection_loop()
                 finally:
                     browser.close()
@@ -146,17 +183,31 @@ class StreamSniffer:
             raise ValueError("当前没有正在进行的嗅探")
         self._commands.put(str(identifier) if identifier is not None else "c")
 
+    def select_line(self, text: str) -> None:
+        text = validate_line_text(text)
+        if not self.running:
+            raise ValueError("当前没有正在进行的嗅探")
+        assert text is not None
+        with self._lock:
+            self._pending_line = text  # Also invalidate a probe already running on another line.
+            self._line_commands.put(text)
+
     def public_status(self) -> dict[str, Any]:
         now = time.monotonic()
         with self._lock:
             return {
                 "running": self.running,
                 "message": self.message,
+                "lines": list(self._lines),
+                "selected_line": self._selected_line,
+                "pending_line": self._pending_line,
                 "candidates": [
                     {
                         "id": item.identifier,
                         "url": item.display_url,
                         "kind": item.kind,
+                        "line_text": item.line_text,
+                        "browser_blocked": item.browser_blocked,
                         "active": item.active(now),
                         "cancelled": item.cancelled_until > now,
                         "countdown": max(0, round(10 - (now - item.stable_since)))
@@ -197,17 +248,71 @@ class StreamSniffer:
             except Exception:
                 pass
 
-    def _reuse_line(self, text: str) -> None:
+    def _discover_lines(self) -> None:
+        if self._page is None:
+            return
+        found: dict[str, str] = {}
+        for frame in self._page.frames:
+            try:
+                labels = frame.locator(LINE_SELECTOR).evaluate_all(
+                    """elements => elements.filter(el => el.getClientRects().length)
+                      .map(el => (el.innerText || el.textContent || '').trim())
+                      .filter(text => text.length > 0 && text.length <= 80)"""
+                )
+                for label in labels:
+                    if is_line_label(label) or (
+                        self._pending_line
+                        and normalize_line_text(label) == normalize_line_text(self._pending_line)
+                    ):
+                        found.setdefault(normalize_line_text(label), label)
+            except Exception:
+                continue  # A player frame can be replaced while changing lines.
+        with self._lock:
+            self._lines = list(found.values())
+
+    def _activate_line(self, text: str, *, force: bool = False) -> None:
+        with self._lock:
+            if force or normalize_line_text(text) != normalize_line_text(self._selected_line or ""):
+                self._generation += 1
+                self._candidates.clear()
+                self._recent_requests.clear()
+                self._blocked_requests.clear()
+                self._blocked_seen.clear()
+            self._selected_line = text
+            self._pending_line = None
+            self._auto_select = True
+            self.message = f"正在获取线路：{text}"
+
+    def _on_line_click(self, _source: Any, text: str) -> None:
+        if is_line_label(text) or (
+            self._pending_line
+            and normalize_line_text(text) == normalize_line_text(self._pending_line)
+        ):
+            self._activate_line(text)
+
+    def _reuse_line(self, text: str) -> bool:
         assert self._page is not None
-        try:
-            locator = self._page.get_by_text(text, exact=True)
-            if locator.count():
-                locator.first.click(timeout=5_000)
-                print(f"已尝试复用上次线路: {text}")
-        except Exception as exc:
-            print(f"未能自动点击上次线路“{text}”: {exc}", file=sys.stderr)
+        wanted = normalize_line_text(text)
+        labels = [label for label in self._lines if normalize_line_text(label) == wanted]
+        for frame in self._page.frames:
+            for label in labels or [text]:
+                try:
+                    locator = frame.get_by_text(label, exact=True)
+                    for index in range(locator.count()):
+                        item = locator.nth(index)
+                        if item.is_visible():
+                            self._activate_line(label, force=True)
+                            item.click(timeout=2_000)
+                            return True
+                except Exception:
+                    self._pending_line = text
+        self.message = f"未找到或无法点击线路“{text}”，请在页面或控制台重新选择"
+        return False
 
     def _on_response(self, response: Any) -> None:
+        generation = self._request_generations.get(id(response.request), self._generation)
+        if generation != self._generation or self._pending_line:
+            return
         if response.status < 200 or response.status >= 300:
             return
         now = time.monotonic()
@@ -222,7 +327,7 @@ class StreamSniffer:
                 body = response.body().decode("utf-8", errors="replace")
             except Exception:
                 return
-            if "#EXTM3U" not in body or "#EXT-X-ENDLIST" in body:
+            if not _live_playlist(body):
                 return
             # A master manifest is not itself playing. Only media playlists
             # with exact child requests can become an active candidate.
@@ -234,16 +339,10 @@ class StreamSniffer:
             kind = "flv"
 
         if kind:
-            try:
-                all_headers = response.request.all_headers()
-            except Exception:
-                all_headers = response.request.headers
-            headers = {
-                name: value
-                for name, value in all_headers.items()
-                if name.lower() in {"user-agent", "referer", "origin"}
-            }
+            headers = _request_headers(response.request)
             with self._lock:
+                if generation != self._generation or self._pending_line:
+                    return
                 candidate = self._candidates.get(url)
                 if candidate:
                     candidate.last_seen = now
@@ -255,12 +354,14 @@ class StreamSniffer:
                         headers=headers,
                         first_seen=now,
                         last_seen=now,
-                        line_text=self._last_click_text(),
-                        identifier=len(self._candidates) + 1,
+                        line_text=self._selected_line or self._last_click_text(),
+                        identifier=self._next_identifier,
                     )
+                    self._next_identifier += 1
                     self._candidates[url] = candidate
                 candidate.segments = segments
                 candidate.request_open = kind == "flv"
+                candidate.browser_blocked = False
                 candidate.last_segment_at = max(
                     (self._recent_requests.get(segment, 0) for segment in segments), default=0
                 )
@@ -268,6 +369,7 @@ class StreamSniffer:
     def _on_request(self, request: Any) -> None:
         now = time.monotonic()
         with self._lock:
+            self._request_generations[id(request)] = self._generation
             self._recent_requests[request.url] = now
             if len(self._recent_requests) > 500:
                 self._recent_requests = {
@@ -279,27 +381,112 @@ class StreamSniffer:
 
     def _on_request_finished(self, request: Any) -> None:
         with self._lock:
+            generation = self._request_generations.pop(id(request), self._generation)
+            if generation != self._generation:
+                return
             candidate = self._candidates.get(request.url)
             if candidate and candidate.kind == "flv":
                 candidate.request_open = False
+
+    def _on_request_failed(self, request: Any) -> None:
+        generation = self._request_generations.get(id(request), self._generation)
+        self._on_request_finished(request)
+        failure = (getattr(request, "failure", "") or "").lower().replace("_", "-")
+        path = urlsplit(request.url).path.lower()
+        if (
+            "mixed-content" not in failure
+            or not path.endswith((".m3u8", ".flv"))
+            or generation != self._generation
+            or self._pending_line
+            or request.url in self._blocked_seen
+        ):
+            return
+        self._blocked_seen.add(request.url)
+        self._blocked_requests.append(
+            (request.url, _request_headers(request), generation, self._selected_line)
+        )
+
+    def _read_blocked_request(self) -> None:
+        """Validate a browser-blocked live playlist without weakening Chromium."""
+        if not self._blocked_requests:
+            return
+        url, headers, generation, line = self._blocked_requests.pop(0)
+        if generation != self._generation or self._pending_line:
+            return
+        kind = "hls" if urlsplit(url).path.lower().endswith(".m3u8") else "flv"
+        segments: set[str] = set()
+        if kind == "hls":
+            try:
+                for _ in range(4):
+                    response = self._context.request.get(url, headers=headers, timeout=5_000)
+                    try:
+                        if not 200 <= response.status < 300:
+                            raise ValueError("播放列表不可用")
+                        body = response.body().decode("utf-8", errors="replace")
+                        url = response.url
+                    finally:
+                        response.dispose()
+                    if not _live_playlist(body):
+                        raise ValueError("不是直播播放列表")
+                    child = _first_variant(url, body)
+                    if child:
+                        url = child
+                        continue
+                    segments = _playlist_segments(url, body)
+                    break
+                if not segments:
+                    raise ValueError("直播播放列表没有分片")
+            except Exception:
+                self.message = "浏览器阻止了媒体请求，直播播放列表验收失败，请重新选线路"
+                return
+        with self._lock:
+            if generation != self._generation or self._pending_line:
+                return
+            now = time.monotonic()
+            self._candidates[url] = Candidate(
+                url,
+                kind,
+                headers,
+                now,
+                now,
+                line_text=line,
+                identifier=self._next_identifier,
+                segments=segments,
+                browser_blocked=True,
+            )
+            self._next_identifier += 1
+            self.message = "已获取浏览器拦截的媒体请求，等待 ffprobe 验收"
 
     def _last_click_text(self) -> str | None:
         if self._page is None:
             return None
         try:
             value = self._page.evaluate("window.__footboy_last_click || null")
-            return str(value)[:200] if value else None
+            return value if isinstance(value, str) and is_line_label(value) else None
         except Exception:
             return None
 
     def _selection_loop(self) -> Source:
         assert self._page is not None and self._context is not None
         last_print = 0.0
+        last_discovery = 0.0
         while time.monotonic() - self._started < self.timeout:
             if self._abort.is_set():
                 raise SniffError("嗅探已取消")
             self._page.wait_for_timeout(250)
             now = time.monotonic()
+            try:
+                while True:
+                    self._pending_line = self._line_commands.get_nowait()
+                    last_discovery = 0.0
+            except queue.Empty:
+                pass
+            if now - last_discovery >= 1.0 and hasattr(self._page, "frames"):
+                self._discover_lines()
+                if self._pending_line:
+                    self._reuse_line(self._pending_line)
+                last_discovery = now
+            self._read_blocked_request()
             self._update_stability(now)
             ranked = self._ranked(now)
             if now - last_print >= 1.0:
@@ -317,7 +504,7 @@ class StreamSniffer:
                 chosen = ranked[0]
             elif command.isdigit():
                 chosen = next((c for c in ranked if c.identifier == int(command)), None)
-            if chosen is None and ranked and command != "c":
+            if chosen is None and ranked and command != "c" and self._auto_select:
                 best = ranked[0]
                 if best.stable_since is not None and now - best.stable_since >= 10:
                     chosen = best
@@ -330,12 +517,14 @@ class StreamSniffer:
                     chosen.stable_since = None
                     self.message = f"线路探测失败，请换线路: {exc}"
                     print(self.message, file=sys.stderr)
-        raise SniffError("5 分钟内未确认可用直播线路")
+        raise SniffError(f"{self.timeout:g} 秒内未确认可用直播线路；{self.message}")
 
     def _update_stability(self, now: float) -> None:
         with self._lock:
             for candidate in self._candidates.values():
-                if candidate.active(now) and now >= candidate.cancelled_until:
+                if (
+                    candidate.active(now) or candidate.browser_blocked
+                ) and now >= candidate.cancelled_until:
                     if candidate.stable_since is None:
                         candidate.stable_since = now
                 else:
@@ -343,6 +532,8 @@ class StreamSniffer:
 
     def _ranked(self, now: float) -> list[Candidate]:
         with self._lock:
+            if self._pending_line:
+                return []
             return sorted(
                 self._candidates.values(),
                 key=lambda item: (
@@ -367,12 +558,19 @@ class StreamSniffer:
                 status = f"正在播放，{max(0, 10 - stable):.0f}s 后自动确认"
             elif active:
                 status = f"正在播放，稳定确认 {stable:.0f}/5s"
+            elif candidate.browser_blocked:
+                status = "浏览器拦截，等待媒体探测"
             else:
                 status = "未发现近期分片"
-            print(f"  [{candidate.identifier}] {status}  {candidate.display_url}")
+            print(
+                f"  [{candidate.identifier}] {candidate.line_text or '未命名线路'}  {status}  {candidate.display_url}"
+            )
         print("回车确认首项，输入编号确认指定项，输入 c 取消当前自动选择。", flush=True)
 
     def _confirm(self, candidate: Candidate) -> Source:
+        if self._abort.is_set():
+            raise SniffError("嗅探已取消")
+        generation = self._generation
         cookies = self._context.cookies([candidate.url, *candidate.segments])
         source = Source(
             url=candidate.url,
@@ -383,6 +581,10 @@ class StreamSniffer:
             no_proxy=self.no_proxy,
         )
         probed = ffprobe_source(source, ffprobe=self.ffprobe, timeout=15)
+        if self._abort.is_set():
+            raise SniffError("嗅探已取消")
+        if generation != self._generation or self._pending_line:
+            raise MediaProbeError("线路已更换，忽略旧线路的探测结果")
         print(
             f"已确认线路: codec={probed.video_codec}, audio={'yes' if probed.has_audio else 'no'}"
         )
@@ -431,3 +633,34 @@ def _playlist_segments(url: str, body: str) -> set[str]:
             if match:
                 result.add(urljoin(url, match.group(1)))
     return result
+
+
+def _live_playlist(body: str) -> bool:
+    return (
+        body.lstrip().startswith("#EXTM3U")
+        and "#EXT-X-ENDLIST" not in body
+        and not re.search(r"#EXT-X-PLAYLIST-TYPE:\s*VOD", body)
+    )
+
+
+def _first_variant(url: str, body: str) -> str | None:
+    variant = False
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            variant = True
+        elif variant and line and not line.startswith("#"):
+            return urljoin(url, line)
+    return None
+
+
+def _request_headers(request: Any) -> dict[str, str]:
+    try:
+        headers = request.all_headers()
+    except Exception:
+        headers = request.headers
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.lower() in {"user-agent", "referer", "origin"}
+    }

@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from http.client import HTTPConnection
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -87,7 +88,8 @@ def media_server(tmp_path):
 
         def do_GET(self):
             requests.append(dict(self.headers))
-            if self.headers.get("Cookie") != "sid=fixture":
+            cookie = SimpleCookie(self.headers.get("Cookie", "")).get("sid")
+            if cookie is None or cookie.value != "fixture":
                 self.send_error(403)
                 return
             if self.path.endswith("?paced=1"):
@@ -542,3 +544,129 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
     finally:
         app.close()
         server.stop()
+
+
+@pytest.mark.skipif(
+    os.environ.get("FOOTBOY_BROWSER_TESTS") != "1",
+    reason="设置 FOOTBOY_BROWSER_TESTS=1 并安装 Playwright Chromium 后运行",
+)
+def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_path, media_server):
+    """Synthetic streams, real browser clicks, ffprobe, FFmpeg, and HLS playback."""
+    from playwright.sync_api import expect, sync_playwright
+
+    from footboy.app import Application
+    from footboy.serve.http import ControlServer
+    from footboy.supervisor import SupervisorConfig
+
+    expect.set_options(timeout=40_000)
+    base, _ = media_server
+    make_clip(tmp_path / "video.flv", 1000, duration=160)
+    make_clip(tmp_path / "alternate.flv", 1000, duration=160)
+    make_clip(tmp_path / "bili.flv", 990, duration=160)
+
+    class PageHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            if self.path == "/match":
+                body = (
+                    '<iframe name="player" src="/empty"></iframe><iframe src="/chooser"></iframe>'
+                )
+            elif self.path == "/chooser":
+                links = '<a target="player" href="/player-1">中文高清</a> <a target="player" href="/player-5">高清直播⑤</a>'
+                body = f"<script>setTimeout(() => document.body.innerHTML = {json.dumps(links)}, 200)</script>"
+            elif self.path in {"/player-1", "/player-5"}:
+                filename = "video.flv" if self.path == "/player-1" else "alternate.flv"
+                url = json.dumps(f"{base}/{filename}?paced=1")
+                body = f"<script>fetch({url}, {{mode:'no-cors',credentials:'include'}}).catch(() => {{}})</script>"
+            else:
+                body = "<body></body>"
+            content = ("<!doctype html><html><body>" + body + "</body></html>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Set-Cookie", "sid=fixture; Path=/; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(content)
+
+    line_server = ThreadingHTTPServer(("127.0.0.1", 0), PageHandler)
+    line_worker = threading.Thread(target=line_server.serve_forever, daemon=True)
+    line_worker.start()
+    app = Application(
+        SupervisorConfig(
+            "",
+            "",
+            tmp_path / "hls",
+            tmp_path / "state.json",
+            ffmpeg=str(FFMPEG),
+            ffprobe=str(FFPROBE),
+            auto_measure=False,
+            initial_offset=10,
+            bili_direct=True,
+            headless_sniff=True,
+            video_no_proxy=True,
+            video_line_text="中文高清",
+        )
+    )
+    server = ControlServer(app, tmp_path / "hls", host="127.0.0.1", port=0)
+    server.start()
+    errors = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True, args=["--autoplay-policy=no-user-gesture-required"]
+            )
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page.set_default_timeout(40_000)
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(f"http://127.0.0.1:{server.port}/")
+            expect(page.locator("#video-line-text")).to_have_value("中文高清")
+            page.locator("#video-url").fill(f"http://127.0.0.1:{line_server.server_port}/match")
+            page.locator("#bili-url").fill(base + "/bili.flv?paced=1")
+            page.locator(".advanced > summary").click()
+            page.locator("#bili-headers").fill("Cookie: sid=fixture")
+            page.locator("#start").click()
+            expect(page.locator("#phase-text")).to_have_text("直播运行中")
+            page.wait_for_function("document.getElementById('player').readyState >= 2")
+            assert app.session.video.line_text == "中文高清"
+            initial_generation = app.session.muxer.generation
+            expect(page.locator("#line-form")).to_be_visible()
+            expect(page.locator("#line-choice option")).to_have_text(["中文高清", "高清直播⑤"])
+            page.locator("#line-choice").select_option("高清直播⑤")
+            page.locator("#switch-line").click()
+            expect(page.locator("#phase-text")).to_have_text("选择比赛线路")
+            assert app.session.muxer.health.running
+            assert app.session.muxer.generation == initial_generation
+            page.locator('[data-delta="500"]').click()
+            expect(page.locator("#offset-value")).to_have_text("+10.500")
+            expect(page.locator("#current-line")).to_contain_text("当前：高清直播⑤")
+            page.wait_for_function(
+                "generation => playerGeneration !== generation && playerGeneration !== null "
+                "&& document.getElementById('player').readyState >= 2",
+                arg=initial_generation,
+            )
+            assert app.session.video.line_text == "高清直播⑤"
+            assert app.session.applied_offset == 10.5
+            assert app.session.confidence == {"method": "manual"}
+            assert app.session.video.no_proxy
+            assert app.session.video.cookies
+            sampled = list(keyframes(app.session.video, duration=8, max_frames=1))
+            assert sampled and sampled[0][0] >= 1000
+            assert app.session.store.source_probe("video:127.0.0.1")["line_text"] == "高清直播⑤"
+            start = page.evaluate("document.getElementById('player').currentTime")
+            page.wait_for_function(
+                "start => document.getElementById('player').currentTime > start + 0.5", arg=start
+            )
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            assert not errors
+            page.locator("#stop").click()
+            expect(page.locator("#phase-text")).to_have_text("任务已停止")
+            assert not app.session.muxer.health.running
+            browser.close()
+    finally:
+        app.close()
+        server.stop()
+        line_server.shutdown()
+        line_server.server_close()
+        line_worker.join(2)

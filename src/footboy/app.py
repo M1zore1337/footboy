@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from footboy.environment import check_binary
 from footboy.sources.bili import BiliResolveError, _room_id
+from footboy.sources.lines import validate_line_text
 from footboy.supervisor import Supervisor, SupervisorConfig
 
 
@@ -89,6 +90,9 @@ class Application:
     def request_select_source(self, identifier: int | None) -> None:
         self._active_session().request_select_source(identifier)
 
+    def request_switch_line(self, text: str) -> None:
+        self._active_session().request_switch_line(text)
+
     def request_roi(self, label: str, value: dict[str, Any]) -> None:
         self._active_session().request_roi(label, value)
 
@@ -116,12 +120,18 @@ class Application:
             )
             value["active"] = self._thread is not None and self._thread.is_alive()
             value["session_id"] = self._session_id
-            value["capabilities"] = {"session_controls": True, "roi": True, "select_source": True}
+            value["capabilities"] = {
+                "session_controls": True,
+                "roi": True,
+                "select_source": True,
+                "switch_line": True,
+            }
             value["defaults"] = {
                 "auto_measure": self.defaults.auto_measure,
                 "offset_seconds": self.defaults.initial_offset,
                 "video_direct": self.defaults.video_direct,
                 "video_no_proxy": self.defaults.video_no_proxy,
+                "video_line_text": self.defaults.video_line_text,
                 "bili_direct": self.defaults.bili_direct,
             }
             return value
@@ -153,6 +163,11 @@ def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> Supervis
         bili_room_url=bili,
         video_direct=video_direct,
         video_no_proxy=_boolean(body, "video_no_proxy", defaults.video_no_proxy),
+        video_line_text=validate_line_text(
+            body.get("video_line_text", defaults.video_line_text), optional=True
+        )
+        if not video_direct
+        else None,
         bili_direct=bili_direct,
         video_headers=_headers(body.get("video_headers", defaults.video_headers)),
         bili_headers=_headers(body.get("bili_headers", defaults.bili_headers)),

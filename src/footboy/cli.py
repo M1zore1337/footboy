@@ -21,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--video-page", help="第三方比赛页面 URL；省略后从 WebUI 输入")
     result.add_argument("--bili-room", help="B站直播间 URL；与 --video-page 同时填写")
     result.add_argument("--video-direct", action="store_true", help="比赛地址为媒体直链")
+    result.add_argument("--video-line", help="比赛页面线路名称，例如 高清直播5；支持圈号数字")
     result.add_argument(
         "--video-no-proxy", action="store_true", help="比赛页面与媒体流直连，不使用代理"
     )
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         verify_interval=args.verify_interval,
         video_direct=args.video_direct,
         video_no_proxy=args.video_no_proxy,
+        video_line_text=args.video_line,
         bili_direct=args.bili_direct,
         headless_sniff=args.headless_sniff,
     )

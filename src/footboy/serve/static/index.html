@@ -61,7 +61,7 @@
           <div class="panel-heading"><div><p class="eyebrow">SOURCES</p><h2 id="sources-heading">连接直播源</h2></div><span class="step-badge">01 / 02</span></div>
           <form id="source-form">
             <fieldset id="source-fields">
-              <div class="source-field"><label for="video-url"><span class="source-number">01</span> 比赛画面<span class="tag mini">视频</span></label><input id="video-url" type="url" required placeholder="粘贴比赛页面或媒体完整地址" autocomplete="off" spellcheck="false"><p class="helper">打开比赛页面后，在本机浏览器选择播放线路。</p></div>
+              <div class="source-field"><label for="video-url"><span class="source-number">01</span> 比赛画面<span class="tag mini">视频</span></label><input id="video-url" type="url" required placeholder="粘贴比赛页面或媒体完整地址" autocomplete="off" spellcheck="false"><label class="field-label" for="video-line-text">指定线路（可选）</label><input id="video-line-text" type="text" maxlength="80" placeholder="例如：高清直播5" autocomplete="off"><p class="helper">可填线路名称自动选择；连接后也可从下方线路列表切换。</p></div>
               <div class="source-connector" aria-hidden="true"><span></span>＋<span></span></div>
               <div class="source-field"><label for="bili-url"><span class="source-number bili">02</span> B 站直播间<span class="tag mini">音源</span></label><input id="bili-url" type="url" required placeholder="粘贴 B 站直播间完整地址" autocomplete="off" spellcheck="false"><p class="helper">使用直播间声音，并识别画面里的比赛计时。</p></div>
               <div class="auto-option"><label class="checkbox"><input id="auto-measure" type="checkbox" checked><span>自动识别并对齐时钟<small>开启后每 2 分钟复核一次</small></span></label></div>
@@ -71,6 +71,7 @@
           </form>
           <div id="session-actions" class="session-actions" hidden><button id="resniff" class="button secondary small">重新选线路</button><button id="stop" class="button danger small">停止任务</button></div>
           <div id="source-info" class="source-info" hidden></div>
+          <form id="line-form" class="line-switcher" hidden><label class="field-label" for="line-choice">比赛线路</label><div class="copy-row"><select id="line-choice" aria-label="选择比赛线路"></select><button id="switch-line" class="button secondary small" type="submit">切换</button></div><p id="current-line" class="helper"></p><p class="helper">新线路验收后替换画面；自动模式会重新校准时钟。</p></form>
         </section>
 
         <section id="candidates-panel" class="panel" hidden><div class="panel-heading"><h2>选择比赛线路</h2><button id="cancel-source" class="text-button">暂停自动选择</button></div><p class="helper">优先选择正在拉取分片的线路，通过探测后开始混流。</p><div id="candidates"></div><p id="sniff-message" class="helper"></p></section>

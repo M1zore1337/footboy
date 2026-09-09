@@ -60,6 +60,7 @@ class Source:
 
     def ffmpeg_cookies(self) -> str:
         lines = []
+        parsed = urlparse(self.url)
         for item in self.cookies:
             name, value = item.get("name"), item.get("value")
             if not name or value is None:
@@ -67,6 +68,18 @@ class Source:
             path = str(item.get("path") or "/")
             domain = str(item.get("domain") or self.domain)
             lines.append(f"{name}={value}; path={path}; domain={domain};")
+            host = (parsed.hostname or "").lower()
+            cookie_domain = domain.lstrip(".").lower()
+            if parsed.port is not None and (
+                host == cookie_domain or host.endswith("." + cookie_domain)
+            ):
+                # libavformat matches cookies against the HTTP authority,
+                # including an explicit port. Keep the ordinary domain entry
+                # too, for redirects/segments that use the default authority.
+                authority = (
+                    f"[{domain}]" if ":" in domain and not domain.startswith("[") else domain
+                )
+                lines.append(f"{name}={value}; path={path}; domain={authority}:{parsed.port};")
         return "\r\n".join(lines) + ("\r\n" if lines else "")
 
     def ffmpeg_headers(self, *, include_cookies: bool = True) -> str:

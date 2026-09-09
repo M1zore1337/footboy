@@ -46,6 +46,21 @@ def test_explicit_cookie_headers_reach_all_media_clients() -> None:
     assert "Cookie: sid=secret\r\n" in source.pyav_options()["headers"]
 
 
+def test_cookie_jar_supports_explicit_ports_without_removing_domain_scope():
+    source = Source(
+        "https://cdn.example:8443/live/index.m3u8",
+        cookies=[
+            {"name": "sid", "value": "fixture", "domain": ".example", "path": "/live"},
+            {"name": "other", "value": "private", "domain": "unrelated.test", "path": "/"},
+        ],
+    )
+    jar = source.ffmpeg_cookies()
+    assert "domain=.example;" in jar and "domain=.example:8443;" in jar
+    assert "domain=unrelated.test;" in jar and "domain=unrelated.test:8443;" not in jar
+    assert source.cookie_header() == "sid=fixture"
+    assert source.pyav_options()["cookies"] == jar
+
+
 def test_cookies_for_unrelated_domains_are_not_sent_as_header() -> None:
     source = Source(
         "https://cdn.example/live/index.m3u8",

@@ -20,6 +20,7 @@ from footboy.probe.ocr import ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
 from footboy.serve.http import ControlServer
 from footboy.sources.bili import BiliResolver
+from footboy.sources.lines import validate_line_text
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 from footboy.sources.sniffer import StreamSniffer
@@ -48,6 +49,7 @@ class SupervisorConfig:
     bili_headers: dict[str, str] = field(default_factory=dict)
     headless_sniff: bool = False
     video_no_proxy: bool = False
+    video_line_text: str | None = None
 
 
 class Supervisor:
@@ -96,6 +98,8 @@ class Supervisor:
         self._measurement_cancel = threading.Event()
         self._pending_measurement: str | None = None
         self._refresh_thread: threading.Thread | None = None
+        self._line_switch_pending = False
+        self._refresh_revision: int | None = None
         self._preview_bytes: dict[str, bytes] = {}
         self._preview_meta: dict[str, dict[str, Any]] = {}
         self._needs_roi: list[str] = []
@@ -142,6 +146,22 @@ class Supervisor:
     def request_select_source(self, identifier: int | None) -> None:
         self.sniffer.select(identifier)
 
+    def request_switch_line(self, text: str) -> None:
+        text = validate_line_text(text)
+        assert text is not None
+        with self._lock:
+            if self.config.video_direct:
+                raise ValueError("媒体直链没有页面线路；更换地址请停止后重新连接")
+            if self._stop.is_set():
+                raise RuntimeError("任务正在停止")
+            if self.sniffer.running:
+                self.sniffer.select_line(text)
+                return
+            if self.video is None or self._refresh_thread is not None or self._line_switch_pending:
+                raise RuntimeError("正在获取直播源，请等待线路列表出现后再选择")
+            self._line_switch_pending = True
+            self._events.put(("switch_line", text))
+
     def request_roi(self, label: str, value: dict[str, Any]) -> None:
         if label not in {"video", "bili"}:
             raise ValueError("source 必须为 video 或 bili")
@@ -176,6 +196,8 @@ class Supervisor:
                 "video": self.video.public_dict() if self.video else None,
                 "bili": self.bili.public_dict() if self.bili else None,
                 "auto_measure": self.config.auto_measure,
+                "video_direct": self.config.video_direct,
+                "source_switching": self._line_switch_pending or self._refresh_thread is not None,
                 "sniffer": self.sniffer.public_status(),
                 "measurement": {
                     "running": self._measurement_thread is not None,
@@ -223,13 +245,23 @@ class Supervisor:
             raise MediaProbeError("B站输入不含音频，请更换直播间或直链")
         return source
 
-    def _sniff_video(self, *, headless: bool) -> Source:
+    def _sniff_video(
+        self, *, headless: bool, line_text: str | None = None, reuse_line: bool = True
+    ) -> Source:
         self._check_cancelled()
         saved = self.store.source_probe(self._video_probe_key) or {}
+        preferred = line_text
+        if preferred is None and reuse_line:
+            preferred = (
+                self.video.line_text
+                if self.video
+                else (self.config.video_line_text or saved.get("line_text"))
+            )
         source = self.sniffer.sniff(
             self.config.video_page_url,
-            preferred_line_text=self.video.line_text if self.video else saved.get("line_text"),
+            preferred_line_text=preferred,
             headless=headless,
+            auto_select=reuse_line or line_text is not None,
         )
         self._check_cancelled()
         if source.line_text:
@@ -273,6 +305,11 @@ class Supervisor:
                 self._start_measurement("manual")
             elif action == "resniff":
                 self._start_refresh(force_sniff=True)
+            elif action == "switch_line":
+                try:
+                    self._start_refresh(force_sniff=True, line_text=payload)
+                finally:
+                    self._line_switch_pending = False
             elif action == "measurement_done":
                 self._finish_measurement(*payload)
             elif action == "refresh_done":
@@ -296,6 +333,8 @@ class Supervisor:
             self.offset = round(self.offset + delta_ms / 1000.0, 3)
             self._revision += 1
             self._verify_candidate = None
+            self._pending_measurement = None
+            self._measurement_cancel.set()
             self.aligned = True
             self.confidence = {"method": "manual"}
             self.message = "手动偏移已更新，1.5 秒后应用"
@@ -464,7 +503,7 @@ class Supervisor:
             else float("inf")
         )
 
-    def _start_refresh(self, *, force_sniff: bool = False) -> None:
+    def _start_refresh(self, *, force_sniff: bool = False, line_text: str | None = None) -> None:
         if self._refresh_thread is not None or self._stop.is_set():
             return
         assert self.video is not None
@@ -473,10 +512,13 @@ class Supervisor:
             self.message = "当前使用直链；如需更换地址，请停止后重新连接"
             return
         self._set_phase("SNIFF" if force_sniff else "RECOVER", "正在重新获取直播源")
-        self._measurement_cancel.set()
-        self._source_generation += 1
-        self._verify_candidate = None
-        self.aligned = False
+        with self._lock:
+            self._measurement_cancel.set()
+            self._source_generation += 1
+            self._refresh_revision = self._revision
+            self._verify_candidate = None
+            self.aligned = False
+            self.confidence = None
 
         def worker() -> None:
             sources, error = None, None
@@ -484,7 +526,9 @@ class Supervisor:
                 bili = self._resolve_bili()
                 self._check_cancelled()
                 if force_sniff:
-                    video = self._sniff_video(headless=self.config.headless_sniff)
+                    video = self._sniff_video(
+                        headless=self.config.headless_sniff, line_text=line_text, reuse_line=False
+                    )
                 else:
                     video = previous
                     try:
@@ -511,9 +555,16 @@ class Supervisor:
         forced: bool,
     ) -> None:
         self._refresh_thread = None
+        refresh_revision, self._refresh_revision = self._refresh_revision, None
         if self._stop.is_set():
             return
         if error is not None:
+            if forced and self.muxer.health.running:
+                self._set_phase(
+                    "RUN", f"换线失败，保留原线路和当前偏移：{_sanitize_ffmpeg_line(str(error))}"
+                )
+                self._schedule_verify()
+                return
             self._recovery_attempts += 1
             delay = min(30, 5 * self._recovery_attempts)
             self._next_recover = time.monotonic() + delay
@@ -524,6 +575,10 @@ class Supervisor:
             return
         assert sources is not None
         self.video, self.bili = sources
+        with self._lock:
+            self._preview_bytes.clear()
+            self._preview_meta.clear()
+            self._needs_roi = []
         try:
             with self._lock:
                 value, revision = self.offset, self._revision
@@ -539,7 +594,16 @@ class Supervisor:
         self._recovery_attempts = 0
         self._reset_health_window()
         self._set_phase("RUN", "已使用上次偏移恢复，源时间轴需要重新确认")
-        if self.config.auto_measure:
+        manual_changed = (
+            refresh_revision is not None
+            and refresh_revision != self._revision
+            and self.confidence is not None
+            and self.confidence.get("method") == "manual"
+        )
+        if manual_changed and self._pending_measurement is None:
+            self.message = "线路已切换，保留切换期间的最新手动偏移"
+            self._schedule_verify()
+        elif self.config.auto_measure or self._pending_measurement == "manual":
             if self._measurement_thread is not None:
                 self._pending_measurement = "initial"
             else:

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
 
+from footboy.sources.lines import validate_line_text
+
 MIME_TYPES = {
     ".m3u8": "application/vnd.apple.mpegurl",
     ".ts": "video/mp2t",
@@ -166,6 +168,10 @@ def _handler_factory(controller: Controller, hls_dir: Path) -> type[BaseHTTPRequ
                     ):
                         raise ValueError("线路 id 必须是正整数；null 取消自动选择")
                     self._controller_action("request_select_source", identifier)
+                elif path == "/api/line":
+                    self._controller_action(
+                        "request_switch_line", validate_line_text(body.get("text"))
+                    )
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return

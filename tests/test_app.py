@@ -30,6 +30,8 @@ def body(**changes):
         {"bili_url": "https://evil.example/live.bilibili.com/123"},
         {"auto_measure": "false"},
         {"video_no_proxy": "false"},
+        {"video_line_text": ["高清直播5"]},
+        {"video_line_text": "https://cdn.example/live.m3u8"},
         {"offset_seconds": float("nan")},
         {"video_headers": {"Referer": "value\r\nInjected: true"}},
     ],
@@ -62,6 +64,16 @@ def test_video_proxy_setting_inherits_cli_default_and_allows_web_override(tmp_pa
     assert Application(config).public_status()["defaults"]["video_no_proxy"] is True
     assert session_config(config, body()).video_no_proxy is True
     assert session_config(config, body(video_no_proxy=False)).video_no_proxy is False
+
+
+def test_named_line_inherits_defaults_and_supports_web_override(tmp_path):
+    config = defaults(tmp_path)
+    config.video_line_text = "高清直播5"
+    assert Application(config).public_status()["defaults"]["video_line_text"] == "高清直播5"
+    assert session_config(config, body()).video_line_text == "高清直播5"
+    assert session_config(config, body(video_line_text="中文高清")).video_line_text == "中文高清"
+    assert session_config(config, body(video_line_text="")).video_line_text is None
+    assert session_config(config, body(video_direct=True)).video_line_text is None
 
 
 def test_console_survives_stop_and_allows_another_session(tmp_path, monkeypatch) -> None:

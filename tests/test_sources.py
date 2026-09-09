@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from footboy.sources.bili import BiliResolveError, BiliResolver, _room_id
+from footboy.sources.lines import is_line_label, normalize_line_text
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 from footboy.sources.sniffer import Candidate, SniffError, StreamSniffer, _playlist_segments
@@ -217,3 +218,111 @@ def test_manual_probe_failure_leaves_sniffer_available_for_another_selection(mon
     monkeypatch.setattr(sniffer, "_confirm", confirm)
     assert sniffer._selection_loop().url == candidates[1].url
     assert candidates[0].cancelled_until > time.monotonic()
+
+
+def test_line_names_support_circled_digits_and_exclude_navigation():
+    assert normalize_line_text(" 高清 直播⑤ ") == normalize_line_text("高清直播５")
+    assert all(is_line_label(text) for text in ("中文高清", "高清直播⑤", "主播解说①"))
+    assert not is_line_label("返回首页")
+    assert not is_line_label("足球直播导航")
+
+
+def test_old_line_responses_and_pending_default_candidates_are_ignored():
+    sniffer = StreamSniffer()
+    sniffer._activate_line("中文高清")
+    old = response("https://cdn.example/old.flv", content_type="video/x-flv")
+    old.request.url = old.url
+    sniffer._on_request(old.request)
+    sniffer._activate_line("高清直播⑤")
+    sniffer._on_response(old)
+    assert not sniffer._candidates
+    current = response("https://cdn.example/new.flv", content_type="video/x-flv")
+    sniffer._on_response(current)
+    assert sniffer._ranked(0)[0].line_text == "高清直播⑤"
+    sniffer._pending_line = "不存在的线路"
+    assert sniffer._ranked(0) == []
+
+
+def test_line_request_during_probe_prevents_accepting_previous_source(monkeypatch):
+    sniffer = StreamSniffer()
+    sniffer.running = True
+    sniffer._activate_line("中文高清")
+    sniffer._context = SimpleNamespace(cookies=lambda _: [])
+
+    def probe(source, **kwargs):
+        sniffer.select_line("高清直播5")
+        return source
+
+    monkeypatch.setattr("footboy.sources.sniffer.ffprobe_source", probe)
+    candidate = Candidate("https://cdn.example/live.flv", "flv", {}, 0, 0)
+    with pytest.raises(MediaProbeError, match="忽略旧线路"):
+        sniffer._confirm(candidate)
+    assert sniffer.public_status()["pending_line"] == "高清直播5"
+
+
+def blocked_request(url="http://cdn.example/master.m3u8?token=private", failure="mixed-content"):
+    return SimpleNamespace(
+        url=url,
+        failure=failure,
+        all_headers=lambda: {"user-agent": "Fixture", "referer": "https://player.example/"},
+    )
+
+
+def api_response(url, body, status=200):
+    return SimpleNamespace(url=url, status=status, body=lambda: body.encode(), dispose=lambda: None)
+
+
+def test_mixed_content_fallback_checks_live_variant_and_preserves_context(monkeypatch):
+    sniffer = StreamSniffer(no_proxy=True)
+    sniffer._activate_line("高清直播⑤")
+    request = blocked_request()
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            return api_response(url, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000\nvideo.m3u8\n")
+        return api_response(url, "#EXTM3U\n#EXTINF:2,\nchunk.ts\n")
+
+    sniffer._context = SimpleNamespace(
+        request=SimpleNamespace(get=get),
+        cookies=lambda _: [{"name": "sid", "value": "fixture", "domain": "cdn.example"}],
+    )
+    sniffer._on_request(request)
+    sniffer._on_request_failed(request)
+    sniffer._read_blocked_request()
+    candidate = next(iter(sniffer._candidates.values()))
+    assert candidate.url == "http://cdn.example/video.m3u8"
+    assert candidate.line_text == "高清直播⑤" and candidate.browser_blocked
+    assert candidate.segments == {"http://cdn.example/chunk.ts"}
+    assert not candidate.active(0)  # Do not claim the browser played blocked media.
+    assert calls[1][1]["headers"]["referer"] == "https://player.example/"
+    monkeypatch.setattr("footboy.sources.sniffer.ffprobe_source", lambda source, **_: source)
+    source = sniffer._confirm(candidate)
+    assert source.no_proxy and source.cookie_header() == "sid=fixture"
+    assert source.header("referer") == "https://player.example/"
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        ("#EXTM3U\n#EXTINF:2,\nchunk.ts\n#EXT-X-ENDLIST", 200),
+        ("#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:2,\nchunk.ts", 200),
+        ("#EXTM3U\n#EXTINF:2,\nchunk.ts", 403),
+        ("<html>Unavailable</html>", 200),
+    ],
+)
+def test_mixed_content_fallback_rejects_vod_and_bad_responses(body, status):
+    sniffer = StreamSniffer()
+    sniffer._context = SimpleNamespace(
+        request=SimpleNamespace(get=lambda url, **_: api_response(url, body, status))
+    )
+    sniffer._on_request_failed(blocked_request())
+    sniffer._read_blocked_request()
+    assert not sniffer._candidates
+
+
+def test_other_request_failures_do_not_bypass_response_checks():
+    sniffer = StreamSniffer()
+    sniffer._on_request_failed(blocked_request(failure="net::ERR_CONNECTION_REFUSED"))
+    assert not sniffer._blocked_requests and not sniffer._candidates

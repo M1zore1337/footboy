@@ -18,6 +18,7 @@ class FakeController:
         self.stops = 0
         self.rois = []
         self.selections = []
+        self.lines = []
 
     def public_status(self):
         return {"state": "RUN", "offset_seconds": -1.5, "aligned": True}
@@ -42,6 +43,9 @@ class FakeController:
 
     def request_select_source(self, identifier):
         self.selections.append(identifier)
+
+    def request_switch_line(self, text):
+        self.lines.append(text)
 
     def preview(self, label):
         return b"jpeg-fixture" if label == "video" else None
@@ -152,6 +156,7 @@ def test_web_actions_and_snapshot(running_server):
         ("roi", {"source": "video", "roi": [0, 0, 0.2, 0.2], "flip": "h", "inverted": False}),
         ("source", {"id": 2}),
         ("source", {"id": None}),
+        ("line", {"text": "高清直播5"}),
     ):
         request = urllib.request.Request(
             base + "/api/" + route, data=json.dumps(value).encode(), method="POST"
@@ -162,9 +167,23 @@ def test_web_actions_and_snapshot(running_server):
     assert controller.stops == 1
     assert controller.rois[0][0] == "video"
     assert controller.selections == [2, None]
+    assert controller.lines == ["高清直播5"]
     with urllib.request.urlopen(base + "/api/snapshot/video.jpg") as response:
         assert response.headers.get_content_type() == "image/jpeg"
         assert response.read() == b"jpeg-fixture"
+
+
+@pytest.mark.parametrize(
+    "value", [None, [], "", "https://cdn.example/live.m3u8", "高清\n直播5", "x" * 81]
+)
+def test_invalid_line_names_do_not_reach_controller(running_server, value):
+    controller, base = running_server
+    request = urllib.request.Request(
+        base + "/api/line", data=json.dumps({"text": value}).encode(), method="POST"
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == 400 and not controller.lines
 
 
 def test_web_assets_are_served_locally(running_server):

@@ -282,7 +282,9 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
         frame = cv2.resize(frame, (1280, round(height * 1280 / width)))
     height, width = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    kernel = np.ones((1, max(2, round(width * 0.004))), dtype=np.uint8)
+    # Broadcast clocks can leave a wider gap around the colon. Keep the narrow
+    # grouping for tiny clocks, and also join the complete spaced mm:ss line.
+    kernels = [np.ones((1, max(2, round(width * gap))), dtype=np.uint8) for gap in (0.004, 0.006)]
     boxes = set()
     for threshold, mode in ((175, cv2.THRESH_BINARY), (80, cv2.THRESH_BINARY_INV)):
         _, mask = cv2.threshold(gray, threshold, 255, mode)
@@ -290,16 +292,17 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
         mask[round(height * 0.62) : round(height * 0.75), :] = 0
         mask[round(height * 0.38) : round(height * 0.62), : round(width * 0.24)] = 0
         mask[round(height * 0.38) : round(height * 0.62), round(width * 0.76) :] = 0
-        joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(joined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if not max(6, height * 0.008) <= h <= height * 0.08 or not 1.3 <= w / h <= 8:
-                continue
-            pad_x, pad_y = max(2, math.ceil(h * 0.3)), max(2, math.ceil(h * 0.12))
-            left, top = max(0, x - pad_x), max(0, y - pad_y)
-            right, bottom = min(width, x + w + pad_x), min(height, y + h + pad_y)
-            boxes.add((left, top, right - left, bottom - top))
+        for kernel in kernels:
+            joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(joined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                if not max(6, height * 0.008) <= h <= height * 0.08 or not 1.3 <= w / h <= 8:
+                    continue
+                pad_x, pad_y = max(2, math.ceil(h * 0.3)), max(2, math.ceil(h * 0.12))
+                left, top = max(0, x - pad_x), max(0, y - pad_y)
+                right, bottom = min(width, x + w + pad_x), min(height, y + h + pad_y)
+                boxes.add((left, top, right - left, bottom - top))
     ordered = sorted(boxes, key=lambda box: (box[1], box[0]))
     return [(x / width, y / height, w / width, h / height) for x, y, w, h in ordered[:64]]
 
