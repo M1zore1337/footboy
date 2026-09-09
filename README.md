@@ -35,6 +35,10 @@ footboy
 
 手动调节会合并连续点击，在最后一次点击 1.5 秒后应用；较早启动的 OCR 不会覆盖新的手动设置。停止任务后控制页保持可用，可重新连接。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用包内 hls.js，控制页不依赖外部 CDN。Chromium 即使声明支持原生 HLS，也优先使用 hls.js，避免部分真实直播分片在原生播放器中解析失败。
 
+“音源音量”提供两个独立的 0–100% 滑块：原直播音量与 B 站解说音量。勾选“保留原直播声音”后可混入原音轨，调节任何一路不会改变另一路，0% 为该路静音。原音轨中的现场声与自带解说会一起保留，不能单独分离。设置作用于合成 HLS，保留到本次任务结束；拖动停止后合并应用并重新缓冲。混音或调整解说音量时仅音频转 AAC，视频仍复制。没有原音轨时禁用原声开关。
+
+画面卡顿后可点击“立即同步”：重新 OCR 测量 `D = K_B - K_V`，成功后刷新混流与播放器，即使偏移没变也重新接续播放。没有可读的连续比赛计时则保留当前偏移。首次连接且没有保存或手动指定的偏移时，并行采样两路 PTS 估算初始时间轴以减少无声等待；该估算不代表比赛内容已对齐，也不保存为正式偏移。
+
 命令行默认设置会同步到 WebUI，例如 `footboy --no-auto-measure --offset 0`。用 `--ffmpeg /path/to/ffmpeg --ffprobe /path/to/ffprobe` 可指定程序位置；Ctrl+C 会停止取流、关闭浏览器并让 FFmpeg 刷新播放列表。
 
 比赛网站需要直连时，在“直链与初始偏移”中勾选“比赛源直连（不走代理）”，或启动时传 `footboy --video-no-proxy`。该设置覆盖比赛页面嗅探、媒体探测、OCR 采样、混流以及 HLS 分片和密钥请求；B 站继续使用原有代理设置。`footboy-p0` 也支持 `--video-no-proxy`。
@@ -92,6 +96,7 @@ footboy --video-page ... --bili-room ... --no-auto-measure --offset 0
 - `POST /api/stop`
 - `POST /api/offset`，JSON 为 `{"delta_ms": 500}`（相对调整）
 - `POST /api/remeasure`
+- `POST /api/audio`，例如 `{"original_enabled":true,"original_volume":0.25,"commentary_volume":0.8}`；支持只提交一个字段，两路音量独立，范围 0–1
 - `POST /api/resniff`
 - `POST /api/source`，JSON 为 `{"id":1}`；`{"id":null}` 暂停当前候选自动选择
 - `POST /api/line`，JSON 为 `{"text":"高清直播5"}`；嗅探中点击该线路，运行中重新获取并切换

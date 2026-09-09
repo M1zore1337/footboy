@@ -15,9 +15,10 @@ import cv2
 import numpy as np
 
 from footboy.environment import binary_crash_reason
-from footboy.mux.ffmpeg import FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
+from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
 from footboy.probe.ocr import ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
+from footboy.probe.timeline import estimate_initial_offset
 from footboy.serve.http import ControlServer
 from footboy.sources.bili import BiliResolver
 from footboy.sources.lines import validate_line_text
@@ -83,6 +84,8 @@ class Supervisor:
         self._stop = threading.Event()
         self._adjust_deadline: float | None = None
         self._revision = 0
+        self.audio = AudioMix()
+        self._audio_revision = 0
         self._source_generation = 0
         self._verify_candidate: float | None = None
         self._video_http_failures = 0
@@ -140,6 +143,21 @@ class Supervisor:
     def request_remeasure(self) -> None:
         self._events.put(("remeasure", None))
 
+    def request_audio(self, body: dict[str, Any]) -> None:
+        with self._lock:
+            values = self.audio.public_dict()
+            if not body or set(body) - set(values):
+                raise ValueError("音量设置字段无效")
+            values.update(body)
+            audio = AudioMix(**values)
+            if self.video is None or self._stop.is_set():
+                raise RuntimeError("请等待直播连接完成")
+            if audio.original_enabled and not self.video.has_audio:
+                raise ValueError("当前原直播不含音轨")
+            self.audio = audio
+            self._audio_revision += 1
+            self._adjust_deadline = time.monotonic() + 1.5
+
     def request_resniff(self) -> None:
         self._events.put(("resniff", None))
 
@@ -188,6 +206,8 @@ class Supervisor:
                 "offset_seconds": round(self.offset, 3),
                 "applied_offset_seconds": self.applied_offset,
                 "adjust_pending": self._adjust_deadline is not None,
+                "audio": self.audio.public_dict(),
+                "applied_audio": self.muxer.audio.public_dict(),
                 "confidence": self.confidence,
                 "last_verified_at": self.last_verified_at,
                 "message": self.message,
@@ -283,13 +303,33 @@ class Supervisor:
         else:
             self.video = self._sniff_video(headless=self.config.headless_sniff)
         self._check_cancelled()
+        timeline_message = ""
+        if (
+            self.config.initial_offset is None
+            and self.store.offset(self._offset_key) is None
+            and self._revision == 0
+        ):
+            revision = self._revision
+            self._set_phase("INIT", "正在估算两路起始时间轴")
+            try:
+                initial = estimate_initial_offset(self.video, self.bili, stop_event=self._stop)
+                with self._lock:
+                    if revision == self._revision:
+                        self.offset = initial
+                        self.aligned = False
+                        self.confidence = {"method": "timeline-estimate"}
+                        timeline_message = "；时间轴已粗略接续，比赛内容尚未对齐"
+            except Exception:
+                timeline_message = "；起始时间轴采样失败，可能暂时无声，请重测或手动设置偏移"
+        self._check_cancelled()
         with self._lock:
             self._source_generation += 1
+            self.muxer.audio = self.audio
             self.muxer.start(self.video, self.bili, self.offset, fresh=True)
             self.applied_offset = self.offset
             self._adjust_deadline = None
         self._reset_health_window()
-        self._set_phase("RUN", "混流已启动；可随时手动调整声音时间")
+        self._set_phase("RUN", "混流已启动；可随时手动调整声音时间" + timeline_message)
         if self.config.auto_measure:
             self._start_measurement("initial")
 
@@ -345,11 +385,13 @@ class Supervisor:
         assert self.video is not None and self.bili is not None
         with self._lock:
             value, revision = self.offset, self._revision
+            audio_revision = self._audio_revision
+            self.muxer.audio = self.audio
         self._set_phase("ADJUST", f"正在应用偏移 D={value:.3f}s")
         self.muxer.restart(self.video, self.bili, value)
         with self._lock:
             self.applied_offset = value
-            if revision == self._revision:
+            if revision == self._revision and audio_revision == self._audio_revision:
                 self._adjust_deadline = None
         self._reset_health_window()
         self._set_phase("RUN", "偏移已应用，等待新分片后继续播放")
@@ -492,7 +534,11 @@ class Supervisor:
             self.offset = round(result.offset, 3)
             self.aligned = True
             self.store.set_offset(self._offset_key, self.offset)
-            if self.applied_offset is None or abs(self.offset - self.applied_offset) > 0.001:
+            if (
+                mode == "manual"
+                or self.applied_offset is None
+                or abs(self.offset - self.applied_offset) > 0.001
+            ):
                 self._adjust_deadline = time.monotonic() + 1.5
             self.message = f"OCR 已锁定，D={self.offset:.3f}s"
 
@@ -582,10 +628,16 @@ class Supervisor:
         try:
             with self._lock:
                 value, revision = self.offset, self._revision
+                audio_revision = self._audio_revision
+                if self.audio.original_enabled and not self.video.has_audio:
+                    self.audio = AudioMix(
+                        False, self.audio.original_volume, self.audio.commentary_volume
+                    )
+                self.muxer.audio = self.audio
             self.muxer.restart(self.video, self.bili, value)
             with self._lock:
                 self.applied_offset = value
-                if revision == self._revision:
+                if revision == self._revision and audio_revision == self._audio_revision:
                     self._adjust_deadline = None
         except Exception as exc:
             self._next_recover = time.monotonic() + 5

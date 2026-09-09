@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from footboy.probe.timeline import sample_audio_start
 from footboy.sources.models import DIRECT_HTTP_PROXY, Source
 
 SPEED_RE = re.compile(r"speed=\s*([0-9.]+)x")
@@ -19,6 +20,29 @@ DTS_RE = re.compile(r"non[- ]monoton(?:ic|ous).*dts", re.IGNORECASE)
 
 class MuxError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AudioMix:
+    original_enabled: bool = False
+    original_volume: float = 1.0
+    commentary_volume: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.original_enabled, bool):
+            raise ValueError("原直播声音开关必须为布尔值")
+        for value in (self.original_volume, self.commentary_volume):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("音量必须是 0 到 1 的数值")
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError("音量必须是 0 到 1 的数值")
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "original_enabled": self.original_enabled,
+            "original_volume": self.original_volume,
+            "commentary_volume": self.commentary_volume,
+        }
 
 
 @dataclass(slots=True)
@@ -58,6 +82,8 @@ def build_ffmpeg_command(
     *,
     ffmpeg: str | Path = "ffmpeg",
     generation: int | None = None,
+    audio: AudioMix | None = None,
+    audio_origin: float | None = None,
 ) -> list[str]:
     if not math.isfinite(offset):
         raise ValueError("偏移必须是有限数值")
@@ -79,8 +105,37 @@ def build_ffmpeg_command(
     command.extend(["-i", video.url, "-itsoffset", _format_offset(offset)])
     command.extend(_input_options(bili, video_input=False))
     command.extend(["-i", bili.url])
-    command.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"])
-    if (bili.audio_codec or "").lower() in {"aac", "mp4a"}:
+    audio = audio or AudioMix()
+    filtered = audio.original_enabled or audio.commentary_volume != 1
+    command.extend(["-map", "0:v:0", "-c:v", "copy"])
+    if audio.original_enabled:
+        if not video.has_audio:
+            raise ValueError("当前原直播不含音轨")
+        if audio_origin is None or not math.isfinite(audio_origin):
+            raise ValueError("混音需要有效的原直播音频起始 PTS")
+        # amix combines samples, not timestamps. Give both inputs the same
+        # source-PTS origin before mixing, including silence or trimming.
+        # first_pts is interpreted at the input sample rate. Normalize that
+        # rate first so 44.1 kHz sources use the same anchor as 48 kHz sources.
+        resample = (
+            f"aresample=48000,aresample=48000:async=1:first_pts={round(audio_origin * 48000)}"
+        )
+        command.extend(
+            [
+                "-filter_complex",
+                f"[0:a:0]{resample},volume={audio.original_volume:.6f}[original];"
+                f"[1:a:0]{resample},volume={audio.commentary_volume:.6f}[commentary];"
+                "[original][commentary]amix=inputs=2:duration=longest:normalize=0,"
+                "alimiter=limit=0.95:level=false:latency=1[mixed]",
+                "-map",
+                "[mixed]",
+            ]
+        )
+    else:
+        command.extend(["-map", "1:a:0"])
+        if filtered:
+            command.extend(["-af", f"volume={audio.commentary_volume:.6f}"])
+    if not filtered and (bili.audio_codec or "").lower() in {"aac", "mp4a"}:
         command.extend(["-c:a", "copy"])
     else:
         command.extend(["-c:a", "aac", "-b:a", "128k"])
@@ -151,6 +206,8 @@ class FfmpegMuxer:
         self._reader: threading.Thread | None = None
         self._lock = threading.RLock()
         self.generation = 0
+        self.audio = AudioMix()
+        self.audio_origin: float | None = None
 
     def start(self, video: Source, bili: Source, offset: float, *, fresh: bool = False) -> None:
         with self._lock:
@@ -160,6 +217,7 @@ class FfmpegMuxer:
             if fresh:
                 self._clear_generated_outputs()
             self.generation = max(self.generation + 1, time.time_ns() // 1_000_000)
+            self.audio_origin = sample_audio_start(video) if self.audio.original_enabled else None
             command = build_ffmpeg_command(
                 video,
                 bili,
@@ -167,6 +225,8 @@ class FfmpegMuxer:
                 self.output_dir,
                 ffmpeg=self.ffmpeg,
                 generation=self.generation,
+                audio=self.audio,
+                audio_origin=self.audio_origin,
             )
             flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
@@ -242,7 +302,15 @@ class FfmpegMuxer:
             return self._process.poll() if self._process else self.health.returncode
 
     def command(self, video: Source, bili: Source, offset: float) -> list[str]:
-        return build_ffmpeg_command(video, bili, offset, self.output_dir, ffmpeg=self.ffmpeg)
+        return build_ffmpeg_command(
+            video,
+            bili,
+            offset,
+            self.output_dir,
+            ffmpeg=self.ffmpeg,
+            audio=self.audio,
+            audio_origin=self.audio_origin,
+        )
 
     def _refresh_exit(self) -> None:
         if self._process:

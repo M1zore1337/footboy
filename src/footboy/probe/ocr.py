@@ -284,7 +284,9 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     # Broadcast clocks can leave a wider gap around the colon. Keep the narrow
     # grouping for tiny clocks, and also join the complete spaced mm:ss line.
-    kernels = [np.ones((1, max(2, round(width * gap))), dtype=np.uint8) for gap in (0.004, 0.006)]
+    kernels = [
+        np.ones((1, max(2, round(width * gap))), dtype=np.uint8) for gap in (0.004, 0.006, 0.024)
+    ]
     boxes = set()
     for threshold, mode in ((175, cv2.THRESH_BINARY), (80, cv2.THRESH_BINARY_INV)):
         _, mask = cv2.threshold(gray, threshold, 255, mode)
@@ -294,7 +296,9 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
         mask[round(height * 0.38) : round(height * 0.62), round(width * 0.76) :] = 0
         for kernel in kernels:
             joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            contours, _ = cv2.findContours(joined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Dark digits inside a bright scoreboard are nested contours.
+            retrieval = cv2.RETR_LIST if kernel.shape[1] > width * 0.01 else cv2.RETR_EXTERNAL
+            contours, _ = cv2.findContours(joined, retrieval, cv2.CHAIN_APPROX_SIMPLE)
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 if not max(6, height * 0.008) <= h <= height * 0.08 or not 1.3 <= w / h <= 8:

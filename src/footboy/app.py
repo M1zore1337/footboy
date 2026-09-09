@@ -84,6 +84,9 @@ class Application:
     def request_remeasure(self) -> None:
         self._active_session().request_remeasure()
 
+    def request_audio(self, body: dict[str, Any]) -> None:
+        self._active_session().request_audio(body)
+
     def request_resniff(self) -> None:
         self._active_session().request_resniff()
 
@@ -125,6 +128,7 @@ class Application:
                 "roi": True,
                 "select_source": True,
                 "switch_line": True,
+                "audio_mix": True,
             }
             value["defaults"] = {
                 "auto_measure": self.defaults.auto_measure,

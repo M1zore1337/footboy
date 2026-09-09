@@ -75,6 +75,27 @@ def test_tesseract_stopped_clock_is_rejected():
         )
 
 
+def test_tesseract_discovers_large_dark_clock_inside_bright_scoreboard():
+    frames = []
+    for index in range(4):
+        image = np.full((720, 1280, 3), 20, dtype=np.uint8)
+        cv2.rectangle(image, (83, 62), (345, 145), (245, 245, 245), -1)
+        cv2.putText(
+            image,
+            f"47:{8 + index * 2:02}",
+            (115, 129),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.6,
+            (15, 15, 15),
+            3,
+            cv2.LINE_AA,
+        )
+        frames.append((8000 + index * 2, image))
+    result = probe_clock(frames, TesseractBackend(TESSERACT), allow_manual=False)
+    assert result.k == pytest.approx(2828 - 8000)
+    assert len(result.samples) >= 3
+
+
 def compact_clock_frames(*, flip="none"):
     """Synthetic condensed digits with scoreboard clutter and a decoy countdown."""
     frames = []

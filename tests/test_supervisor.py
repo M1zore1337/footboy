@@ -173,6 +173,7 @@ def test_direct_mode_only_disables_proxy_for_the_video_source(tmp_path, monkeypa
         return source
 
     monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr("footboy.supervisor.estimate_initial_offset", lambda *a, **k: -4719.0)
     monkeypatch.setattr(
         supervisor.muxer,
         "start",
@@ -183,6 +184,9 @@ def test_direct_mode_only_disables_proxy_for_the_video_source(tmp_path, monkeypa
     assert started == [supervisor.video, supervisor.bili]
     assert supervisor.video.no_proxy and not supervisor.bili.no_proxy
     assert [source.no_proxy for source in probed] == [False, True]
+    assert supervisor.offset == -4719.0
+    assert not supervisor.aligned
+    assert supervisor.store.offset(supervisor._offset_key) is None
 
 
 def test_native_mux_crash_stops_recovery_and_cancels_stale_measurements(tmp_path, monkeypatch):

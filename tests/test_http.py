@@ -19,6 +19,7 @@ class FakeController:
         self.rois = []
         self.selections = []
         self.lines = []
+        self.audio = []
 
     def public_status(self):
         return {"state": "RUN", "offset_seconds": -1.5, "aligned": True}
@@ -28,6 +29,9 @@ class FakeController:
 
     def request_remeasure(self) -> None:
         self.remeasure += 1
+
+    def request_audio(self, body):
+        self.audio.append(body)
 
     def request_resniff(self) -> None:
         self.resniff += 1
@@ -99,6 +103,19 @@ def test_control_actions_and_validation(running_server) -> None:
     with pytest.raises(urllib.error.HTTPError) as error:
         urllib.request.urlopen(bad)
     assert error.value.code == 400
+
+
+def test_audio_control_accepts_independent_partial_updates(running_server):
+    controller, base = running_server
+    for body in ({"original_volume": 0.3}, {"commentary_volume": 0}):
+        request = urllib.request.Request(
+            base + "/api/audio",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 202
+    assert controller.audio == [{"original_volume": 0.3}, {"commentary_volume": 0}]
 
 
 def test_path_traversal_is_not_served(running_server) -> None:

@@ -19,7 +19,7 @@ import av
 import numpy as np
 import pytest
 
-from footboy.mux.ffmpeg import FfmpegMuxer
+from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer
 from footboy.probe.frames import keyframes
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
@@ -29,7 +29,15 @@ FFPROBE = os.environ.get("FOOTBOY_FFPROBE") or shutil.which("ffprobe")
 pytestmark = pytest.mark.skipif(not FFMPEG or not FFPROBE, reason="需要 FFmpeg / ffprobe")
 
 
-def make_clip(path: Path, origin: float, *, hevc: bool = False, duration: float = 8) -> None:
+def make_clip(
+    path: Path,
+    origin: float,
+    *,
+    hevc: bool = False,
+    duration: float = 8,
+    frequency: int = 700,
+    sample_rate: int = 48000,
+) -> None:
     command = [
         str(FFMPEG),
         "-hide_banner",
@@ -43,7 +51,7 @@ def make_clip(path: Path, origin: float, *, hevc: bool = False, duration: float 
         "-f",
         "lavfi",
         "-i",
-        "sine=frequency=700:sample_rate=48000",
+        f"sine=frequency={frequency}:sample_rate={sample_rate}",
         "-t",
         str(duration),
         "-c:v",
@@ -260,6 +268,113 @@ def test_signed_offsets_preserve_relative_pts_and_video_pixels(tmp_path, media_s
         assert all(row.get("Referer") == "https://page.example/" for row in requests)
     finally:
         mux.stop()
+
+
+@pytest.mark.parametrize("original,commentary", [(1, 1), (0.25, 1), (1, 0.25), (0, 1), (1, 0)])
+@pytest.mark.parametrize("sample_rate", [44100, 48000])
+def test_independent_audio_gains_in_actual_mux(tmp_path, original, commentary, sample_rate):
+    video_file, bili_file = tmp_path / "video.flv", tmp_path / "bili.flv"
+    make_clip(video_file, 1000, frequency=700, sample_rate=sample_rate)
+    make_clip(bili_file, 5719, frequency=1200)
+    video, bili = source(str(video_file)), source(str(bili_file))
+    video.headers.clear()
+    bili.headers.clear()
+    output = tmp_path / "hls"
+    mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+    mux.audio = AudioMix(True, original, commentary)
+    try:
+        mux.start(video, bili, -4719)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        pts = first_pts(output / "live.m3u8")
+        assert abs(pts["video"] - pts["audio"]) < 0.1
+        assert np.array_equal(first_picture(video_file), first_picture(output / "live.m3u8"))
+        result = subprocess.run(
+            [
+                str(FFMPEG),
+                "-v",
+                "error",
+                "-i",
+                str(output / "live.m3u8"),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-f",
+                "f32le",
+                "-",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+        samples = np.frombuffer(result.stdout, dtype=np.float32)[48000:144000]
+        assert len(samples) == 96000
+        spectrum = abs(np.fft.rfft(samples)) / len(samples) * 2
+        for frequency, gain in [(700, original), (1200, commentary)]:
+            amplitude = spectrum[frequency * 2 - 1 : frequency * 2 + 2].max()
+            assert amplitude == pytest.approx(0.125 * gain, abs=0.012)
+    finally:
+        mux.stop()
+
+
+def test_mixing_respects_delayed_commentary_pts(tmp_path):
+    video_file, bili_file = tmp_path / "video.flv", tmp_path / "bili.flv"
+    make_clip(video_file, 1000, frequency=700, sample_rate=44100)
+    make_clip(bili_file, 5719, frequency=1200)
+    video = Source(str(video_file), has_audio=True, video_codec="h264")
+    bili = Source(str(bili_file), has_audio=True, audio_codec="aac")
+    mux = FfmpegMuxer(tmp_path / "hls", ffmpeg=str(FFMPEG))
+    mux.audio = AudioMix(True, 1, 1)
+    try:
+        mux.start(video, bili, -4717)  # Commentary starts two seconds after the video.
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        result = subprocess.run(
+            [
+                str(FFMPEG),
+                "-v",
+                "error",
+                "-i",
+                str(mux.output_dir / "live.m3u8"),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-f",
+                "f32le",
+                "-",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=15,
+        )
+        samples = np.frombuffer(result.stdout, dtype=np.float32)
+
+        def amplitude(start, frequency):
+            clip = samples[int(start * 48000) : int((start + 1) * 48000)]
+            spectrum = abs(np.fft.rfft(clip)) / len(clip) * 2
+            return spectrum[frequency - 1 : frequency + 2].max()
+
+        assert amplitude(0.5, 700) > 0.1
+        assert amplitude(0.5, 1200) < 0.005
+        assert amplitude(3, 1200) > 0.1
+    finally:
+        mux.stop()
+
+
+def test_initial_timeline_estimate_handles_different_origins(tmp_path):
+    from footboy.probe.timeline import estimate_initial_offset
+
+    video_file, bili_file = tmp_path / "video.flv", tmp_path / "bili.flv"
+    make_clip(video_file, 1000)
+    make_clip(bili_file, 5719)
+    offset = estimate_initial_offset(
+        source(str(video_file)), source(str(bili_file)), stop_event=threading.Event()
+    )
+    assert offset == pytest.approx(-4719, abs=0.5)
 
 
 def test_hevc_fmp4_keeps_init_files_immutable_across_restart(tmp_path, media_server):
@@ -526,6 +641,19 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
                 f"WebUI {viewport[0]}px: adjusted playback in {time.monotonic() - adjusted_at:.2f}s"
             )
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            page.locator("#original-enabled").check()
+            page.locator("#original-volume").fill("25")
+            page.locator("#commentary-volume").fill("75")
+            wait_for(lambda: app.session.muxer.audio == AudioMix(True, 0.25, 0.75))
+            page.locator("#commentary-volume").fill("0")
+            wait_for(lambda: app.session.muxer.audio == AudioMix(True, 0.25, 0))
+            expect(page.locator("#original-volume")).to_have_value("25")
+            page.locator("#commentary-volume").fill("75")
+            wait_for(lambda: app.session.muxer.audio == AudioMix(True, 0.25, 0.75))
+            page.wait_for_function(
+                "document.getElementById('player').readyState >= 2 "
+                "&& document.getElementById('player').error === null"
+            )
             screenshots = os.environ.get("FOOTBOY_SCREENSHOT_DIR")
             if screenshots:
                 folder = Path(screenshots)

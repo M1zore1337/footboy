@@ -20,6 +20,10 @@ let submitting = false;
 let defaultsApplied = false;
 let lineSubmitting = false;
 let lineOptionsKey = '';
+let audioTimer = null;
+let audioDirty = false;
+let audioSending = false;
+let audioVersion = 0;
 
 const phaseNames = {
   IDLE: '等待连接', CHECK: '检查环境', INIT: '准备连接', RESOLVE: '获取直播间',
@@ -108,7 +112,7 @@ $('source-form').addEventListener('submit', async event => {
 document.querySelectorAll('[data-delta]').forEach(button => {
   action(button, '/api/offset', () => ({delta_ms: Number(button.dataset.delta)}));
 });
-action($('remeasure'), '/api/remeasure', {}, '正在重新采样比赛时钟');
+action($('remeasure'), '/api/remeasure', {}, '正在识别两路比赛时钟并重新同步');
 action($('resniff'), '/api/resniff', {}, '请在本机浏览器重新选择比赛线路');
 action($('stop'), '/api/stop', {}, '正在停止任务');
 action($('cancel-source'), '/api/source', {id: null}, '已暂停当前线路的自动选择');
@@ -125,6 +129,39 @@ $('line-form').addEventListener('submit', async event => {
 
 function activeSession(status) {
   return status.active ?? !['IDLE', 'STOPPED', 'ERROR', 'INIT'].includes(status.state);
+}
+
+function audioValues() {
+  return {original_enabled: $('original-enabled').checked,
+    original_volume: Number($('original-volume').value) / 100,
+    commentary_volume: Number($('commentary-volume').value) / 100};
+}
+function updateAudioLabels() {
+  for (const name of ['original', 'commentary']) {
+    $(`${name}-volume-value`).textContent = `${$(`${name}-volume`).value}%`;
+  }
+}
+async function sendAudio() {
+  if (audioSending || !audioDirty) return;
+  if (!currentStatus || !activeSession(currentStatus)) { audioDirty = false; return; }
+  audioSending = true;
+  const version = audioVersion;
+  try { await post('/api/audio', audioValues()); }
+  catch (error) { toast(error.message, true); }
+  finally {
+    audioSending = false;
+    if (version === audioVersion) { audioDirty = false; refresh(); }
+    else audioTimer = setTimeout(sendAudio, 300);
+  }
+}
+for (const id of ['original-enabled', 'original-volume', 'commentary-volume']) {
+  $(id).addEventListener('input', () => {
+    audioDirty = true; audioVersion += 1;
+    updateAudioLabels();
+    $('original-volume').disabled = !$('original-enabled').checked;
+    $('audio-state').textContent = '音量待应用';
+    clearTimeout(audioTimer); audioTimer = setTimeout(sendAudio, 300);
+  });
 }
 function clockTime(value) {
   if (!value) return '尚未复核';
@@ -152,6 +189,7 @@ function updateStatus(status) {
   const controllable = active && status.state !== 'STOPPING';
   const session = status.session_id ?? 'p0';
   if (session !== lastSession) {
+    clearTimeout(audioTimer); audioDirty = false; audioVersion += 1;
     lastSession = session; resetEditors(); detachPlayer();
   }
   $('phase-text').textContent = phaseNames[status.state] || status.state;
@@ -169,6 +207,22 @@ function updateStatus(status) {
     || Boolean(status.sniffer?.running) || Boolean(status.source_switching);
   document.querySelectorAll('[data-delta]').forEach(button => { button.disabled = !controllable; });
   $('remeasure').disabled = !controllable || !status.video || !status.capabilities?.roi;
+  $('remeasure').textContent = status.measurement?.running ? '↻ 正在同步…' : '↻ 立即同步';
+  $('audio-controls').hidden = !status.capabilities?.audio_mix;
+  const audioReady = controllable && Boolean(status.video);
+  const originalAvailable = Boolean(status.video?.has_audio);
+  $('original-enabled').disabled = !audioReady || !originalAvailable;
+  $('commentary-volume').disabled = !audioReady;
+  if (!audioDirty && !audioSending) {
+    const audio = status.audio || {original_enabled: false, original_volume: 1, commentary_volume: 1};
+    $('original-enabled').checked = audio.original_enabled;
+    $('original-volume').value = Math.round(audio.original_volume * 100);
+    $('commentary-volume').value = Math.round(audio.commentary_volume * 100);
+    updateAudioLabels();
+    $('audio-state').textContent = !audioReady ? '' : !originalAvailable ? '原直播不含音轨'
+      : JSON.stringify(status.audio) !== JSON.stringify(status.applied_audio) ? '音量待应用' : '';
+  }
+  $('original-volume').disabled = !audioReady || !originalAvailable || !$('original-enabled').checked;
   $('flip').disabled = !controllable;
   $('inverted').disabled = !controllable;
   if (active && typeof status.auto_measure === 'boolean') $('auto-measure').checked = status.auto_measure;

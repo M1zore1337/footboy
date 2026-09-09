@@ -151,6 +151,8 @@ def _handler_factory(controller: Controller, hls_dir: Path) -> type[BaseHTTPRequ
                     controller.request_offset_delta(delta_int)
                 elif path == "/api/remeasure":
                     controller.request_remeasure()
+                elif path == "/api/audio":
+                    self._controller_action("request_audio", body)
                 elif path == "/api/resniff":
                     controller.request_resniff()
                 elif path == "/api/start":
