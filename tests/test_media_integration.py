@@ -436,12 +436,23 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             )
             page = browser.new_page(viewport={"width": viewport[0], "height": viewport[1]})
             page.set_default_timeout(20_000)
+            # Recent Chromium advertises native HLS, but its demuxer can reject
+            # real live TS playlists. Keep exercising the MSE player in that case.
+            page.add_init_script(
+                """
+                const canPlayType = HTMLMediaElement.prototype.canPlayType;
+                HTMLMediaElement.prototype.canPlayType = function(type) {
+                  return type === 'application/vnd.apple.mpegurl'
+                    ? 'probably' : canPlayType.call(this, type);
+                };
+                """
+            )
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on(
                 "request",
                 lambda request: (
                     external_requests.append(request.url)
-                    if not request.url.startswith("http://127.0.0.1:")
+                    if not request.url.startswith(("http://127.0.0.1:", "blob:http://127.0.0.1:"))
                     else None
                 ),
             )
@@ -463,6 +474,12 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             page.locator("#start").click()
             expect(page.locator("#phase-text")).to_have_text("直播运行中")
             page.wait_for_function("document.getElementById('player').readyState >= 2")
+            assert page.evaluate("hls !== null && document.getElementById('player').error === null")
+            playback_started = page.evaluate("document.getElementById('player').currentTime")
+            page.wait_for_function(
+                "start => document.getElementById('player').currentTime > start + 0.5",
+                arg=playback_started,
+            )
             assert app.session is not None
             assert app.session.video.no_proxy and not app.session.bili.no_proxy
             initial_generation = app.session.muxer.generation
@@ -497,6 +514,12 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
                 arg=initial_generation,
             )
             assert app.session.applied_offset == 10.5
+            resumed_at = page.evaluate("document.getElementById('player').currentTime")
+            page.wait_for_function(
+                "start => document.getElementById('player').currentTime > start + 0.5 "
+                "&& document.getElementById('player').error === null",
+                arg=resumed_at,
+            )
             print(
                 f"WebUI {viewport[0]}px: adjusted playback in {time.monotonic() - adjusted_at:.2f}s"
             )

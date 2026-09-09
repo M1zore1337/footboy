@@ -276,9 +276,14 @@ function attachPlayer(generation) {
   const source = `/live.m3u8?g=${encodeURIComponent(generation)}`;
   $('player-state').textContent = '正在缓冲';
   $('player-message').textContent = '视频保持原画质 · 使用 B 站直播间音源';
-  if (player.canPlayType('application/vnd.apple.mpegurl')) {
+  // Chromium can advertise native HLS while failing to parse live TS streams.
+  // Keep native playback on Apple browsers and use MSE elsewhere when available.
+  const nativeHls = Boolean(player.canPlayType('application/vnd.apple.mpegurl'));
+  const mseHls = Boolean(window.Hls && Hls.isSupported());
+  const appleBrowser = navigator.vendor === 'Apple Computer, Inc.';
+  if (nativeHls && (appleBrowser || !mseHls)) {
     player.src = source; tryPlay();
-  } else if (window.Hls && Hls.isSupported()) {
+  } else if (mseHls) {
     hls = new Hls({liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8, backBufferLength: 30});
     hls.attachMedia(player); hls.loadSource(source);
     hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
