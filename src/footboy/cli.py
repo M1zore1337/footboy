@@ -16,7 +16,7 @@ from footboy.supervisor import SupervisorConfig
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="footboy",
-        description="启动 Footboy WebUI，将比赛画面与 B站音源按源 PTS 对齐。",
+        description="启动 Footboy（足小子）WebUI，将比赛画面与 B站音源按源 PTS 对齐。",
     )
     result.add_argument("--video-page", help="第三方比赛页面 URL；省略后从 WebUI 输入")
     result.add_argument("--bili-room", help="B站直播间 URL；与 --video-page 同时填写")

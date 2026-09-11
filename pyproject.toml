@@ -1,12 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "footboy"
 version = "0.1.4"
-description = "Synchronize a football video stream with Bilibili live audio and publish it as LAN HLS."
+description = "Footboy (足小子): synchronize football video with Bilibili live audio over LAN HLS."
 readme = "README.md"
+license = "MIT AND Apache-2.0"
+license-files = [
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "src/footboy/serve/static/vendor/hls.LICENSE",
+  "src/footboy/serve/static/vendor/Apache-2.0.txt",
+]
 requires-python = ">=3.10"
 dependencies = [
   "av>=11",

@@ -21,6 +21,8 @@
 # 本地协作文件与工具配置
 AGENT.md
 AGENTS.md
+agent.md
+agents.md
 .codex
 .agents
 .claude
