@@ -12,6 +12,8 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 
+from footboy.environment import resolve_binary
+
 CLOCK_RE = re.compile(r"(?<![\d:：.])(\d{1,3})\s*[:：.]\s*(\d{2})(?![\d:：.])")
 FLIPS = ("none", "h", "v", "hv")
 STYLES = ("standard", "condensed")
@@ -99,8 +101,7 @@ class TesseractBackend:
             import pytesseract  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
             raise OcrError("未安装 pytesseract") from exc
-        if command:
-            pytesseract.pytesseract.tesseract_cmd = command
+        pytesseract.pytesseract.tesseract_cmd = resolve_binary(command or "tesseract")
         try:
             pytesseract.get_tesseract_version()
         except Exception as exc:

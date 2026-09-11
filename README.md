@@ -11,7 +11,7 @@
 
 **依赖**：Python 3.10+、[FFmpeg 6.0+ 和 ffprobe](https://ffmpeg.org/download.html)、[Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html)（自动同步用）。页面取流使用本机 Chrome、Edge 或 Playwright Chromium。
 
-确保 FFmpeg、ffprobe、Tesseract 及英文模型在 PATH 中（`tesseract --list-langs` 应包含 `eng`）。
+外部程序可加入 PATH，也可放入项目 `tools` 目录，见下文。Tesseract 需英文模型 `eng`。
 
 ```bash
 # macOS / Linux
@@ -35,6 +35,59 @@ footboy --host 127.0.0.1 --ocr tesseract
 
 > **Windows 注意**：若没有 `py` 命令可用 `python`。若 PowerShell 阻止脚本激活，可直接使用 `.\.venv\Scripts\python.exe` 和 `.\.venv\Scripts\footboy.exe`。
 
+## 外部依赖
+
+查找顺序：**自定义程序路径 → 系统 PATH → 当前目录的 tools → 源码项目的 tools**。找到后仍会检查版本；PATH 中的旧版本不会自动跳过，可用参数指定新版。通过 wheel 安装时，从含 `tools` 的目录启动。
+
+```text
+tools/
+├─ ffmpeg/bin/
+│  ├─ ffmpeg.exe
+│  └─ ffprobe.exe
+└─ tesseract/
+   ├─ tesseract.exe
+   ├─ 配套 DLL 等文件
+   └─ tessdata/eng.traineddata
+```
+
+**Windows**
+
+1. 从 [FFmpeg 下载页](https://ffmpeg.org/download.html)进入 Windows builds，下载 Gyan 的 release essentials ZIP。解压到 `tools/ffmpeg`，确保 `bin` 下有两个 EXE；保留配套文件。
+2. 从 [Tesseract 安装说明](https://tesseract-ocr.github.io/tessdoc/Installation.html)进入 UB Mannheim 下载页。安装到项目的 `tools/tesseract`，或将完整安装目录复制到此处，保留 DLL 和英文模型。
+3. 在项目根目录验证，无需修改 PATH：
+
+```powershell
+footboy --check
+& ".\tools\tesseract\tesseract.exe" --list-langs
+```
+
+语言列表应包含 `eng`。缺少时，将 [eng.traineddata](https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata) 放入 `tools/tesseract/tessdata`。
+
+**macOS / Linux**
+
+目录结构同上，可执行文件不带 `.exe`；Tesseract 也支持放在 `tools/tesseract/bin`。使用与系统、CPU 架构匹配的构建，保留动态库和语言数据，并确保程序有执行权限。FFmpeg 可从[官方列出的构建](https://ffmpeg.org/download.html)下载后解压整理到 `tools/ffmpeg/bin`。
+
+Tesseract 建议通过系统包管理器安装，避免单独复制程序导致动态库缺失：
+
+```bash
+# macOS（已安装 Homebrew）
+brew install ffmpeg tesseract
+
+# Ubuntu / Debian（FFmpeg 需 6.0+，旧系统的软件源可能不满足）
+sudo apt update
+sudo apt install ffmpeg tesseract-ocr tesseract-ocr-eng
+```
+
+安装 Tesseract 到工具目录：按[编译说明](https://tesseract-ocr.github.io/tessdoc/Compiling.html)准备依赖，在 Tesseract 源码目录依次执行 `./autogen.sh`、`./configure --prefix="/绝对路径/footboy/tools/tesseract"`、`make`、`make install`，再将 `eng.traineddata` 放入该前缀下的 `share/tessdata`。
+
+**自定义路径**
+
+```bash
+footboy --ffmpeg "/path/to/ffmpeg" --ffprobe "/path/to/ffprobe" --ocr tesseract --tesseract-command "/path/to/tesseract"
+```
+
+Windows 路径同样用引号包裹。相对路径以终端当前目录为准；指定路径无效时直接报错。`tools` 已被 Git 忽略，外部程序不随 Footboy 发布。Python 依赖仍按快速开始安装；浏览器用本机 Chrome/Edge 或 `python -m playwright install chromium`。
+
 ## 连接与观看
 
 1. 在控制页输入比赛页面和音源直播间的地址。媒体直链需勾选对应选项。
@@ -52,8 +105,8 @@ footboy --host 127.0.0.1 --ocr tesseract
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 找不到 FFmpeg / ffprobe 或版本过旧 | 安装并加入 PATH，或用 `--ffmpeg` / `--ffprobe` 指定路径，再运行 `footboy --check` |
-| 找不到 Tesseract 或英文模型 | 确认 `tesseract --list-langs` 含 `eng`；必要时用 `--tesseract-command` 指定路径 |
+| 找不到 FFmpeg / ffprobe 或版本过旧 | 安装到 PATH 或 `tools`，也可用 `--ffmpeg` / `--ffprobe` 指定路径，再运行 `footboy --check` |
+| 找不到 Tesseract 或英文模型 | 安装到 PATH 或 `tools`；用实际程序路径执行 `--list-langs`，确认含 `eng`；可用 `--tesseract-command` 指定路径 |
 | Linux 浏览器缺少系统库 | 运行 `python -m playwright install --with-deps chromium` |
 | 无图形桌面 | 用 `--headless-sniff`（不支持手动选线）或改用媒体直链 |
 | 无法播放 HEVC | 选择 H.264 线路，或使用支持 HEVC 的播放器 |

@@ -30,11 +30,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--state-file", type=Path, default=Path("state.json"))
     result.add_argument("--host", default="0.0.0.0")
     result.add_argument("--port", type=int, default=8080)
-    result.add_argument("--ffmpeg", default="ffmpeg")
-    result.add_argument("--ffprobe", default="ffprobe")
+    result.add_argument(
+        "--ffmpeg", default="ffmpeg", help="自定义程序路径；默认先查 PATH，再查 tools"
+    )
+    result.add_argument(
+        "--ffprobe", default="ffprobe", help="自定义程序路径；默认先查 PATH，再查 tools"
+    )
     result.add_argument("--bili-cookies", type=Path, help="可选 Netscape cookies.txt")
     result.add_argument("--ocr", choices=("auto", "rapidocr", "tesseract"), default="auto")
-    result.add_argument("--tesseract-command", help="Windows 上 tesseract.exe 的完整路径")
+    result.add_argument("--tesseract-command", help="自定义程序路径；默认先查 PATH，再查 tools")
     result.add_argument("--offset", type=float, help="初始有符号 D 秒；正值推后 B站音频")
     result.add_argument(
         "--no-auto-measure", action="store_true", help="关闭启动和周期 OCR，手动调节"

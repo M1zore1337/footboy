@@ -1,11 +1,112 @@
 from __future__ import annotations
 
+import os
 import signal
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from footboy.environment import binary_crash_reason, check_binary
+from footboy.environment import binary_crash_reason, check_binary, resolve_binary
+
+
+@pytest.fixture
+def local_tools(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("footboy.environment.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "footboy.environment.__file__", str(tmp_path / "src/footboy/environment.py")
+    )
+    return tmp_path
+
+
+def executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    path.chmod(0o755)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("tool", "relative"),
+    [
+        ("ffmpeg", "ffmpeg/bin/ffmpeg"),
+        ("ffprobe", "ffmpeg/bin/ffprobe"),
+        ("tesseract", "tesseract/tesseract"),
+        ("tesseract", "tesseract/bin/tesseract"),
+    ],
+)
+def test_local_tool_fallback(local_tools, tool, relative):
+    suffix = ".exe" if os.name == "nt" else ""
+    expected = executable(local_tools / "tools" / (relative + suffix))
+    assert resolve_binary(tool) == expected
+
+
+def test_system_path_precedes_tools(local_tools, monkeypatch):
+    executable(local_tools / "tools/ffmpeg/bin/ffmpeg")
+    system = executable(local_tools / "system/ffmpeg")
+    monkeypatch.setattr("footboy.environment.shutil.which", lambda _: system)
+    assert resolve_binary("ffmpeg") == system
+
+
+def test_explicit_path_never_falls_back(local_tools, monkeypatch):
+    monkeypatch.setattr("footboy.environment.shutil.which", lambda _: "/system/ffmpeg")
+    assert resolve_binary("./custom/ffmpeg") == str(local_tools / "custom/ffmpeg")
+    with pytest.raises(RuntimeError, match="无法执行"):
+        check_binary("./custom/ffmpeg")
+
+
+def test_source_tools_work_outside_project(local_tools, monkeypatch):
+    source = local_tools / "project"
+    executable(source / "src/footboy/environment.py")
+    monkeypatch.setattr("footboy.environment.__file__", str(source / "src/footboy/environment.py"))
+    expected = executable(
+        source / "tools/ffmpeg/bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    )
+    assert resolve_binary("ffmpeg") == expected
+
+
+def test_missing_tool_diagnostic(local_tools):
+    with pytest.raises(RuntimeError, match="tools"):
+        check_binary("ffprobe")
+
+
+def test_local_tools_reach_check_probe_mux_and_ocr(local_tools, monkeypatch):
+    from footboy.cli import main
+    from footboy.mux.ffmpeg import build_ffmpeg_command
+    from footboy.probe.ocr import TesseractBackend
+    from footboy.sources.media_probe import ffprobe_source
+    from footboy.sources.models import Source
+
+    suffix = ".exe" if os.name == "nt" else ""
+    ffmpeg = executable(local_tools / "tools/ffmpeg/bin" / ("ffmpeg" + suffix))
+    ffprobe = executable(local_tools / "tools/ffmpeg/bin" / ("ffprobe" + suffix))
+    tesseract = executable(local_tools / "tools/tesseract" / ("tesseract" + suffix))
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        output = (
+            "ffmpeg version 6.0"
+            if command[-1] == "-version"
+            else ('{"streams":[{"codec_type":"video","codec_name":"h264"}]}')
+        )
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    monkeypatch.setattr("footboy.environment.subprocess.run", run)
+    assert main(["--check"]) == 0
+    assert [call[0] for call in calls] == [ffmpeg, ffprobe]
+    source = Source("https://example.com/live.m3u8")
+    ffprobe_source(source)
+    assert calls[-1][0] == ffprobe
+    assert build_ffmpeg_command(source, source, 0, local_tools)[0] == ffmpeg
+    module = SimpleNamespace(
+        pytesseract=SimpleNamespace(tesseract_cmd="old-command"),
+        get_tesseract_version=lambda: None,
+    )
+    monkeypatch.setitem(sys.modules, "pytesseract", module)
+    TesseractBackend()
+    assert module.pytesseract.tesseract_cmd == tesseract
 
 
 @pytest.mark.parametrize(

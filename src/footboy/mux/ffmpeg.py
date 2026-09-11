@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from footboy.environment import resolve_binary
 from footboy.probe.timeline import sample_audio_start
 from footboy.sources.models import DIRECT_HTTP_PROXY, Source
 
@@ -92,7 +93,7 @@ def build_ffmpeg_command(
     segment_extension = "m4s" if hevc else "ts"
     prefix = f"seg_{generation}_" if generation is not None else "seg_"
     command = [
-        str(ffmpeg),
+        resolve_binary(ffmpeg),
         "-hide_banner",
         "-loglevel",
         "warning",

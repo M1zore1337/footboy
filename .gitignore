@@ -1,6 +1,7 @@
 /.venv/
 /build/
 /dist/
+/tools/
 *.egg-info/
 /hls_out/*
 !/hls_out/.gitkeep

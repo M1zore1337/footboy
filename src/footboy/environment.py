@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import signal
@@ -7,10 +8,35 @@ import subprocess
 from pathlib import Path
 
 
+def resolve_binary(name: str | Path) -> str:
+    """Resolve explicit paths, then PATH, then local tool installations."""
+    command = str(name)
+    if Path(command).is_absolute() or "/" in command or "\\" in command:
+        return str(Path(command).expanduser().resolve())
+    resolved = shutil.which(command)
+    if resolved:
+        return str(Path(resolved).resolve())
+    tool = command.removesuffix(".exe")
+    if tool not in {"ffmpeg", "ffprobe", "tesseract"}:
+        return command
+    roots = [Path.cwd()]
+    source_root = Path(__file__).resolve().parents[2]
+    if (source_root / "src" / "footboy" / "environment.py").is_file():
+        roots.append(source_root)
+    filename = tool + (".exe" if os.name == "nt" else "")
+    package = "ffmpeg" if tool in {"ffmpeg", "ffprobe"} else "tesseract"
+    for root in dict.fromkeys(roots):
+        for directory in (root / "tools" / package / "bin", root / "tools" / package):
+            candidate = directory / filename
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+    return command
+
+
 def check_binary(name: str, minimum_major: int | None = None) -> None:
-    resolved = shutil.which(name) if not Path(name).exists() else name
-    if not resolved:
-        raise RuntimeError(f"PATH 中找不到 {name}")
+    resolved = resolve_binary(name)
+    if resolved == name and not Path(resolved).is_file() and not shutil.which(resolved):
+        raise RuntimeError(f"找不到 {name}；请检查自定义路径、PATH 或项目 tools 目录")
     try:
         result = subprocess.run(
             [str(resolved), "-version"],

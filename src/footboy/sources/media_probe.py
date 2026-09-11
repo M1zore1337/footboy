@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from footboy.environment import binary_crash_reason
+from footboy.environment import binary_crash_reason, resolve_binary
 
 from .models import DIRECT_HTTP_PROXY, Source
 
@@ -21,7 +21,7 @@ def ffprobe_source(
     timeout: float = 15,
 ) -> Source:
     command = [
-        str(ffprobe),
+        resolve_binary(ffprobe),
         "-v",
         "error",
         "-rw_timeout",
