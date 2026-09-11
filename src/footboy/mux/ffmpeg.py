@@ -153,7 +153,7 @@ def build_ffmpeg_command(
             "4",
             "-hls_flags",
             "delete_segments+discont_start+temp_file+independent_segments"
-            + ("+append_list" if not hevc else ""),
+            + ("+append_list" if not hevc and _can_append_mpegts_playlist(output) else ""),
             "-hls_start_number_source",
             "epoch_us",
             "-hls_segment_type",
@@ -171,6 +171,23 @@ def build_ffmpeg_command(
         ]
     )
     return command
+
+
+def _can_append_mpegts_playlist(output: Path) -> bool:
+    try:
+        content = (output / "live.m3u8").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError):
+        return False
+    # MPEG-TS append_list drops EXT-X-MAP while keeping old fMP4 segments.
+    # Inspect the on-disk playlist so a new muxer instance is safe as well.
+    lines = [line.strip() for line in content.splitlines()]
+    return (
+        "#EXTM3U" in lines
+        and not any(line.startswith("#EXT-X-MAP:") for line in lines)
+        and all(line.endswith(".ts") for line in lines if line and not line.startswith("#"))
+    )
 
 
 def _input_options(source: Source, *, video_input: bool) -> list[str]:

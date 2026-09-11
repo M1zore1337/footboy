@@ -189,6 +189,56 @@ def test_direct_mode_only_disables_proxy_for_the_video_source(tmp_path, monkeypa
     assert supervisor.store.offset(supervisor._offset_key) is None
 
 
+@pytest.mark.parametrize("manual_when", ["resolve", "estimate", "ready", None])
+def test_bootstrap_keeps_manual_offset_instead_of_applying_initial_ocr(
+    tmp_path, monkeypatch, manual_when
+) -> None:
+    supervisor = supervisor_at(tmp_path, video_direct=True, bili_direct=True)
+    set_phase = supervisor._set_phase
+
+    def probe(source, **kwargs):
+        source.has_audio = True
+        if manual_when == "resolve" and supervisor.bili is None:
+            supervisor.request_offset_delta(500)
+        return source
+
+    def estimate(*args, **kwargs):
+        if manual_when == "estimate":
+            supervisor.request_offset_delta(500)
+        return 0.0
+
+    def phase(phase, message):
+        set_phase(phase, message)
+        if manual_when == "ready" and phase == "RUN":
+            supervisor.request_offset_delta(500)
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr("footboy.supervisor.estimate_initial_offset", estimate)
+    monkeypatch.setattr("footboy.supervisor.measure_offset", lambda *a, **k: measurement(12))
+    monkeypatch.setattr(supervisor.muxer, "start", lambda *a, **k: None)
+    monkeypatch.setattr(supervisor, "_set_phase", phase)
+    supervisor._bootstrap()
+    worker = supervisor._measurement_thread
+    if worker is not None:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        action, payload = supervisor._events.get(timeout=1)
+        assert action == "measurement_done"
+        supervisor._finish_measurement(*payload)
+
+    expected = 12 if manual_when is None else 0.5
+    assert supervisor.offset == expected
+    assert supervisor.store.offset(supervisor._offset_key) == expected
+    assert supervisor.confidence["method"] == ("ocr" if manual_when is None else "manual")
+    assert supervisor.aligned
+    assert supervisor._next_verify - time.monotonic() == pytest.approx(
+        supervisor.config.verify_interval, abs=1
+    )
+    if manual_when == "ready":
+        assert supervisor.applied_offset == 0
+        assert supervisor._adjust_deadline is not None
+
+
 def test_native_mux_crash_stops_recovery_and_cancels_stale_measurements(tmp_path, monkeypatch):
     supervisor = supervisor_at(tmp_path, initial_offset=3.5, auto_measure=False)
     monkeypatch.setattr(supervisor, "_bootstrap", lambda: None)

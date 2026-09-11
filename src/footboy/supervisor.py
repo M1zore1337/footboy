@@ -331,7 +331,13 @@ class Supervisor:
         self._reset_health_window()
         self._set_phase("RUN", "混流已启动；可随时手动调整声音时间" + timeline_message)
         if self.config.auto_measure:
-            self._start_measurement("initial")
+            # Keep this check and the worker's revision snapshot atomic with
+            # manual changes, including clicks made before playback was ready.
+            with self._lock:
+                if self.confidence is not None and self.confidence.get("method") == "manual":
+                    self._schedule_verify()
+                else:
+                    self._start_measurement("initial")
 
     def _run_loop(self) -> None:
         while not self._stop.is_set():

@@ -406,6 +406,54 @@ def test_hevc_fmp4_keeps_init_files_immutable_across_restart(tmp_path, media_ser
         mux.stop()
 
 
+@pytest.mark.parametrize("recreate_muxer", [False, True], ids=["restart", "new-muxer"])
+def test_hevc_to_h264_switch_produces_decodable_hls(tmp_path, recreate_muxer):
+    hevc_file, video_file, bili_file = (
+        tmp_path / "hevc.mp4",
+        tmp_path / "video.flv",
+        tmp_path / "bili.flv",
+    )
+    make_clip(hevc_file, 1000, hevc=True)
+    # Keep the new stream shorter than the playlist window so old entries
+    # cannot disappear merely because enough new segments were generated.
+    make_clip(video_file, 1000, duration=2)
+    make_clip(bili_file, 1003)
+    hevc = Source(str(hevc_file), video_codec="hevc")
+    video = Source(str(video_file), video_codec="h264")
+    bili = Source(str(bili_file), audio_codec="aac")
+    output = tmp_path / "hls"
+    mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+    try:
+        mux.start(hevc, bili, -3)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        old_files = {
+            path: path.read_bytes() for path in output.iterdir() if path.suffix in {".mp4", ".m4s"}
+        }
+        assert old_files
+        if recreate_muxer:
+            mux.stop()
+            mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+            mux.start(video, bili, -3)
+        else:
+            mux.restart(video, bili, -3)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        playlist = output / "live.m3u8"
+        pts = first_pts(playlist)
+        expected = first_pts(video_file)["video"] - (first_pts(bili_file)["audio"] - 3)
+        assert pts["video"] - pts["audio"] == pytest.approx(expected, abs=0.025)
+        assert np.array_equal(first_picture(video_file), first_picture(playlist))
+        content = playlist.read_text()
+        assert "#EXT-X-DISCONTINUITY" in content
+        assert "#EXT-X-MAP" not in content
+        assert all(path.name not in content for path in old_files)
+        assert all(path.read_bytes() == data for path, data in old_files.items())
+        assert mux.health.non_monotonic_dts == 0
+    finally:
+        mux.stop()
+
+
 def test_live_restart_produces_new_segments_and_closes_process(tmp_path, media_server):
     base, _ = media_server
     make_clip(tmp_path / "video.flv", 1000, duration=36)
