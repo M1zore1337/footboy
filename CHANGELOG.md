@@ -2,6 +2,13 @@
 
 每次 Git 提交都同步记录实际变更、验证结果与已知限制。
 
+## [文档优化与界面截图] - 2026-09-11
+
+- README 增加项目徽章、高分辨率 WebUI 真实控制台截图（`docs/images/webui-1440.png`）、Mermaid 纵向数据流架构图与目录索引（TOC）。
+- 优化快速开始指引，简化默认启动命令并强调 `--ocr auto` 自动侦测，补充常规安装与开发安装说明，提前提示 Linux Playwright 系统依赖安装选项（`--with-deps`）。
+- 新增「跨设备与局域网观看」章节，提供 iOS Safari 原生硬解、智能电视/盒子与 VLC/IINA/PotPlayer 串流播放指引，补充各系统（Windows/Linux/macOS）防火墙放行命令参考及播放延迟说明。
+- 补充日常手动调偏白话直觉对照，补齐 CLI 参数表中遗漏的 `--headless-sniff`、`--ocr`、`--tesseract-command`，并单列 `--offset` 与 `footboy-p0` 调用示例。
+
 ## [外部工具查找] - 2026-09-11
 
 - FFmpeg、ffprobe、Tesseract 支持自定义程序路径；默认先查 PATH，再查当前目录和源码项目的 `tools`。环境检查、媒体探测、混流与 OCR 共用查找逻辑。

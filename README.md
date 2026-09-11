@@ -1,11 +1,64 @@
 # Footboy（足小子）
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Platform: Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
+
 把比赛直播画面与 B 站直播间的解说同步组合，输出局域网 HLS。
 
-- **视频复制**：画面始终复制，音频按需转为 AAC。
+![Footboy 控制台](docs/images/webui-1440.png)
+
+- **视频复制**：画面始终复制原画质，音频按需转为 AAC。
 - **自动 / 手动同步**：OCR 读取两路比赛计时；手动偏移优先，过期测量不覆盖新设置。
 - **切换线路**：按页面名称选择线路，新源探测通过后接替播放。
 - **独立音量**：两路分别控制音量和静音，可混入原直播声音。
+- **多端观看**：支持手机（Safari）、平板、电视盒子与各类网络播放器局域网同看。
+
+```mermaid
+flowchart TD
+    subgraph Input ["1. 直播源接入"]
+        V["比赛直播页面 / 媒体直链<br/>(视频画面)"]
+        B["B 站直播间 / 媒体直链<br/>(解说音频)"]
+    end
+
+    subgraph Core ["2. Footboy 混流核心"]
+        OCR["OCR 时钟识别 / 采样<br/>(自动连续走表或交互框选 ROI)"]
+        Sync["源 PTS 对齐 & 偏移微调<br/>(D = K_B - K_V)"]
+        FFmpeg["FFmpeg 混流器<br/>(画面复制 + itsoffset 音频)"]
+    end
+
+    subgraph Output ["3. 多端分发与控制"]
+        WebUI["Web 控制台 (8080 端口)<br/>(实时画面 / 偏移微调 / 独立音量)"]
+        HLS["局域网 HLS 串流<br/>(/live.m3u8)"]
+        Client["手机 (Safari) / 平板 / 智能电视 / VLC"]
+    end
+
+    V --> OCR
+    B --> OCR
+    OCR --> Sync
+    V --> FFmpeg
+    B --> FFmpeg
+    Sync --> FFmpeg
+    FFmpeg --> HLS
+    HLS --> WebUI
+    HLS --> Client
+```
+
+## 目录
+
+- [快速开始](#快速开始)
+- [外部依赖](#外部依赖)
+- [连接与观看](#连接与观看)
+- [跨设备与局域网观看](#跨设备与局域网观看)
+- [常见问题](#常见问题)
+- [同步原理](#同步原理)
+- [命令行](#命令行)
+- [控制接口](#控制接口)
+- [本地数据](#本地数据)
+- [验证与限制](#验证与限制)
+- [开发](#开发)
+- [许可](#许可)
 
 ## 快速开始
 
@@ -23,16 +76,18 @@ py -3 -m venv .venv; .\.venv\Scripts\Activate.ps1
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -e ".[tesseract]"
-python -m playwright install chromium
-footboy --check
-footboy --host 127.0.0.1 --ocr tesseract
+python -m pip install ".[tesseract]"                  # 源码开发模式可用 -e ".[tesseract]"
+python -m playwright install chromium                 # Linux 若缺失系统依赖改用: python -m playwright install --with-deps chromium
+footboy --check                                       # 确认 FFmpeg 6.0+ 和 ffprobe 可用
+footboy                                               # 启动服务（默认监听 0.0.0.0:8080）
 ```
 
-打开 <http://127.0.0.1:8080/>。`--check` 确认 FFmpeg 版本和 ffprobe 可用。退出时在终端按 Ctrl+C。
+打开 <http://127.0.0.1:8080/>。退出时在终端按 Ctrl+C。
 
-> **其他 OCR 方案**：Python 3.10–3.12 可用 `pip install -e ".[rapidocr]"` + `--ocr rapidocr`。只需手动同步时安装基础包 `pip install -e .`，以 `--no-auto-measure --offset 0` 启动。
-
+> **启动提示**：默认以 `--ocr auto` 启动，会自动匹配已安装的 Tesseract 或 RapidOCR；若仅供本机访问，可指定 `footboy --host 127.0.0.1`。`footboy --check` 专门用于检查 FFmpeg 与 ffprobe 环境。
+>
+> **其他 OCR 方案**：Python 3.10–3.12 可用 `pip install ".[rapidocr]"` + `--ocr rapidocr`。只需手动同步时安装基础包 `pip install .`，以 `--no-auto-measure --offset 0` 启动。
+>
 > **Windows 注意**：若没有 `py` 命令可用 `python`。若 PowerShell 阻止脚本激活，可直接使用 `.\.venv\Scripts\python.exe` 和 `.\.venv\Scripts\footboy.exe`。
 
 ## 外部依赖
@@ -97,9 +152,36 @@ Windows 路径同样用引号包裹。相对路径以终端当前目录为准；
 
 自动同步要求两路画面都显示同一场比赛的连续计时。六档偏移按钮调整 ±0.1 / ±0.5 / ±2 秒，连续点击在停顿 1.5 秒后合并应用。"立即同步"重新采样计时并刷新混流。
 
-局域网观看用 `footboy` 启动（默认 `0.0.0.0:8080`），其他设备打开终端显示的地址或使用 `/live.m3u8`。
-
 > **安全提示**：控制 API 无身份认证且允许跨域请求，仅在可信的本机或局域网使用。
+
+## 跨设备与局域网观看
+
+Footboy 默认监听 `0.0.0.0:8080`。启动后控制台和终端会提示本机的局域网访问地址（例如 `http://192.168.1.100:8080/`）：
+
+- **手机 / 平板（iOS / iPadOS / macOS）**：在同一局域网 Wi-Fi 下直接用 Safari 打开控制台地址，或打开 `http://<局域网IP>:8080/live.m3u8`，利用苹果原生 HLS 硬件加速播放。
+- **智能电视 / 电视盒子 / PC 播放器**：在 Apple TV、Android 电视盒子、PC 上的 VLC、IINA、PotPlayer 或 Kodi 中选择「打开网络串流 / 串流地址」，输入 `http://<局域网IP>:8080/live.m3u8` 即可大屏观看。
+- **防火墙设置**：Windows 用户首次启动时，请在系统防火墙弹窗中允许「专用网络访问」；若其他设备无法连接，请放行对应端口（默认 8080）。
+- **播放延迟说明**：总延迟由较慢源自身的直播延迟，加上局域网 HLS 分片缓冲（通常约为 **6–10 秒**）组成。
+
+<details>
+<summary><b>各系统防火墙放行参考（以默认 8080 端口为例）</b></summary>
+
+- **Windows（以管理员身份运行 PowerShell）**：
+  ```powershell
+  New-NetFirewallRule -DisplayName "Footboy" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow
+  ```
+- **Linux (Ubuntu / Debian - UFW)**：
+  ```bash
+  sudo ufw allow 8080/tcp
+  ```
+- **Linux (CentOS / RHEL / openSUSE - firewalld)**：
+  ```bash
+  sudo firewall-cmd --permanent --add-port=8080/tcp && sudo firewall-cmd --reload
+  ```
+- **macOS**：
+  进入「系统设置 → 网络 → 防火墙」，确保未开启「阻止所有传入连接」，并在弹出提示时允许 Python 接收外部网络传入连接。
+
+</details>
 
 ## 常见问题
 
@@ -108,9 +190,10 @@ Windows 路径同样用引号包裹。相对路径以终端当前目录为准；
 | 找不到 FFmpeg / ffprobe 或版本过旧 | 安装到 PATH 或 `tools`，也可用 `--ffmpeg` / `--ffprobe` 指定路径，再运行 `footboy --check` |
 | 找不到 Tesseract 或英文模型 | 安装到 PATH 或 `tools`；用实际程序路径执行 `--list-langs`，确认含 `eng`；可用 `--tesseract-command` 指定路径 |
 | Linux 浏览器缺少系统库 | 运行 `python -m playwright install --with-deps chromium` |
-| 无图形桌面 | 用 `--headless-sniff`（不支持手动选线）或改用媒体直链 |
+| 无图形桌面 / NAS 运行 | 用 `--headless-sniff`（不支持手动选线）或改用媒体直链 |
 | 无法播放 HEVC | 选择 H.264 线路，或使用支持 HEVC 的播放器 |
 | 自动识别一直"未对齐" | 确认两路有走动的同场计时，重新框选区域，或改用手动同步 |
+| 局域网其他设备打不开网页 | 检查运行 Footboy 电脑的防火墙设置，放行对应端口（默认 8080） |
 
 ## 同步原理
 
@@ -120,6 +203,10 @@ D = K_B - K_V
 ```
 
 `V` 为比赛画面，`B` 为 B 站音源。FFmpeg 在 B 站输入上应用 `-itsoffset D`：正值推后声音，负值提前。`D` 包含两路源 PTS 起点差异。更换线路后需重新确认偏移。
+
+**日常手动调偏直觉**：
+- **解说剧透（声音比画面快）**：需推后声音，点击 `+0.1s` / `+0.5s` / `+2s` 按钮（或输入正偏移）。
+- **解说滞后（动作发生后解说才喊）**：需提前声音，点击 `−0.1s` / `−0.5s` / `−2s` 按钮（或输入负偏移）。
 
 ## 命令行
 
@@ -133,18 +220,32 @@ footboy \
 
 也可不传地址，启动后从控制页输入。PowerShell 中变量写作 `$env:FOOTBOY_VIDEO_PAGE_URL`。
 
-| 参数 | 用途 |
-| --- | --- |
-| `--video-line "线路名称"` | 按页面文字选择线路 |
-| `--video-no-proxy` | 比赛页面及媒体请求直连 |
-| `--video-direct` / `--bili-direct` | 将输入解释为媒体直链 |
-| `--no-auto-measure --offset 0` | 关闭 OCR，手动偏移 |
-| `--bili-cookies cookies.txt` | Netscape 格式 Cookie 文件 |
-| `--ffmpeg` / `--ffprobe` | 指定可执行文件路径 |
-| `--host` / `--port` | 监听地址和端口 |
-| `--state-file` / `--output-dir` | 状态和 HLS 输出位置 |
+| 参数 | 默认值 | 用途 |
+| --- | --- | --- |
+| `--video-page URL` | - | 比赛页面 URL（与 `--bili-room` 配对使用，亦可从控制页输入） |
+| `--bili-room URL` | - | B 站直播间 URL |
+| `--video-line "名称"` | - | 按页面文字选择线路（例如：`高清直播5`；支持圈号数字） |
+| `--video-no-proxy` | `false` | 比赛页面及媒体请求直连，不使用代理 |
+| `--video-direct` | `false` | 将比赛地址直接解释为媒体直链 |
+| `--bili-direct` | `false` | 将 B 站地址直接解释为媒体直链 |
+| `--headless-sniff` | `false` | 嗅探时不显示浏览器窗口（适用于无桌面服务器或 NAS） |
+| `--ocr {auto,rapidocr,tesseract}` | `auto` | OCR 后端引擎；`auto` 自动检测已安装的引擎 |
+| `--tesseract-command PATH` | `tesseract` | 自定义 Tesseract 可执行文件路径 |
+| `--no-auto-measure` | `false` | 关闭启动和周期 OCR 测量，改用纯手动调节 |
+| `--offset 秒数` | - | 初始有符号偏移秒数；正值推后 B 站音频 |
+| `--bili-cookies FILE` | - | Netscape 格式的 Cookie 文件路径 |
+| `--ffmpeg PATH` / `--ffprobe PATH` | `ffmpeg` / `ffprobe` | 自定义 FFmpeg / ffprobe 程序路径 |
+| `--host HOST` / `--port PORT` | `0.0.0.0` / `8080` | 服务监听地址与端口 |
+| `--state-file FILE` | `state.json` | 状态持久化文件位置 |
+| `--output-dir DIR` | `hls_out` | HLS 输出分片存储目录 |
+| `--check` | - | 快速检查本地 FFmpeg 与 ffprobe 环境并退出 |
 
-`footboy-p0` 用于手工验证两条媒体直链，不执行自动 OCR。完整选项见 `footboy --help` 与 `footboy-p0 --help`。
+```bash
+# footboy-p0 手工验证两条媒体直链（无需 OCR）
+footboy-p0 --video-url "http://.../video.m3u8" --bili-url "http://.../audio.m3u8" --offset 1.5
+```
+
+完整选项见 `footboy --help` 与 `footboy-p0 --help`。
 
 ## 控制接口
 
