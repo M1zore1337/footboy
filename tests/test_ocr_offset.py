@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import threading
+from functools import partial
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from footboy.probe.ocr import (
     ClockProbeResult,
     ClockSample,
+    ManualSelectionRequired,
+    OcrCancelled,
+    OcrError,
+    OcrTimeout,
     ProbeConfig,
     StoppedClock,
     _validate_series,
     parse_clock,
+    probe_clock,
 )
-from footboy.probe.offset import measure_offset
+from footboy.probe.offset import MeasurementError, measure_offset
 from footboy.sources.models import Source
 
 CONFIG = ProbeConfig((0.0, 0.0, 1.0, 1.0), "none", False)
@@ -103,3 +112,69 @@ def test_legacy_probe_config_keeps_standard_preprocessing() -> None:
 def test_invalid_ocr_style_cannot_be_saved(style) -> None:
     with pytest.raises(ValueError, match="预处理样式"):
         ProbeConfig((0, 0, 0.3, 0.2), "none", False, style)
+
+
+def probe_frames():
+    return [(float(index), np.zeros((32, 64, 3), dtype=np.uint8)) for index in range(3)]
+
+
+@pytest.mark.parametrize("saved", [None, CONFIG])
+def test_ocr_timeout_and_cancellation_are_not_roi_errors(saved):
+    backend = SimpleNamespace(read=lambda _: pytest.fail("No OCR should run after its deadline"))
+    with pytest.raises(OcrTimeout):
+        probe_clock(probe_frames(), backend, saved=saved, budget=0)
+    cancellation = threading.Event()
+    cancellation.set()
+    with pytest.raises(OcrCancelled):
+        probe_clock(probe_frames(), backend, saved=saved, stop_event=cancellation)
+
+
+@pytest.mark.parametrize("saved", [None, CONFIG])
+def test_ocr_backend_failure_is_not_replaced_by_roi_prompt(monkeypatch, saved):
+    backend_error = OcrError("Tesseract 识别超时或失败")
+
+    def read(image):
+        raise backend_error
+
+    monkeypatch.setattr("footboy.probe.ocr._discover_candidates", lambda *args, **kwargs: [CONFIG])
+    with pytest.raises(OcrError) as error:
+        probe_clock(probe_frames(), SimpleNamespace(read=read), saved=saved)
+    assert error.value is backend_error
+
+
+def test_measurement_budget_expiry_does_not_request_roi(monkeypatch):
+    monkeypatch.setattr("footboy.probe.offset.make_backend", lambda *args, **kwargs: object())
+    monkeypatch.setattr("footboy.probe.offset.probe_clock", partial(probe_clock, budget=0))
+    with pytest.raises(MeasurementError) as error:
+        measure_offset(
+            Source("https://video.example/live"),
+            Source("https://bili.example/live"),
+            frame_collector=lambda _: probe_frames(),
+        )
+    assert not error.value.needs_roi
+    assert "超时" in str(error.value)
+
+
+def test_missing_clock_requests_roi_without_opening_a_manual_prompt(monkeypatch):
+    monkeypatch.setattr("footboy.probe.ocr._discover_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "footboy.probe.ocr._manual_config",
+        lambda *args: pytest.fail("Background OCR must not prompt"),
+    )
+    with pytest.raises(ManualSelectionRequired):
+        probe_clock(probe_frames(), object())
+
+
+def test_stopped_clock_does_not_hide_another_sources_backend_error(monkeypatch):
+    video = Source("https://video.example/live")
+    bili = Source("https://bili.example/live")
+
+    def collect(source):
+        if source is video:
+            raise StoppedClock("比赛画面停表")
+        raise OcrError("音源识别后端失败")
+
+    with pytest.raises(MeasurementError) as error:
+        measure_offset(video, bili, frame_collector=collect)
+    assert "后端失败" in str(error.value)
+    assert not error.value.needs_roi

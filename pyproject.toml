@@ -43,6 +43,10 @@ footboy = ["serve/static/*.html", "serve/static/*.css", "serve/static/*.js", "se
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "slow: real media processing or OCR integration",
+  "browser: requires Playwright Chromium and FOOTBOY_BROWSER_TESTS=1",
+]
 
 [tool.ruff]
 target-version = "py310"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import math
 import queue
 import re
@@ -18,7 +19,7 @@ from footboy.environment import binary_crash_reason
 from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
 from footboy.probe.ocr import ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
-from footboy.probe.timeline import estimate_initial_offset
+from footboy.probe.timeline import TimelineProbeError, estimate_initial_offset
 from footboy.serve.http import ControlServer
 from footboy.sources.bili import BiliResolver
 from footboy.sources.lines import validate_line_text
@@ -26,6 +27,8 @@ from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 from footboy.sources.sniffer import StreamSniffer
 from footboy.state import StateStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -63,8 +66,8 @@ class Supervisor:
     def __init__(self, config: SupervisorConfig) -> None:
         self.config = config
         self.store = StateStore(config.state_file)
-        self.muxer = FfmpegMuxer(config.output_dir, ffmpeg=config.ffmpeg)
-        self.server = ControlServer(self, config.output_dir, host=config.host, port=config.port)
+        self._stop = threading.Event()
+        self.muxer = FfmpegMuxer(config.output_dir, ffmpeg=config.ffmpeg, stop_event=self._stop)
         self.bili_resolver = BiliResolver(config.cookies_file)
         self.sniffer = StreamSniffer(ffprobe=config.ffprobe, no_proxy=config.video_no_proxy)
         self.video: Source | None = None
@@ -81,7 +84,6 @@ class Supervisor:
         self.phase = "INIT"
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
-        self._stop = threading.Event()
         self._adjust_deadline: float | None = None
         self._revision = 0
         self.audio = AudioMix()
@@ -108,9 +110,13 @@ class Supervisor:
         self._needs_roi: list[str] = []
 
     def run(self, *, serve: bool = True) -> None:
+        server = None
         try:
             if serve:
-                self.server.start()
+                server = ControlServer(
+                    self, self.config.output_dir, host=self.config.host, port=self.config.port
+                )
+                server.start()
             self._bootstrap()
             self._run_loop()
         except Exception as exc:
@@ -124,8 +130,8 @@ class Supervisor:
             for worker in (self._measurement_thread, self._refresh_thread):
                 if worker is not None:
                     worker.join(timeout=8)
-            if serve:
-                self.server.stop()
+            if server is not None:
+                server.stop()
             if self.phase != "ERROR":
                 self._set_phase("STOPPED", "任务已停止")
 
@@ -319,15 +325,21 @@ class Supervisor:
                         self.aligned = False
                         self.confidence = {"method": "timeline-estimate"}
                         timeline_message = "；时间轴已粗略接续，比赛内容尚未对齐"
-            except Exception:
+            except TimelineProbeError as exc:
+                logger.warning("起始时间轴采样失败：%s", _sanitize_ffmpeg_line(str(exc)))
                 timeline_message = "；起始时间轴采样失败，可能暂时无声，请重测或手动设置偏移"
         self._check_cancelled()
         with self._lock:
             self._source_generation += 1
+            value, revision = self.offset, self._revision
+            audio_revision = self._audio_revision
             self.muxer.audio = self.audio
-            self.muxer.start(self.video, self.bili, self.offset, fresh=True)
-            self.applied_offset = self.offset
-            self._adjust_deadline = None
+        self.muxer.start(self.video, self.bili, value, fresh=True)
+        self._check_cancelled()
+        with self._lock:
+            self.applied_offset = value
+            if revision == self._revision and audio_revision == self._audio_revision:
+                self._adjust_deadline = None
         self._reset_health_window()
         self._set_phase("RUN", "混流已启动；可随时手动调整声音时间" + timeline_message)
         if self.config.auto_measure:
@@ -724,17 +736,16 @@ class Supervisor:
             paths = list(self.config.output_dir.iterdir())
         except OSError:
             return None
-        newest = None
+        newest: tuple[str, int] | None = None
+        pattern = re.compile(rf"seg_{self.muxer.health.generation}_(\d+)\.(?:ts|m4s)")
         for path in paths:
-            if path.name.startswith("seg_") and path.suffix in {".ts", ".m4s"}:
-                try:
-                    stamp = path.stat().st_mtime_ns
-                except OSError:
-                    continue
-                if self.muxer.health.started_at and stamp / 1e9 < self.muxer.health.started_at:
-                    continue
-                if newest is None or stamp > newest[1]:
-                    newest = (path.name, stamp)
+            match = pattern.fullmatch(path.name)
+            if match and path.is_file():
+                # FFmpeg atomically renames completed segments. Their sequence
+                # advances even if the wall clock moves backwards during a run.
+                sequence = int(match[1])
+                if newest is None or sequence > newest[1]:
+                    newest = (path.name, sequence)
         return newest
 
     def _playlist_duration_anomaly(self) -> bool:

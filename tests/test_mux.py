@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import threading
+
+import pytest
+
 from footboy.mux.ffmpeg import (
+    AudioMix,
+    FfmpegMuxer,
+    MuxError,
     MuxHealth,
     _consume_stderr,
     _sanitize_ffmpeg_line,
@@ -70,3 +77,33 @@ def test_stderr_query_tokens_are_redacted() -> None:
     sanitized = _sanitize_ffmpeg_line(line)
     assert "very-secret" not in sanitized
     assert "cdn.example" in sanitized
+
+
+@pytest.mark.parametrize("cancel_before_sampling", [False, True])
+def test_cancelled_audio_sampling_never_launches_ffmpeg(
+    tmp_path, monkeypatch, cancel_before_sampling
+):
+    cancellation = threading.Event()
+    video, bili = _sources()
+    video.has_audio = True
+    muxer = FfmpegMuxer(tmp_path, stop_event=cancellation)
+    muxer.audio = AudioMix(original_enabled=True)
+    sampled = []
+
+    def sample(source, *, stop_event):
+        assert stop_event is cancellation
+        sampled.append(source)
+        cancellation.set()
+        return 0.0
+
+    monkeypatch.setattr("footboy.mux.ffmpeg.sample_audio_start", sample)
+    monkeypatch.setattr(
+        "footboy.mux.ffmpeg.subprocess.Popen",
+        lambda *args, **kwargs: pytest.fail("Cancelled sessions cannot spawn FFmpeg"),
+    )
+    if cancel_before_sampling:
+        cancellation.set()
+    with pytest.raises(MuxError, match="已取消"):
+        muxer.start(video, bili, 0)
+    assert len(sampled) == (0 if cancel_before_sampling else 1)
+    assert not muxer.health.running

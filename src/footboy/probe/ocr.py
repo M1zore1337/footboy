@@ -23,6 +23,14 @@ class OcrError(RuntimeError):
     pass
 
 
+class OcrTimeout(OcrError):
+    pass
+
+
+class OcrCancelled(OcrError):
+    pass
+
+
 class StoppedClock(OcrError):
     pass
 
@@ -202,7 +210,7 @@ def probe_clock(
     backend: OcrBackend,
     *,
     saved: ProbeConfig | None = None,
-    allow_manual: bool = True,
+    allow_manual: bool = False,
     budget: float = 15.0,
     stop_event: threading.Event | None = None,
 ) -> ClockProbeResult:
@@ -212,40 +220,30 @@ def probe_clock(
 
     def check_budget() -> None:
         if stop_event is not None and stop_event.is_set():
-            raise OcrError("测量已取消")
+            raise OcrCancelled("测量已取消")
         if time.monotonic() >= deadline:
-            raise OcrError("自动识别窗口已结束")
+            raise OcrTimeout("自动识别超时，请重试或缩小识别区域")
 
     if saved:
-        try:
-            # Retry the selected region before considering any other location.
-            # Old state files and manual selections start with the standard style.
-            for style in (saved.style, *(item for item in STYLES if item != saved.style)):
-                config = replace(saved, style=style)
-                samples = _read_series(frames, config, backend, check_budget=check_budget)
-                result = _validate_series(samples, config)
-                if result:
-                    return result
-        except StoppedClock:
-            raise
-        except OcrError:
-            if stop_event is not None and stop_event.is_set():
-                raise
-
-    stopped = 0
-    try:
-        for config in _discover_candidates(frames[0][1], backend, check_budget=check_budget):
+        # Retry the selected region before considering any other location.
+        # Backend failures, cancellation and timeouts are not evidence of a bad ROI.
+        for style in (saved.style, *(item for item in STYLES if item != saved.style)):
+            config = replace(saved, style=style)
             samples = _read_series(frames, config, backend, check_budget=check_budget)
-            try:
-                result = _validate_series(samples, config)
-            except StoppedClock:
-                stopped += 1
-                continue
+            result = _validate_series(samples, config)
             if result:
                 return result
-    except OcrError:
-        if stop_event is not None and stop_event.is_set():
-            raise
+
+    stopped = 0
+    for config in _discover_candidates(frames[0][1], backend, check_budget=check_budget):
+        samples = _read_series(frames, config, backend, check_budget=check_budget)
+        try:
+            result = _validate_series(samples, config)
+        except StoppedClock:
+            stopped += 1
+            continue
+        if result:
+            return result
     if stopped:
         raise StoppedClock("候选比赛时钟连续 3 帧不动，本轮视为停表")
     if not allow_manual:

@@ -14,6 +14,7 @@ from .frames import collect_keyframes
 from .ocr import (
     ClockProbeResult,
     ManualSelectionRequired,
+    OcrCancelled,
     OcrError,
     ProbeConfig,
     StoppedClock,
@@ -63,7 +64,7 @@ def measure_offset(
     bili_key: str | None = None,
     ocr_backend: str = "auto",
     tesseract_command: str | None = None,
-    allow_manual: bool = True,
+    allow_manual: bool = False,
     frame_collector: Callable[[Source], list] | None = None,
     on_preview: Callable[[str, np.ndarray], None] | None = None,
     stop_event: threading.Event | None = None,
@@ -78,7 +79,7 @@ def measure_offset(
             else collect_keyframes(source, stop_event=stop_event)
         )
         if stop_event is not None and stop_event.is_set():
-            raise OcrError("测量已取消")
+            raise OcrCancelled("测量已取消")
         if frames and on_preview is not None:
             on_preview(label, frames[-1][1])
         saved = None
@@ -111,7 +112,9 @@ def measure_offset(
     if errors:
         labels = {"video": "比赛画面", "bili": "B站直播间"}
         message = "；".join(f"{labels[key]}：{value}" for key, value in errors.items())
-        if any(isinstance(exc, StoppedClock) for exc in errors.values()):
+        if any(isinstance(exc, OcrCancelled) for exc in errors.values()):
+            raise OcrCancelled(message)
+        if all(isinstance(exc, StoppedClock) for exc in errors.values()):
             raise StoppedClock(message)
         raise MeasurementError(
             message,

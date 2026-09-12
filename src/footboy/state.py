@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class StateStore:
@@ -22,12 +25,21 @@ class StateStore:
                 return
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "无法加载状态文件 %s（%s），将使用默认设置；原文件尚未修改",
+                    self.path,
+                    type(exc).__name__,
+                )
                 return
-            if isinstance(loaded, dict):
-                for key in ("sources", "offsets"):
-                    if isinstance(loaded.get(key), dict):
-                        self._data[key] = loaded[key]
+            if not isinstance(loaded, dict):
+                logger.warning("状态文件 %s 不是 JSON 对象，将使用默认设置", self.path)
+                return
+            for key in ("sources", "offsets"):
+                if isinstance(loaded.get(key), dict):
+                    self._data[key] = loaded[key]
+                elif key in loaded:
+                    logger.warning("状态文件 %s 的 %s 字段无效，将使用默认设置", self.path, key)
 
     def source_probe(self, key: str) -> dict[str, Any] | None:
         with self._lock:

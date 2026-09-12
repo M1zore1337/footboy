@@ -216,7 +216,13 @@ def _format_offset(value: float) -> str:
 
 
 class FfmpegMuxer:
-    def __init__(self, output_dir: str | Path, *, ffmpeg: str | Path = "ffmpeg") -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        ffmpeg: str | Path = "ffmpeg",
+        stop_event: threading.Event | None = None,
+    ) -> None:
         self.output_dir = Path(output_dir).resolve()
         self.ffmpeg = ffmpeg
         self.health = MuxHealth()
@@ -226,16 +232,22 @@ class FfmpegMuxer:
         self.generation = 0
         self.audio = AudioMix()
         self.audio_origin: float | None = None
+        self._stop_event = stop_event
 
     def start(self, video: Source, bili: Source, offset: float, *, fresh: bool = False) -> None:
         with self._lock:
+            self._check_cancelled()
             if self._process and self._process.poll() is None:
                 raise MuxError("ffmpeg 已经在运行")
             self.output_dir.mkdir(parents=True, exist_ok=True)
             if fresh:
                 self._clear_generated_outputs()
             self.generation = max(self.generation + 1, time.time_ns() // 1_000_000)
-            self.audio_origin = sample_audio_start(video) if self.audio.original_enabled else None
+            self.audio_origin = (
+                sample_audio_start(video, stop_event=self._stop_event)
+                if self.audio.original_enabled
+                else None
+            )
             command = build_ffmpeg_command(
                 video,
                 bili,
@@ -247,6 +259,7 @@ class FfmpegMuxer:
                 audio_origin=self.audio_origin,
             )
             flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self._check_cancelled()
             try:
                 self._process = subprocess.Popen(
                     command,
@@ -276,6 +289,10 @@ class FfmpegMuxer:
                 daemon=True,
             )
             self._reader.start()
+
+    def _check_cancelled(self) -> None:
+        if self._stop_event is not None and self._stop_event.is_set():
+            raise MuxError("混流启动已取消")
 
     def stop(self, timeout: float = 5.0) -> None:
         with self._lock:

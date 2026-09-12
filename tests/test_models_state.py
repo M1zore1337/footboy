@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from footboy.sources.models import Source
 from footboy.state import StateStore
 
@@ -38,6 +40,16 @@ def test_state_store_round_trip(tmp_path) -> None:
         "roi": [0.1, 0.2, 0.3, 0.4],
         "flip": "h",
     }
+
+
+@pytest.mark.parametrize("content", ["broken json", "[]", '{"offsets": [], "sources": {}}'])
+def test_invalid_state_is_reported_without_changing_the_original(tmp_path, caplog, content):
+    path = tmp_path / "state.json"
+    path.write_text(content, encoding="utf-8")
+    state = StateStore(path)
+    assert state.offset("room@domain") is None
+    assert "state.json" in caplog.text
+    assert path.read_text(encoding="utf-8") == content
 
 
 def test_explicit_cookie_headers_reach_all_media_clients() -> None:

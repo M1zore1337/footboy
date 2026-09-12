@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import signal
 import threading
 import time
@@ -9,6 +10,7 @@ import pytest
 
 from footboy.probe.ocr import ClockProbeResult, ClockSample, ProbeConfig, StoppedClock
 from footboy.probe.offset import OffsetConfidence, OffsetMeasurement
+from footboy.probe.timeline import TimelineProbeError
 from footboy.sources.models import Source
 from footboy.supervisor import Supervisor, SupervisorConfig
 
@@ -187,6 +189,134 @@ def test_direct_mode_only_disables_proxy_for_the_video_source(tmp_path, monkeypa
     assert supervisor.offset == -4719.0
     assert not supervisor.aligned
     assert supervisor.store.offset(supervisor._offset_key) is None
+
+
+@pytest.mark.parametrize("change", ["offset", "audio", "both", "stop"])
+def test_bootstrap_keeps_controls_responsive_during_mux_start(tmp_path, monkeypatch, change):
+    supervisor = supervisor_at(
+        tmp_path, video_direct=True, bili_direct=True, initial_offset=0, auto_measure=False
+    )
+    entered, release, responded = threading.Event(), threading.Event(), threading.Event()
+    failures = []
+
+    def probe(source, **kwargs):
+        source.has_audio = True
+        return source
+
+    def start(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+
+    def bootstrap():
+        try:
+            supervisor._bootstrap()
+        except Exception as exc:
+            failures.append(exc)
+
+    def control():
+        try:
+            assert supervisor.public_status()["video"] is not None
+            if change in {"offset", "both"}:
+                supervisor.request_offset_delta(500)
+            if change in {"audio", "both"}:
+                supervisor.request_audio({"original_enabled": True, "commentary_volume": 0.5})
+            if change == "stop":
+                supervisor.stop()
+            responded.set()
+        except Exception as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr(supervisor.muxer, "start", start)
+    worker = threading.Thread(target=bootstrap)
+    client = threading.Thread(target=control)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        client.start()
+        assert responded.wait(2), "HTTP controls must finish while mux start is still blocked"
+    finally:
+        release.set()
+        worker.join(3)
+        if client.ident is not None:
+            client.join(3)
+    assert not worker.is_alive() and not client.is_alive()
+    if change == "stop":
+        assert len(failures) == 1 and "已取消" in str(failures[0])
+        assert supervisor.phase == "STOPPING"
+        return
+    assert not failures
+    assert supervisor.applied_offset == 0
+    assert supervisor._adjust_deadline is not None
+    if change in {"offset", "both"}:
+        assert supervisor.offset == 0.5
+        assert supervisor.store.offset(supervisor._offset_key) == 0.5
+        assert supervisor.confidence == {"method": "manual"}
+    if change in {"audio", "both"}:
+        assert supervisor.audio.original_enabled
+        assert supervisor.audio.commentary_volume == 0.5
+        assert not supervisor.muxer.audio.original_enabled
+
+
+@pytest.mark.parametrize("expected_failure", [False, True])
+def test_bootstrap_does_not_hide_programming_errors_as_sampling_failures(
+    tmp_path, monkeypatch, caplog, expected_failure
+):
+    supervisor = supervisor_at(tmp_path, video_direct=True, bili_direct=True, auto_measure=False)
+
+    def probe(source, **kwargs):
+        source.has_audio = True
+        return source
+
+    def estimate(*args, **kwargs):
+        if expected_failure:
+            raise TimelineProbeError("https://cdn.example/live?token=private: unavailable")
+        raise AssertionError("unexpected programming error")
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr("footboy.supervisor.estimate_initial_offset", estimate)
+    monkeypatch.setattr(supervisor.muxer, "start", lambda *args, **kwargs: None)
+    if expected_failure:
+        supervisor._bootstrap()
+        assert supervisor.phase == "RUN"
+        assert "采样失败" in supervisor.message and "采样失败" in caplog.text
+        assert "private" not in caplog.text
+    else:
+        with pytest.raises(AssertionError, match="programming error"):
+            supervisor._bootstrap()
+
+
+@pytest.mark.parametrize("extension", ["ts", "m4s"])
+def test_health_uses_current_generation_and_sequence_despite_clock_rollback(
+    tmp_path, monkeypatch, extension
+):
+    supervisor = supervisor_at(tmp_path)
+    folder = supervisor.config.output_dir
+    folder.mkdir()
+    supervisor.muxer.health.generation = 42
+    supervisor.muxer.health.started_at = 1000
+    supervisor.muxer.health.running = True
+    for name, stamp in [
+        (f"seg_41_999.{extension}", 9999),
+        (f"seg_42_9.{extension}", 1010),
+        (f"seg_42_10.{extension}", 990),
+        (f"seg_42_11.{extension}.tmp", 1020),
+    ]:
+        path = folder / name
+        path.write_bytes(b"segment")
+        os.utime(path, (stamp, stamp))
+    (folder / f"seg_42_999.{extension}").mkdir()
+    assert supervisor._latest_segment_signature() == (f"seg_42_10.{extension}", 10)
+    now = time.monotonic()
+    supervisor._last_segment_signature = (f"seg_42_9.{extension}", 9)
+    supervisor._last_segment_change = now - 31
+    recovered = []
+    monkeypatch.setattr(supervisor, "_recover", recovered.append)
+    supervisor._check_health(now)
+    assert not recovered
+    assert supervisor._last_segment_change == now
+    supervisor._check_health(now + 31)
+    assert recovered == ["30 秒没有新 HLS 分片"]
 
 
 @pytest.mark.parametrize("manual_when", ["resolve", "estimate", "ready", None])

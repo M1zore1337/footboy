@@ -26,7 +26,10 @@ from footboy.sources.models import Source
 
 FFMPEG = os.environ.get("FOOTBOY_FFMPEG") or shutil.which("ffmpeg")
 FFPROBE = os.environ.get("FOOTBOY_FFPROBE") or shutil.which("ffprobe")
-pytestmark = pytest.mark.skipif(not FFMPEG or not FFPROBE, reason="需要 FFmpeg / ffprobe")
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(not FFMPEG or not FFPROBE, reason="需要 FFmpeg / ffprobe"),
+]
 
 
 def make_clip(
@@ -227,6 +230,12 @@ def wait_for(predicate, timeout=15):
             return
         time.sleep(0.05)
     pytest.fail("等待 FFmpeg/HLS 超时")
+
+
+def wait_for_page(page, expression, *, arg=None, timeout=20):
+    # Keep polling in the test driver. Browser-side wait_for_function can use
+    # eval from an animation callback, which the console's CSP correctly blocks.
+    wait_for(lambda: page.evaluate(expression, arg=arg), timeout=timeout)
 
 
 def source(url: str, *, hevc=False) -> Source:
@@ -564,6 +573,7 @@ def test_hls_direct_access_preserves_pts_and_bili_proxy(
     reason="设置 FOOTBOY_BROWSER_TESTS=1 并安装 Playwright Chromium 后运行",
 )
 @pytest.mark.parametrize("viewport", [(1440, 1080), (390, 844)], ids=["desktop", "mobile"])
+@pytest.mark.browser
 def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport):
     from playwright.sync_api import expect, sync_playwright
 
@@ -614,6 +624,14 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             )
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.on(
+                "console",
+                lambda message: (
+                    errors.append(message.text)
+                    if "Content Security Policy" in message.text
+                    else None
+                ),
+            )
+            page.on(
                 "request",
                 lambda request: (
                     external_requests.append(request.url)
@@ -622,6 +640,21 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
                 ),
             )
             page.goto(f"http://127.0.0.1:{server.port}/")
+            expect(page.locator("#access-panel")).to_be_visible()
+            expect(page.locator("#workspace")).to_have_attribute("inert", "")
+            page.locator("#access-token").fill("不是控制密钥")
+            page.locator("#access-submit").click()
+            expect(page.locator("#access-message")).to_contain_text("无效或已过期")
+            page.locator("#access-token").fill("invalid-control-token")
+            page.locator("#access-submit").click()
+            expect(page.locator("#access-message")).to_contain_text("无效或已过期")
+            expect(page.locator("#access-submit")).to_be_enabled()
+            page.goto(f"http://127.0.0.1:{server.port}/#token={server.access_token}")
+            expect(page.locator("#access-panel")).to_be_hidden()
+            assert page.evaluate("location.hash") == ""
+            assert page.locator("#access-token").input_value() == ""
+            page.reload()
+            expect(page.locator("#access-panel")).to_be_hidden()
             expect(page.locator("#phase-text")).to_have_text("等待连接")
             expect(page.locator('[data-delta="500"]')).to_be_disabled()
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -638,10 +671,11 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
                 page.locator(f"#{label}-headers").fill("Cookie: sid=fixture")
             page.locator("#start").click()
             expect(page.locator("#phase-text")).to_have_text("直播运行中")
-            page.wait_for_function("document.getElementById('player').readyState >= 2")
+            wait_for_page(page, "document.getElementById('player').readyState >= 2")
             assert page.evaluate("hls !== null && document.getElementById('player').error === null")
             playback_started = page.evaluate("document.getElementById('player').currentTime")
-            page.wait_for_function(
+            wait_for_page(
+                page,
                 "start => document.getElementById('player').currentTime > start + 0.5",
                 arg=playback_started,
             )
@@ -673,14 +707,16 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             adjusted_at = time.monotonic()
             page.locator('[data-delta="500"]').click()
             expect(page.locator("#offset-value")).to_have_text("+10.500")
-            page.wait_for_function(
+            wait_for_page(
+                page,
                 "generation => playerGeneration !== generation && playerGeneration !== null "
                 "&& document.getElementById('player').readyState >= 2",
                 arg=initial_generation,
             )
             assert app.session.applied_offset == 10.5
             resumed_at = page.evaluate("document.getElementById('player').currentTime")
-            page.wait_for_function(
+            wait_for_page(
+                page,
                 "start => document.getElementById('player').currentTime > start + 0.5 "
                 "&& document.getElementById('player').error === null",
                 arg=resumed_at,
@@ -698,9 +734,10 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             expect(page.locator("#original-volume")).to_have_value("25")
             page.locator("#commentary-volume").fill("75")
             wait_for(lambda: app.session.muxer.audio == AudioMix(True, 0.25, 0.75))
-            page.wait_for_function(
+            wait_for_page(
+                page,
                 "document.getElementById('player').readyState >= 2 "
-                "&& document.getElementById('player').error === null"
+                "&& document.getElementById('player').error === null",
             )
             screenshots = os.environ.get("FOOTBOY_SCREENSHOT_DIR")
             if screenshots:
@@ -726,6 +763,7 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
     os.environ.get("FOOTBOY_BROWSER_TESTS") != "1",
     reason="设置 FOOTBOY_BROWSER_TESTS=1 并安装 Playwright Chromium 后运行",
 )
+@pytest.mark.browser
 def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_path, media_server):
     """Synthetic streams, real browser clicks, ffprobe, FFmpeg, and HLS playback."""
     from playwright.sync_api import expect, sync_playwright
@@ -796,7 +834,7 @@ def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_pat
             page = browser.new_page(viewport={"width": 390, "height": 844})
             page.set_default_timeout(40_000)
             page.on("pageerror", lambda error: errors.append(str(error)))
-            page.goto(f"http://127.0.0.1:{server.port}/")
+            page.goto(f"http://127.0.0.1:{server.port}/#token={server.access_token}")
             expect(page.locator("#video-line-text")).to_have_value("中文高清")
             page.locator("#video-url").fill(f"http://127.0.0.1:{line_server.server_port}/match")
             page.locator("#bili-url").fill(base + "/bili.flv?paced=1")
@@ -804,7 +842,7 @@ def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_pat
             page.locator("#bili-headers").fill("Cookie: sid=fixture")
             page.locator("#start").click()
             expect(page.locator("#phase-text")).to_have_text("直播运行中")
-            page.wait_for_function("document.getElementById('player').readyState >= 2")
+            wait_for_page(page, "document.getElementById('player').readyState >= 2", timeout=40)
             assert app.session.video.line_text == "中文高清"
             initial_generation = app.session.muxer.generation
             expect(page.locator("#line-form")).to_be_visible()
@@ -817,10 +855,12 @@ def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_pat
             page.locator('[data-delta="500"]').click()
             expect(page.locator("#offset-value")).to_have_text("+10.500")
             expect(page.locator("#current-line")).to_contain_text("当前：高清直播⑤")
-            page.wait_for_function(
+            wait_for_page(
+                page,
                 "generation => playerGeneration !== generation && playerGeneration !== null "
                 "&& document.getElementById('player').readyState >= 2",
                 arg=initial_generation,
+                timeout=40,
             )
             assert app.session.video.line_text == "高清直播⑤"
             assert app.session.applied_offset == 10.5
@@ -831,8 +871,11 @@ def test_webui_switches_named_iframe_line_while_preserving_manual_offset(tmp_pat
             assert sampled and sampled[0][0] >= 1000
             assert app.session.store.source_probe("video:127.0.0.1")["line_text"] == "高清直播⑤"
             start = page.evaluate("document.getElementById('player').currentTime")
-            page.wait_for_function(
-                "start => document.getElementById('player').currentTime > start + 0.5", arg=start
+            wait_for_page(
+                page,
+                "start => document.getElementById('player').currentTime > start + 0.5",
+                arg=start,
+                timeout=40,
             )
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert not errors

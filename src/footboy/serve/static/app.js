@@ -24,6 +24,9 @@ let audioTimer = null;
 let audioDirty = false;
 let audioSending = false;
 let audioVersion = 0;
+let accessToken = '';
+const accessStorageKey = 'footboy.controlToken';
+const invalidAccessMessage = '控制密钥无效或已过期，请使用本次启动终端中的控制页链接或密钥。';
 
 const phaseNames = {
   IDLE: '等待连接', CHECK: '检查环境', INIT: '准备连接', RESOLVE: '获取直播间',
@@ -49,10 +52,58 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => { $('toast').hidden = true; }, error ? 6500 : 3500);
 }
 
+function setAccessToken(value) {
+  accessToken = value.trim();
+  try {
+    if (accessToken) sessionStorage.setItem(accessStorageKey, accessToken);
+    else sessionStorage.removeItem(accessStorageKey);
+  } catch (_error) { /* The control link also works with browser storage disabled. */ }
+}
+
+function readAccessLink() {
+  const parameters = new URLSearchParams(location.hash.slice(1));
+  if (!parameters.has('token')) return false;
+  setAccessToken(parameters.get('token') || '');
+  history.replaceState(null, '', location.pathname + location.search);
+  return true;
+}
+
+function showAccessPanel(message) {
+  $('access-panel').hidden = false;
+  $('workspace').inert = true;
+  if (message) $('access-message').textContent = message;
+  $('phase-text').textContent = '等待验证';
+  $('phase').classList.remove('running', 'busy');
+  currentStatus = null;
+  clearTimeout(audioTimer); audioDirty = false; audioVersion += 1;
+  detachPlayer(); resetEditors();
+}
+
+$('access-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (refreshBusy) return;
+  setAccessToken($('access-token').value);
+  $('access-token').value = '';
+  await refresh();
+});
+window.addEventListener('hashchange', () => {
+  if (readAccessLink()) refresh();
+});
+
 async function timedFetch(path, options = {}, timeout = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
-  try { return await fetch(path, {...options, signal: controller.signal}); }
+  const token = path.startsWith('/api/') ? accessToken : '';
+  try {
+    const headers = new Headers(options.headers);
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    const response = await fetch(path, {...options, headers, signal: controller.signal});
+    if (response.status === 401 && token && token === accessToken) {
+      setAccessToken('');
+      showAccessPanel(invalidAccessMessage);
+    }
+    return response;
+  }
   finally { clearTimeout(timer); }
 }
 
@@ -428,19 +479,35 @@ function updatePreview(status) {
     }
     if (!meta?.available || editor.version === meta.version) continue;
     editor.version = meta.version;
-    const image = new Image();
-    const version = meta.version;
-    image.onload = () => {
-      if (editors[label] !== editor || editor.version !== version) return;
-      editor.image = image;
-      if (label === sourceLabel) drawRoi();
-    };
-    image.onerror = () => { if (editor.version === version) editor.version = null; };
-    image.src = `/api/snapshot/${label}.jpg?v=${encodeURIComponent(version)}`;
+    loadPreview(label, editor, meta.version);
   }
   const meta = status.measurement?.sources?.[sourceLabel];
   $('snapshot-time').textContent = meta?.captured_at ? `采样于 ${clockTime(meta.captured_at)}` : '以采样截图为准';
   drawRoi();
+}
+
+async function loadPreview(label, editor, version) {
+  try {
+    const response = await timedFetch(`/api/snapshot/${label}.jpg?v=${encodeURIComponent(version)}`, {cache: 'no-store'});
+    if (!response.ok) throw new Error('采样画面暂不可用');
+    const blob = await response.blob();
+    if (editors[label] !== editor || editor.version !== version) return;
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      if (editors[label] !== editor || editor.version !== version) return;
+      editor.image = image;
+      if (label === sourceLabel) drawRoi();
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      if (editors[label] === editor && editor.version === version) editor.version = null;
+    };
+    image.src = url;
+  } catch (_error) {
+    if (editors[label] === editor && editor.version === version) editor.version = null;
+  }
 }
 
 function validRoi(roi) {
@@ -550,11 +617,23 @@ $('copy-link').addEventListener('click', async () => {
 
 async function refresh() {
   if (refreshBusy) return;
-  refreshBusy = true; clearTimeout(refreshTimer);
+  clearTimeout(refreshTimer);
+  if (!accessToken) { showAccessPanel(); return; }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(accessToken)) {
+    setAccessToken(''); showAccessPanel(invalidAccessMessage); return;
+  }
+  const token = accessToken;
+  $('access-submit').disabled = true;
+  refreshBusy = true;
   try {
     const response = await timedFetch('/api/status', {cache: 'no-store'});
+    if (response.status === 401) return;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    updateStatus(await response.json());
+    const status = await response.json();
+    if (token !== accessToken) return;
+    updateStatus(status);
+    $('access-panel').hidden = true;
+    $('workspace').inert = false;
   } catch (_error) {
     $('phase-text').textContent = '控制台连接中断';
     $('phase').classList.remove('running');
@@ -562,7 +641,12 @@ async function refresh() {
     $('status-message').classList.add('warning');
   } finally {
     refreshBusy = false;
-    refreshTimer = setTimeout(refresh, 2000);
+    $('access-submit').disabled = false;
+    if (accessToken) refreshTimer = setTimeout(refresh, token === accessToken ? 2000 : 0);
   }
+}
+if (!readAccessLink()) {
+  try { accessToken = sessionStorage.getItem(accessStorageKey) || ''; }
+  catch (_error) { /* Ask for the control link when storage is unavailable. */ }
 }
 refresh();

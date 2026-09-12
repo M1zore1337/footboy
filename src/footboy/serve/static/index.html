@@ -17,7 +17,12 @@
   </header>
   <main>
     <div class="page-heading"><div><p class="eyebrow">YOUR MATCH. YOUR COMMENTARY.</p><h1>画面与解说，同一时刻。</h1><p class="subheading">连接比赛画面和 B 站音源，在熟悉的解说里看球。</p></div><span id="phase" class="phase"><span class="dot"></span><span id="phase-text">等待连接</span></span></div>
-    <div class="workspace">
+    <section id="access-panel" class="panel access-panel" aria-labelledby="access-heading">
+      <h2 id="access-heading">连接控制台</h2>
+      <p id="access-message" class="helper" role="status">打开启动终端中的控制页链接，或输入本次控制密钥。</p>
+      <form id="access-form"><label class="field-label" for="access-token">控制密钥</label><div class="access-row"><input id="access-token" type="password" required maxlength="128" autocomplete="off" spellcheck="false" placeholder="粘贴启动终端中的控制密钥"><button id="access-submit" class="button secondary small" type="submit">连接控制台</button></div></form>
+    </section>
+    <div id="workspace" class="workspace" inert>
       <div class="main-column">
         <section class="player-card" aria-label="直播播放器">
           <div class="section-bar"><span><span class="live-dot"></span> 合成直播</span><span id="player-state" class="muted">等待视频源</span></div>
@@ -84,7 +89,7 @@
 
         <section class="panel health-panel" aria-labelledby="health-heading"><div class="panel-heading"><h2 id="health-heading">连接状态</h2><span id="health-light" class="dot"></span></div><dl class="metrics"><div><dt>混流进程</dt><dd id="ffmpeg-status">未启动</dd></div><div><dt>识别样本</dt><dd id="confidence">—</dd></div><div><dt>最大识别残差</dt><dd id="residual">—</dd></div><div><dt>上次复核</dt><dd id="last-verified">尚未复核</dd></div><div><dt>连续运行</dt><dd id="uptime">—</dd></div></dl><div id="status-message" class="status-message" role="status">输入两路地址，开始连接。</div><details class="diagnostics"><summary>查看运行日志</summary><pre id="logs">暂无日志</pre></details></section>
 
-        <section class="panel share-panel" aria-labelledby="share-heading"><div class="panel-heading"><h2 id="share-heading">在其他设备观看</h2><span aria-hidden="true">↗</span></div><p class="helper">手机与本机连接同一局域网，打开本页或将播放地址交给支持 HLS 的播放器。</p><div class="copy-row"><input id="hls-address" readonly aria-label="HLS 播放地址"><button id="copy-link" title="复制播放地址" aria-label="复制播放地址">复制</button></div><div class="latency-note"><span aria-hidden="true">◷</span><p>实际延迟为较慢源自身延迟，再加约 <strong>6–10 秒</strong> 播放缓冲。</p></div></section>
+        <section class="panel share-panel" aria-labelledby="share-heading"><div class="panel-heading"><h2 id="share-heading">在其他设备观看</h2><span aria-hidden="true">↗</span></div><p class="helper">同一局域网的播放器可直接打开播放地址；需要控制直播时，使用终端中的控制页链接。</p><div class="copy-row"><input id="hls-address" readonly aria-label="HLS 播放地址"><button id="copy-link" title="复制播放地址" aria-label="复制播放地址">复制</button></div><div class="latency-note"><span aria-hidden="true">◷</span><p>实际延迟为较慢源自身延迟，再加约 <strong>6–10 秒</strong> 播放缓冲。</p></div></section>
       </aside>
     </div>
     <footer class="page-footer"><span>Footboy 足小子 <span class="footer-divider">/</span> 为你的比赛时刻</span><span>局域网使用 · 一场比赛，两路直播</span></footer>

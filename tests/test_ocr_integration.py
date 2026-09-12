@@ -16,10 +16,13 @@ from footboy.sources.models import Source
 from footboy.state import StateStore
 
 TESSERACT = os.environ.get("FOOTBOY_TESSERACT") or shutil.which("tesseract")
-pytestmark = pytest.mark.skipif(
-    not TESSERACT or importlib.util.find_spec("pytesseract") is None,
-    reason="需要 Tesseract 和 pytesseract；可设置 FOOTBOY_TESSERACT 指定可执行文件",
-)
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        not TESSERACT or importlib.util.find_spec("pytesseract") is None,
+        reason="需要 Tesseract 和 pytesseract；可设置 FOOTBOY_TESSERACT 指定可执行文件",
+    ),
+]
 ROI = (20 / 640, 16 / 360, 178 / 640, 56 / 360)
 
 
