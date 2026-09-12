@@ -61,6 +61,14 @@
           <div id="ocr-editor" role="tabpanel" aria-labelledby="tab-video">
             <div class="roi-stage"><canvas id="roi-canvas" width="960" height="540" aria-label="在采样画面上拖动框选比赛时钟；也可使用下方精确区域输入"></canvas><div id="roi-empty" class="roi-empty"><span aria-hidden="true">⌖</span><strong>还没有采样画面</strong><p>连接直播后，点击「重新测量」获取两路截图。</p></div></div>
             <div class="roi-tools"><label>画面方向<select id="flip"><option value="none">正常</option><option value="h">水平翻转</option><option value="v">垂直翻转</option><option value="hv">旋转 180°</option></select></label><label class="checkbox"><input id="inverted" type="checkbox">反色识别</label><span id="roi-summary" class="muted">尚未选择区域</span></div>
+            <div class="ocr-feedback">
+              <figure id="roi-crop-preview" hidden><canvas id="roi-crop" aria-label="当前选区预览，不含框外遮罩"></canvas><figcaption>当前选区</figcaption></figure>
+              <div role="status" aria-live="polite"><p id="ocr-reading-state">等待试读比赛时钟</p><p id="ocr-validation-state" class="muted">至少需要连续 3 帧走表才能确认</p></div>
+            </div>
+            <details id="ocr-diagnostics" class="diagnostics" hidden><summary>本轮识别详情</summary>
+              <div class="ocr-images"><figure><canvas id="ocr-actual-crop" aria-label="最近试读的原始裁剪"></canvas><figcaption>最近试读的原帧裁剪</figcaption></figure><figure><canvas id="ocr-processed" aria-label="送入 OCR 的预处理图像"></canvas><figcaption>识别使用的图像</figcaption></figure></div>
+              <pre id="ocr-details"></pre>
+            </details>
             <details class="fine-roi"><summary>精确设置区域</summary><div class="roi-coordinates"><label>左侧 %<input id="roi-x" type="number" min="0" max="100" step="0.1"></label><label>顶部 %<input id="roi-y" type="number" min="0" max="100" step="0.1"></label><label>宽度 %<input id="roi-w" type="number" min="0.1" max="100" step="0.1"></label><label>高度 %<input id="roi-h" type="number" min="0.1" max="100" step="0.1"></label></div></details>
             <div class="roi-bottom"><span class="muted" id="snapshot-time">以采样截图为准</span><button id="save-roi" class="button secondary small" disabled>保存区域并重测</button></div>
           </div>

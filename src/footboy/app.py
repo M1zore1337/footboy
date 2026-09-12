@@ -103,6 +103,10 @@ class Application:
         with self._lock:
             return self.session.preview(label) if self.session else None
 
+    def ocr_image(self, label: str, kind: str, version: str | None) -> bytes | None:
+        with self._lock:
+            return self.session.ocr_image(label, kind, version) if self.session else None
+
     def public_status(self) -> dict[str, Any]:
         with self._lock:
             value = (

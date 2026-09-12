@@ -5,6 +5,7 @@ const player = $('player');
 let currentStatus = null;
 let refreshBusy = false;
 let refreshTimer = null;
+let statusRevision = 0;
 let toastTimer = null;
 let lastSession = null;
 let hls = null;
@@ -36,7 +37,8 @@ const phaseNames = {
 };
 
 function newEditor() {
-  return {image: null, roi: null, flip: 'none', inverted: false, dirty: false, version: null};
+  return {image: null, roi: null, flip: 'none', inverted: false, dirty: false, version: null,
+    ocrVersion: null, ocrImages: {}};
 }
 function resetEditors() {
   editors.video = newEditor(); editors.bili = newEditor();
@@ -113,6 +115,7 @@ async function post(path, body = {}) {
   });
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  statusRevision += 1;
   refresh();
   return result;
 }
@@ -310,7 +313,10 @@ function updateStatus(status) {
     status.video ? `画面 · ${status.video.line_text || status.video.domain} · ${status.video.video_codec || '探测中'}${status.video.height ? ` / ${status.video.height}p` : ''}` : '',
     status.bili ? `音源 · ${status.bili.domain} · ${status.bili.audio_codec || '探测中'}` : ''
   ].filter(Boolean).join('  ｜  ') || (active ? '正在获取直播信息…' : '');
+  const ocrStates = Object.values(status.measurement?.sources || {}).map(source => source.ocr?.state);
   $('measurement-state').textContent = status.measurement?.running ? '正在采样与识别…'
+    : ocrStates.includes('error') ? '采样或识别失败' : ocrStates.includes('timeout') ? '识别超时'
+    : ocrStates.includes('stopped') ? '比赛时钟停表'
     : status.measurement?.needs_roi?.length ? '请框选未识别的时钟' : aligned && !manual ? '时钟已锁定' : '等待采样';
   $('measurement-state').classList.toggle('busy', Boolean(status.measurement?.running));
   updateCandidates(status.sniffer);
@@ -477,6 +483,14 @@ function updatePreview(status) {
       editor.roi = meta.config.roi.slice(); editor.flip = meta.config.flip;
       editor.inverted = meta.config.inverted;
     }
+    const reading = meta?.ocr?.reading;
+    if (reading?.version && editor.ocrVersion !== reading.version) {
+      editor.ocrVersion = reading.version;
+      editor.ocrImages = {};
+      loadOcrImages(label, editor, reading.version);
+    } else if (!reading?.version) {
+      editor.ocrVersion = null; editor.ocrImages = {};
+    }
     if (!meta?.available || editor.version === meta.version) continue;
     editor.version = meta.version;
     loadPreview(label, editor, meta.version);
@@ -484,6 +498,68 @@ function updatePreview(status) {
   const meta = status.measurement?.sources?.[sourceLabel];
   $('snapshot-time').textContent = meta?.captured_at ? `采样于 ${clockTime(meta.captured_at)}` : '以采样截图为准';
   drawRoi();
+}
+
+async function loadOcrImages(label, editor, version) {
+  await Promise.all(['crop', 'processed'].map(async kind => {
+    try {
+      const response = await timedFetch(`/api/ocr/${label}/${kind}.png?v=${encodeURIComponent(version)}`, {cache: 'no-store'});
+      if (!response.ok) throw new Error('本次识别图像暂不可用');
+      const blob = await response.blob();
+      if (editors[label] !== editor || editor.ocrVersion !== version) return;
+      const url = URL.createObjectURL(blob), image = new Image();
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        if (editors[label] !== editor || editor.ocrVersion !== version) return;
+        editor.ocrImages[kind] = image;
+        if (label === sourceLabel) drawOcrFeedback();
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        if (editors[label] === editor && editor.ocrVersion === version) editor.ocrVersion = null;
+      };
+      image.src = url;
+    } catch (_error) {
+      if (editors[label] === editor && editor.ocrVersion === version) editor.ocrVersion = null;
+    }
+  }));
+}
+
+function matchClock(seconds) {
+  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function drawOcrFeedback() {
+  const editor = editors[sourceLabel];
+  const progress = currentStatus?.measurement?.sources?.[sourceLabel]?.ocr || {};
+  const reading = progress.reading;
+  const states = {
+    queued: '区域已保存，等待重新采样', sampling: '正在采样比赛画面…',
+    searching: progress.phase === 'nearby' ? '正在选区周边寻找时钟…' : '正在画面中寻找时钟…',
+    stopped: '比赛时钟停表，保留当前偏移', timeout: '识别超时，可缩小选区后重试',
+    error: '采样或识别失败，请查看详情', not_found: '未锁定，请框选完整比赛计时',
+    cancelled: '本轮已取消', locked: `连续 ${progress.samples || 3} 帧走表通过`
+  };
+  $('ocr-reading-state').textContent = editor.dirty ? '选区已修改，保存后试读'
+    : reading ? reading.clock == null ? '最近单帧试读：未读到时间' : `最近单帧试读：${matchClock(reading.clock)}`
+    : states[progress.state] || '等待试读比赛时钟';
+  $('ocr-validation-state').textContent = editor.dirty ? '当前选区尚未验证'
+    : states[progress.state] || '尚未锁定，至少需要连续 3 帧走表';
+  $('ocr-diagnostics').hidden = editor.dirty || !reading && !progress.reason;
+  for (const [kind, id] of [['crop', 'ocr-actual-crop'], ['processed', 'ocr-processed']]) {
+    const target = $(id), image = editor.ocrImages[kind];
+    target.parentElement.hidden = !image || editor.dirty;
+    if (image) {
+      target.width = image.naturalWidth; target.height = image.naturalHeight;
+      target.getContext('2d').drawImage(image, 0, 0);
+    }
+  }
+  $('ocr-details').textContent = [
+    reading ? `原始识别文字：${reading.text?.trim() || '（空）'} · 第 ${reading.frame_index + 1} 帧` : '',
+    reading?.seconds != null ? `单次试读 ${reading.seconds.toFixed(3)} 秒` : '',
+    progress.attempts != null ? `本轮 ${progress.attempts} 次试读 · ${(progress.elapsed || 0).toFixed(3)} 秒` : '',
+    progress.reason || ''
+  ].filter(Boolean).join('\n');
 }
 
 async function loadPreview(label, editor, version) {
@@ -523,6 +599,8 @@ function drawRoi() {
   const canSave = editor.image && validRoi(editor.roi) && currentStatus && activeSession(currentStatus)
     && currentStatus.state !== 'STOPPING' && currentStatus.capabilities?.roi;
   $('save-roi').disabled = !canSave;
+  $('roi-crop-preview').hidden = !editor.image || !validRoi(editor.roi);
+  drawOcrFeedback();
   if (!editor.image) { context.clearRect(0, 0, canvas.width, canvas.height); return; }
   canvas.width = editor.image.naturalWidth; canvas.height = editor.image.naturalHeight;
   const width = canvas.width, height = canvas.height;
@@ -533,6 +611,9 @@ function drawRoi() {
   if (validRoi(editor.roi)) {
     const [x, y, w, h] = editor.roi;
     const left = x * width, top = y * height, rw = w * width, rh = h * height;
+    const crop = $('roi-crop'), scale = Math.min(4, 240 / rw, 100 / rh);
+    crop.width = Math.max(1, Math.round(rw * scale)); crop.height = Math.max(1, Math.round(rh * scale));
+    crop.getContext('2d').drawImage(canvas, left, top, rw, rh, 0, 0, crop.width, crop.height);
     context.fillStyle = 'rgba(8,16,9,.47)';
     context.fillRect(0, 0, width, top); context.fillRect(0, top + rh, width, height - top - rh);
     context.fillRect(0, top, left, rh); context.fillRect(left + rw, top, width - left - rw, rh);
@@ -562,6 +643,7 @@ $('flip').addEventListener('change', () => {
 });
 $('inverted').addEventListener('change', () => {
   editors[sourceLabel].inverted = $('inverted').checked; editors[sourceLabel].dirty = true;
+  drawRoi();
 });
 
 function pointer(event) {
@@ -598,9 +680,16 @@ $('save-roi').addEventListener('click', async () => {
   const editor = editors[sourceLabel], label = sourceLabel;
   if (!validRoi(editor.roi)) { toast('请在画面内选择有效的时钟区域', true); return; }
   $('save-roi').disabled = true;
+  const selection = {source: label, roi: editor.roi.slice(), flip: editor.flip, inverted: editor.inverted};
   try {
-    await post('/api/roi', {source: label, roi: editor.roi, flip: editor.flip, inverted: editor.inverted});
-    editor.dirty = false; toast('识别区域已保存，正在重新测量');
+    await post('/api/roi', selection);
+    if (editors[label] === editor && JSON.stringify(selection) === JSON.stringify({source: label, roi: editor.roi, flip: editor.flip, inverted: editor.inverted})) {
+      editor.dirty = false;
+      editor.ocrVersion = null; editor.ocrImages = {};
+      const meta = currentStatus?.measurement?.sources?.[label];
+      if (meta) meta.ocr = {state: 'queued'};
+    }
+    toast('识别区域已保存，正在重新测量');
   } catch (error) { toast(error.message, true); }
   finally { drawRoi(); }
 });
@@ -623,6 +712,7 @@ async function refresh() {
     setAccessToken(''); showAccessPanel(invalidAccessMessage); return;
   }
   const token = accessToken;
+  const revision = statusRevision;
   $('access-submit').disabled = true;
   refreshBusy = true;
   try {
@@ -630,7 +720,7 @@ async function refresh() {
     if (response.status === 401) return;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const status = await response.json();
-    if (token !== accessToken) return;
+    if (token !== accessToken || revision !== statusRevision) return;
     updateStatus(status);
     $('access-panel').hidden = true;
     $('workspace').inert = false;

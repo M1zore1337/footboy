@@ -6,10 +6,12 @@ import threading
 import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
-from footboy.probe.ocr import ClockProbeResult, ClockSample, ProbeConfig, StoppedClock
-from footboy.probe.offset import OffsetConfidence, OffsetMeasurement
+from footboy.probe.ocr import ClockProbeResult, ClockSample, OcrProgress, ProbeConfig, StoppedClock
+from footboy.probe.offset import MeasurementError, OffsetConfidence, OffsetMeasurement
 from footboy.probe.timeline import TimelineProbeError
 from footboy.sources.models import Source
 from footboy.supervisor import Supervisor, SupervisorConfig
@@ -145,6 +147,116 @@ def test_manual_roi_invalidates_old_measurement(tmp_path) -> None:
     supervisor._finish_measurement("initial", 0, 0, measurement(50), None)
     assert supervisor.offset == 0
     assert supervisor.store.source_probe("video:video.example")["flip"] == "h"
+
+
+@pytest.mark.parametrize("invalidate", ["roi", "offset", "source"])
+def test_ocr_images_and_progress_cannot_overwrite_new_user_settings(
+    tmp_path, monkeypatch, invalidate
+):
+    supervisor = supervisor_at(tmp_path)
+    supervisor.video = Source("https://v.example/live.flv")
+    supervisor.bili = Source("https://b.example/live.flv")
+    entered, release = threading.Event(), threading.Event()
+    callbacks = {}
+    crop = np.full((12, 48, 3), (10, 100, 220), dtype=np.uint8)
+    config = ProbeConfig((0.1, 0.1, 0.2, 0.1), "none", False)
+
+    def measure(*args, **kwargs):
+        callbacks.update(kwargs)
+        kwargs["on_progress"](
+            "video",
+            OcrProgress(
+                "reading",
+                phase="saved",
+                config=config,
+                frame_index=2,
+                clock=0,
+                text="00:00\n",
+                crop=crop,
+                image=crop[:, :, 0],
+            ),
+        )
+        entered.set()
+        assert release.wait(3)
+        kwargs["on_progress"]("video", OcrProgress("locked", config=config, samples=4))
+        return measurement(15)
+
+    monkeypatch.setattr("footboy.supervisor.measure_offset", measure)
+    supervisor._start_measurement("manual")
+    try:
+        assert entered.wait(1)
+        progress = supervisor.public_status()["measurement"]["sources"]["video"]["ocr"]
+        assert progress["state"] == "reading" and progress["reading"]["clock"] == 0
+        assert (
+            not supervisor.aligned and supervisor.store.source_probe("video:video.example") is None
+        )
+        version = progress["reading"]["version"]
+        encoded = supervisor.ocr_image("video", "crop", version)
+        assert encoded is not None
+        decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert np.array_equal(decoded, crop)
+        assert supervisor.ocr_image("video", "crop", "older") is None
+        if invalidate == "roi":
+            supervisor.request_roi(
+                "video", {"roi": [0, 0, 0.3, 0.2], "flip": "h", "inverted": False}
+            )
+            assert supervisor.ocr_image("video", "crop", version) is None
+        elif invalidate == "offset":
+            supervisor.request_offset_delta(500)
+        else:
+            supervisor._source_generation += 1
+        current = dict(supervisor.public_status()["measurement"]["sources"]["video"]["ocr"])
+        callbacks["on_progress"]("video", OcrProgress("locked", config=config, samples=4))
+        callbacks["on_preview"]("video", crop)
+        assert supervisor.public_status()["measurement"]["sources"]["video"]["ocr"] == current
+        assert supervisor.preview("video") is None
+    finally:
+        release.set()
+        supervisor._measurement_thread.join(timeout=3)
+    while True:
+        action, payload = supervisor._events.get(timeout=1)
+        if action == "measurement_done":
+            supervisor._finish_measurement(*payload)
+            break
+    assert supervisor.offset == (0.5 if invalidate == "offset" else 0)
+    if invalidate == "roi":
+        assert supervisor.store.source_probe("video:video.example")["flip"] == "h"
+    else:
+        assert supervisor.store.source_probe("video:video.example") is None
+
+
+def test_one_sources_validated_progress_does_not_apply_or_persist_offset(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path)
+    supervisor.video = Source("https://v.example/live.flv")
+    supervisor.bili = Source("https://b.example/live.flv")
+    entered, release = threading.Event(), threading.Event()
+
+    def measure(*args, **kwargs):
+        kwargs["on_progress"](
+            "video", OcrProgress("locked", config=measurement(15).video.config, samples=4)
+        )
+        entered.set()
+        assert release.wait(3)
+        kwargs["on_progress"]("bili", OcrProgress("error", reason="识别引擎失败"))
+        raise MeasurementError("识别引擎失败", [])
+
+    monkeypatch.setattr("footboy.supervisor.measure_offset", measure)
+    supervisor._start_measurement("manual")
+    try:
+        assert entered.wait(1)
+        assert not supervisor.aligned and supervisor.offset == 0
+        assert supervisor.store.source_probe("video:video.example") is None
+    finally:
+        release.set()
+        supervisor._measurement_thread.join(timeout=3)
+    action, payload = supervisor._events.get(timeout=1)
+    assert action == "measurement_done"
+    supervisor._finish_measurement(*payload)
+    status = supervisor.public_status()
+    assert not status["aligned"] and not status["measurement"]["needs_roi"]
+    assert status["measurement"]["sources"]["video"]["ocr"]["state"] == "locked"
+    assert status["measurement"]["sources"]["bili"]["ocr"]["state"] == "error"
+    assert supervisor.store.source_probe("video:video.example") is None
 
 
 def test_large_signed_pts_offset_does_not_trigger_30_second_startup_recovery(

@@ -10,7 +10,14 @@ import cv2
 import numpy as np
 import pytest
 
-from footboy.probe.ocr import ProbeConfig, StoppedClock, TesseractBackend, flip_frame, probe_clock
+from footboy.probe.ocr import (
+    ProbeConfig,
+    StoppedClock,
+    TesseractBackend,
+    flip_frame,
+    probe_clock,
+    read_with_config,
+)
 from footboy.probe.offset import measure_offset
 from footboy.sources.models import Source
 from footboy.state import StateStore
@@ -221,9 +228,9 @@ class CountingTesseractBackend(TesseractBackend):
         super().__init__(TESSERACT)
         self.calls = 0
 
-    def read(self, image, *, raw_line=False):
+    def read(self, image, **kwargs):
         self.calls += 1
-        return super().read(image, raw_line=raw_line)
+        return super().read(image, **kwargs)
 
 
 def textured_clock_frames(*, flip="none"):
@@ -283,6 +290,62 @@ def test_tesseract_recovers_from_saved_team_name_region():
     assert [sample.clock for sample in result.samples] == [3714, 3716, 3718, 3720]
     assert result.config.roi != saved.roi
     assert backend.calls <= 40
+
+
+def test_saved_clock_survives_an_occluded_first_frame():
+    frames = clock_frames(1000.125, 2700)
+    frames[0][1].fill(0)
+    saved = ProbeConfig(ROI, "none", False)
+    backend = CountingTesseractBackend()
+    result = probe_clock(frames, backend, saved=saved)
+    assert result.config == saved
+    assert [sample.clock for sample in result.samples] == [2702, 2704, 2706]
+    assert result.k == pytest.approx(1699.875)
+    assert backend.calls == 4
+
+
+def uneven_clock_frames(*, dark_digits=False):
+    """Small low-contrast digits over a gradual panel brightness change."""
+    frames = []
+    for index in range(4):
+        clock = 3714 + index * 2
+        glyph = np.zeros((40, 150), dtype=np.uint8)
+        cv2.putText(
+            glyph,
+            f"{clock // 60:02}:{clock % 60:02}",
+            (2, 30),
+            cv2.FONT_HERSHEY_DUPLEX,
+            1,
+            255,
+            2,
+            cv2.LINE_AA,
+        )
+        x, y, width, height = cv2.boundingRect(cv2.findNonZero(glyph))
+        glyph = cv2.resize(
+            glyph[y : y + height, x : x + width], (44, 13), interpolation=cv2.INTER_AREA
+        )
+        glyph = cv2.copyMakeBorder(glyph, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0)
+        crop = np.linspace(25, 155, glyph.shape[1])[None, :] + glyph.astype(float) * 0.25
+        crop = crop.clip(0, 255).astype(np.uint8)
+        if dark_digits:
+            crop = 255 - crop
+        image = np.full((360, 640, 3), (48, 92, 44), dtype=np.uint8)
+        image[40:61, 80:132] = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        frames.append((1000.125 + index * 2, image))
+    return frames
+
+
+@pytest.mark.parametrize("dark_digits", [False, True])
+def test_adaptive_saved_style_recovers_small_clock_with_uneven_brightness(dark_digits):
+    frames = uneven_clock_frames(dark_digits=dark_digits)
+    saved = ProbeConfig((80 / 640, 40 / 360, 52 / 640, 21 / 360), "none", False)
+    backend = CountingTesseractBackend()
+    assert read_with_config(frames[0][1], saved, backend) != 3714
+    result = probe_clock(frames, backend, saved=saved)
+    assert [sample.clock for sample in result.samples] == [3714, 3716, 3718, 3720]
+    assert result.config.roi == saved.roi and result.config.style == "adaptive"
+    assert result.residual == 0
+    assert ProbeConfig.from_dict(result.config.to_dict()) == result.config
 
 
 @pytest.mark.parametrize(

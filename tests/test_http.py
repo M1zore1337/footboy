@@ -55,6 +55,9 @@ class FakeController:
     def preview(self, label):
         return b"jpeg-fixture" if label == "video" else None
 
+    def ocr_image(self, label, kind, version):
+        return b"png-fixture" if label == "video" and version == "current" else None
+
 
 @pytest.fixture
 def running_server(tmp_path):
@@ -251,6 +254,9 @@ def test_web_assets_are_served_locally(running_server):
         ("HEAD", "/api/status"),
         ("GET", "/api/snapshot/video.jpg"),
         ("GET", "/api/snapshot/bili.jpg"),
+        ("GET", "/api/ocr/video/crop.png?v=current"),
+        ("GET", "/api/ocr/bili/processed.png?v=current"),
+        ("HEAD", "/api/ocr/video/processed.png?v=current"),
     ]
     + [
         ("POST", f"/api/{action}")
@@ -300,6 +306,27 @@ def test_wrong_or_query_string_tokens_cannot_authorize(running_server):
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(request)
         assert error.value.code == 401
+
+
+@pytest.mark.parametrize("kind", ["crop", "processed"])
+def test_ocr_diagnostics_are_private_uncached_and_versioned(running_server, kind):
+    path = f"/api/ocr/video/{kind}.png"
+    with urllib.request.urlopen(api_request(running_server, path + "?v=current")) as response:
+        assert response.headers.get_content_type() == "image/png"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert "Access-Control-Allow-Origin" not in response.headers
+        assert response.read() == b"png-fixture"
+    for suffix in ("", "?v=previous"):
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(api_request(running_server, path + suffix))
+        assert error.value.code == 404
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(
+            api_request(
+                running_server, path + "?v=current", headers={"Origin": "https://untrusted.example"}
+            )
+        )
+    assert error.value.code == 403
 
 
 @pytest.mark.parametrize("origin", ["http://untrusted.example", "null", "http://127.0.0.1:1"])

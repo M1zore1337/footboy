@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from functools import partial
+from itertools import product
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,7 +17,9 @@ from footboy.probe.ocr import (
     OcrTimeout,
     ProbeConfig,
     StoppedClock,
+    TesseractBackend,
     _discover_candidates,
+    _read_series,
     _validate_series,
     parse_clock,
     probe_clock,
@@ -171,17 +174,18 @@ def test_discovery_reading_is_reused_without_skipping_a_validation_frame(monkeyp
     monkeypatch.setattr("footboy.probe.ocr._text_rois", lambda _: [CONFIG.roi])
     monkeypatch.setattr("footboy.probe.ocr._candidate_rois", lambda: [])
     monkeypatch.setattr("footboy.probe.ocr._has_edges", lambda _: True)
-    readings = iter(range(first_clock, first_clock + 3))
+    monkeypatch.setattr("footboy.probe.ocr.preprocess", lambda image, *args: image)
+    frames = [(float(i), np.full((32, 64, 3), i, dtype=np.uint8)) for i in range(3)]
     calls = []
 
     def read(image):
-        clock = next(readings)
+        clock = first_clock + int(image[0, 0, 0])
         calls.append(clock)
         return f"{clock // 60:02}:{clock % 60:02}"
 
-    result = probe_clock(probe_frames(), SimpleNamespace(read=read))
+    result = probe_clock(frames, SimpleNamespace(read=read))
 
-    assert calls == list(range(first_clock, first_clock + 3))
+    assert sorted(calls) == list(range(first_clock, first_clock + 3))
     assert result.k == first_clock
     assert [(sample.pts, sample.clock) for sample in result.samples] == [
         (float(index), first_clock + index) for index in range(3)
@@ -220,3 +224,202 @@ def test_stopped_clock_does_not_hide_another_sources_backend_error(monkeypatch):
         measure_offset(video, bili, frame_collector=collect)
     assert "后端失败" in str(error.value)
     assert not error.value.needs_roi
+
+
+def test_quick_screen_preserves_every_possible_later_run(monkeypatch):
+    frames = [(float(i * 2), np.full((2, 2), i, dtype=np.uint8)) for i in range(8)]
+    # All 256 occlusion patterns: unknown frames must never be treated as misses.
+    for present in product((False, True), repeat=8):
+        readings = [500 + i * 2 if found else None for i, found in enumerate(present)]
+        monkeypatch.setattr(
+            "footboy.probe.ocr.read_with_config",
+            lambda frame, *_, readings=readings: readings[int(frame[0, 0])],
+        )
+        expected = _validate_series(
+            [
+                ClockSample(pts, clock) if clock is not None else None
+                for (pts, _), clock in zip(frames, readings, strict=True)
+            ],
+            CONFIG,
+        )
+        actual = _validate_series(_read_series(frames, CONFIG, object()), CONFIG)
+        assert actual == expected, present
+
+
+@pytest.mark.parametrize("count", [3, 4, 7, 8])
+def test_empty_saved_region_is_screened_with_few_reads(monkeypatch, count):
+    calls = []
+    frames = [(float(i), np.zeros((2, 2))) for i in range(count)]
+    monkeypatch.setattr("footboy.probe.ocr.read_with_config", lambda *args: calls.append(1))
+    samples = _read_series(frames, CONFIG, object())
+    assert _validate_series(samples, CONFIG) is None
+    assert len(calls) == count // 3
+
+
+@pytest.mark.parametrize(
+    "clocks",
+    [
+        [500, 498, 496, 494, 492, 490, 488, 486],
+        [800, 500, 504, 506, 508, 510, 512, 514],
+        [500, 500, 500, 506, 508, 510, 512, 514],
+        [500, 502, 504, 900, 508, 510, 512, 514],
+    ],
+)
+def test_quick_screen_preserves_jump_countdown_and_stopped_results(monkeypatch, clocks):
+    frames = [(float(i * 2), np.full((2, 2), i)) for i in range(len(clocks))]
+    monkeypatch.setattr(
+        "footboy.probe.ocr.read_with_config", lambda frame, *_: clocks[int(frame[0, 0])]
+    )
+    samples = _read_series(frames, CONFIG, object())
+    if clocks[:3] == [500] * 3:
+        with pytest.raises(StoppedClock):
+            _validate_series(samples, CONFIG)
+    else:
+        expected = _validate_series(
+            [ClockSample(i * 2, clock) for i, clock in enumerate(clocks)], CONFIG
+        )
+        assert _validate_series(samples, CONFIG) == expected
+
+
+def test_tesseract_receives_remaining_budget_and_late_success_is_rejected(monkeypatch):
+    now = [100.0]
+    timeouts = []
+    monkeypatch.setattr("footboy.probe.ocr.time.monotonic", lambda: now[0])
+
+    def read(image, *, config, timeout):
+        timeouts.append(timeout)
+        now[0] += timeout + 0.01
+        return "61:54"
+
+    backend = object.__new__(TesseractBackend)
+    backend._module = SimpleNamespace(image_to_string=read)
+    events = []
+    with pytest.raises(OcrTimeout):
+        probe_clock(probe_frames(), backend, saved=CONFIG, budget=0.25, on_progress=events.append)
+    assert timeouts == [pytest.approx(0.25)]
+    assert events[-1].state == "timeout"
+    assert not any(event.state == "locked" for event in events)
+
+
+@pytest.mark.parametrize("message", ["Tesseract process timeout", "executable failed"])
+def test_tesseract_distinguishes_call_timeout_from_backend_failure(message):
+    def read(*args, **kwargs):
+        raise RuntimeError(message)
+
+    backend = object.__new__(TesseractBackend)
+    backend._module = SimpleNamespace(image_to_string=read)
+    with pytest.raises(OcrError) as error:
+        backend.read(np.zeros((2, 2), dtype=np.uint8))
+    assert isinstance(error.value, OcrTimeout) == ("timeout" in message)
+
+
+def test_generic_backend_receives_no_tesseract_options_and_cannot_lock_after_deadline(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("footboy.probe.ocr.time.monotonic", lambda: now[0])
+
+    def read(image):
+        now[0] += 1
+        return "61:54"
+
+    with pytest.raises(OcrTimeout):
+        probe_clock(probe_frames(), SimpleNamespace(read=read), saved=CONFIG, budget=0.5)
+
+
+def test_cancellation_during_backend_read_is_not_reported_as_a_reading():
+    cancellation = threading.Event()
+    events = []
+
+    def read(image):
+        cancellation.set()
+        return "61:54"
+
+    with pytest.raises(OcrCancelled):
+        probe_clock(
+            probe_frames(),
+            SimpleNamespace(read=read),
+            saved=CONFIG,
+            stop_event=cancellation,
+            on_progress=events.append,
+        )
+    assert events[-1].state == "cancelled"
+    assert not any(event.state in {"reading", "locked"} for event in events)
+
+
+@pytest.mark.parametrize("start", range(6))
+def test_quick_screen_preserves_a_later_stopped_run(monkeypatch, start):
+    frames = [(float(i * 2), np.full((2, 2), i)) for i in range(8)]
+    monkeypatch.setattr(
+        "footboy.probe.ocr.read_with_config",
+        lambda frame, *_: 500 if start <= int(frame[0, 0]) < start + 3 else None,
+    )
+    with pytest.raises(StoppedClock):
+        _validate_series(_read_series(frames, CONFIG, object()), CONFIG)
+
+
+def test_nearby_search_does_not_mark_unread_candidates_as_tried(monkeypatch):
+    rois = [(index / 20, 0.0, 0.04, 0.2) for index in range(10)]
+    monkeypatch.setattr("footboy.probe.ocr._text_rois", lambda *args, **kwargs: rois)
+    monkeypatch.setattr("footboy.probe.ocr._candidate_rois", lambda: [])
+    monkeypatch.setattr("footboy.probe.ocr._has_edges", lambda _: True)
+    attempts = []
+    monkeypatch.setattr(
+        "footboy.probe.ocr.read_with_config", lambda frame, config, _: attempts.append(config)
+    )
+    tried = set()
+    frame = np.zeros((32, 64, 3), dtype=np.uint8)
+    assert list(_discover_candidates(frame, object(), near=CONFIG, tried=tried)) == []
+    assert len(attempts) == 8 and tried == set(attempts)
+    expected = ProbeConfig(rois[6], "none", False)
+    monkeypatch.setattr(
+        "footboy.probe.ocr.read_with_config",
+        lambda frame, config, _: 500 if config == expected else None,
+    )
+    assert next(_discover_candidates(frame, object(), tried=tried)) == expected
+
+
+def test_user_cancellation_takes_precedence_over_backend_timeout():
+    cancellation = threading.Event()
+
+    def read(image):
+        cancellation.set()
+        raise OcrTimeout("backend timeout")
+
+    with pytest.raises(OcrCancelled):
+        probe_clock(
+            probe_frames(), SimpleNamespace(read=read), saved=CONFIG, stop_event=cancellation
+        )
+
+
+def test_explicit_manual_selection_does_not_spend_validation_budget_while_user_chooses(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("footboy.probe.ocr.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("footboy.probe.ocr._discover_candidates", lambda *a, **k: [])
+    monkeypatch.setattr("footboy.probe.ocr.preprocess", lambda image, *args: image)
+
+    def select(*args):
+        now[0] += 60
+        return CONFIG
+
+    monkeypatch.setattr("footboy.probe.ocr._manual_config", select)
+    frames = [(float(i), np.full((12, 32, 3), i, dtype=np.uint8)) for i in range(3)]
+    backend = SimpleNamespace(read=lambda image: f"01:{int(image[0, 0, 0]):02}")
+    result = probe_clock(frames, backend, allow_manual=True)
+    assert [sample.clock for sample in result.samples] == [60, 61, 62]
+
+
+def test_source_sampling_failures_publish_independent_ocr_states():
+    events = {"video": [], "bili": []}
+
+    def collect(source):
+        return []
+
+    with pytest.raises(MeasurementError) as error:
+        measure_offset(
+            Source("https://video.example/live"),
+            Source("https://bili.example/live"),
+            frame_collector=collect,
+            on_progress=lambda label, event: events[label].append(event),
+        )
+    assert not error.value.needs_roi
+    assert [event.state for event in events["video"]] == ["sampling", "error"]
+    assert [event.state for event in events["bili"]] == ["sampling", "error"]

@@ -12,7 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from footboy.sources.lines import validate_line_text
 
@@ -146,6 +146,16 @@ def _handler_factory(
                     self._send_json({"error": "尚无采样画面"}, status=HTTPStatus.NOT_FOUND)
                 else:
                     self._send_bytes(preview, "image/jpeg", no_store=True)
+                return
+            diagnostic = re.fullmatch(r"/api/ocr/(video|bili)/(crop|processed)\.png", path)
+            if diagnostic:
+                label, kind = diagnostic.groups()
+                version = parse_qs(urlsplit(self.path).query).get("v", [None])[0]
+                preview = getattr(controller, "ocr_image", lambda *_: None)(label, kind, version)
+                if preview is None:
+                    self._send_json({"error": "本次识别图像暂不可用"}, status=HTTPStatus.NOT_FOUND)
+                else:
+                    self._send_bytes(preview, "image/png", no_store=True)
                 return
             if path.startswith("/static/"):
                 candidate = (static_dir / unquote(path[len("/static/") :])).resolve()

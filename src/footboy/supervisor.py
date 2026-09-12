@@ -17,7 +17,7 @@ import numpy as np
 
 from footboy.environment import binary_crash_reason
 from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
-from footboy.probe.ocr import ProbeConfig, StoppedClock
+from footboy.probe.ocr import OcrProgress, ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
 from footboy.probe.timeline import TimelineProbeError, estimate_initial_offset
 from footboy.serve.http import ControlServer
@@ -107,6 +107,8 @@ class Supervisor:
         self._refresh_revision: int | None = None
         self._preview_bytes: dict[str, bytes] = {}
         self._preview_meta: dict[str, dict[str, Any]] = {}
+        self._ocr_progress: dict[str, dict[str, Any]] = {}
+        self._ocr_images: dict[str, dict[str, bytes]] = {}
         self._needs_roi: list[str] = []
 
     def run(self, *, serve: bool = True) -> None:
@@ -198,11 +200,20 @@ class Supervisor:
             self._verify_candidate = None
             self._needs_roi = [item for item in self._needs_roi if item != label]
             self._measurement_cancel.set()
+            self._ocr_progress[label] = {"state": "queued"}
+            self._ocr_images.pop(label, None)
         self._events.put(("remeasure", None))
 
     def preview(self, label: str) -> bytes | None:
         with self._lock:
             return self._preview_bytes.get(label)
+
+    def ocr_image(self, label: str, kind: str, version: str | None) -> bytes | None:
+        with self._lock:
+            reading = self._ocr_progress.get(label, {}).get("reading") or {}
+            if version != reading.get("version"):
+                return None
+            return self._ocr_images.get(label, {}).get(kind)
 
     def public_status(self) -> dict[str, Any]:
         with self._lock:
@@ -232,6 +243,7 @@ class Supervisor:
                         label: {
                             **self._preview_meta.get(label, {}),
                             "config": self.store.source_probe(key),
+                            "ocr": dict(self._ocr_progress.get(label, {})),
                         }
                         for label, key in (
                             ("video", self._video_probe_key),
@@ -393,6 +405,9 @@ class Supervisor:
             self._verify_candidate = None
             self._pending_measurement = None
             self._measurement_cancel.set()
+            for progress in self._ocr_progress.values():
+                progress["state"] = "cancelled"
+                progress["reason"] = "已采用最新手动偏移"
             self.aligned = True
             self.confidence = {"method": "manual"}
             self.message = "手动偏移已更新，1.5 秒后应用"
@@ -433,9 +448,19 @@ class Supervisor:
             video, bili = self.video, self.bili
             self._next_verify = float("inf")
             self.message = "正在采样两路比赛时钟，播放和手动调节继续可用"
+            self._ocr_progress = {label: {"state": "sampling"} for label in ("video", "bili")}
+            self._ocr_images.clear()
+
+        def is_current() -> bool:
+            return (
+                not cancellation.is_set()
+                and not self._stop.is_set()
+                and revision == self._revision
+                and generation == self._source_generation
+            )
 
         def capture_preview(label: str, frame: np.ndarray) -> None:
-            if cancellation.is_set() or self._stop.is_set():
+            if not is_current():
                 return
             height, width = frame.shape[:2]
             image = frame
@@ -444,7 +469,7 @@ class Supervisor:
             ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if ok:
                 with self._lock:
-                    if generation == self._source_generation:
+                    if is_current():
                         self._preview_bytes[label] = encoded.tobytes()
                         self._preview_meta[label] = {
                             "available": True,
@@ -453,6 +478,47 @@ class Supervisor:
                             "version": time.time_ns() // 1_000_000,
                             "captured_at": _now_iso(),
                         }
+
+        def capture_progress(label: str, event: OcrProgress) -> None:
+            if not is_current():
+                return
+            details = event.public_dict()
+            if details.get("reason"):
+                details["reason"] = _sanitize_ffmpeg_line(details["reason"])
+            if details.get("text") is not None:
+                details["text"] = _sanitize_ffmpeg_line(details["text"][:256])
+            images = {}
+            # Keep the actual selected crop, or a candidate with a clock reading.
+            # Failed global guesses must not replace useful diagnostic images.
+            if event.state == "reading" and (event.phase == "saved" or event.clock is not None):
+                for kind, image in (("crop", event.crop), ("processed", event.image)):
+                    if image is None or not image.size:
+                        continue
+                    height, width = image.shape[:2]
+                    scale = min(1.0, 640 / width, 256 / height)
+                    if scale < 1:
+                        image = cv2.resize(
+                            image, (max(1, round(width * scale)), max(1, round(height * scale)))
+                        )
+                    ok, encoded = cv2.imencode(".png", image)
+                    if ok:
+                        images[kind] = encoded.tobytes()
+            with self._lock:
+                if not is_current():
+                    return
+                previous = self._ocr_progress.get(label, {})
+                reading = previous.get("reading")
+                if images:
+                    reading = {
+                        "version": str(time.time_ns()),
+                        "config": details["config"],
+                        "frame_index": details["frame_index"],
+                        "clock": details["clock"],
+                        "text": _sanitize_ffmpeg_line((details["text"] or "")[:256]),
+                        "seconds": details["seconds"],
+                    }
+                    self._ocr_images[label] = images
+                self._ocr_progress[label] = {**details, "reading": reading}
 
         def worker() -> None:
             result, error = None, None
@@ -467,6 +533,7 @@ class Supervisor:
                     tesseract_command=self.config.tesseract_command,
                     allow_manual=False,
                     on_preview=capture_preview,
+                    on_progress=capture_progress,
                     stop_event=cancellation,
                     persist=False,
                 )
@@ -509,11 +576,32 @@ class Supervisor:
         if revision != self._revision or generation != self._source_generation:
             self.message = "已保留最新手动设置；过期的 OCR 结果已忽略"
             self._verify_candidate = None
+            for progress in self._ocr_progress.values():
+                if progress.get("state") not in {
+                    "queued",
+                    "locked",
+                    "error",
+                    "timeout",
+                    "not_found",
+                    "stopped",
+                }:
+                    progress["state"] = "cancelled"
             return
         self.last_verified_at = _now_iso()
         if error is not None:
             self._verify_candidate = None
             self.aligned = False
+            for progress in self._ocr_progress.values():
+                if progress.get("state") in {
+                    "sampling",
+                    "searching",
+                    "candidate",
+                    "reading",
+                    "validating",
+                    "rejected",
+                }:
+                    progress["state"] = "stopped" if isinstance(error, StoppedClock) else "error"
+                    progress["reason"] = _sanitize_ffmpeg_line(str(error))
             if isinstance(error, StoppedClock):
                 self.message = f"检测到停表，保留 D={self.offset:.3f}s；60 秒后重试"
                 self.confidence = {"method": "ocr", "stopped": True}
@@ -526,12 +614,19 @@ class Supervisor:
                 self._needs_roi = error.needs_roi if isinstance(error, MeasurementError) else []
             return
         assert result is not None
-        for key, source_result in (
-            (self._video_probe_key, result.video),
-            (self._bili_probe_key, result.bili),
+        for label, key, source_result in (
+            ("video", self._video_probe_key, result.video),
+            ("bili", self._bili_probe_key, result.bili),
         ):
             saved = self.store.source_probe(key) or {}
             self.store.set_source_probe(key, {**saved, **source_result.config.to_dict()})
+            self._ocr_progress[label] = {
+                **self._ocr_progress.get(label, {}),
+                "state": "locked",
+                "config": source_result.config.to_dict(),
+                "samples": len(source_result.samples),
+                "residual": source_result.residual,
+            }
         self._needs_roi = []
         self.confidence = {"method": "ocr", **result.confidence.public_dict()}
         difference = result.offset - self.offset
@@ -642,6 +737,8 @@ class Supervisor:
         with self._lock:
             self._preview_bytes.clear()
             self._preview_meta.clear()
+            self._ocr_progress.clear()
+            self._ocr_images.clear()
             self._needs_roi = []
         try:
             with self._lock:

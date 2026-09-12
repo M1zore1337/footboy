@@ -269,6 +269,9 @@ POST 请求必须声明 `Content-Type: application/json`。成功返回 202；�
 | `POST /api/roi` | `{"source":"video","roi":[0.1,0.1,0.2,0.1],"flip":"none","inverted":false}` |
 | `GET /api/snapshot/video.jpg` | 比赛画面截图 |
 | `GET /api/snapshot/bili.jpg` | 音源截图 |
+| `GET /api/ocr/{video,bili}/{crop,processed}.png?v=版本` | 最近一次试读的裁剪或预处理图；版本取自状态中的 `measurement.sources[来源].ocr.reading.version` |
+
+保存识别区域后，网页先显示当前选区预览，再显示单帧试读和连续验证状态。单帧读到时间还不代表同步成功，两路均通过连续走表验证后才能应用自动偏移。「本轮识别详情」提供实际试读图像、原始文字和耗时，并区分未读到时间、停表、超时和采样或引擎失败。
 
 ## 本地数据
 
@@ -278,11 +281,21 @@ POST 请求必须声明 `Content-Type: application/json`。成功返回 202；�
 
 `.gitignore` 排除虚拟环境、状态文件、HLS 产物、Cookie 及 agent 配置文件。自定义路径也应排除在版本控制之外。
 
+需要离线诊断时，可将解码源 PTS 和原始关键帧保存为包含 `pts`、`frames` 数组的 NPZ，再选取至少三帧连续样本运行：
+
+```bash
+python -m footboy.tools.ocr_diagnose frames.npz --start 0 --count 4 --backend tesseract --output ocr-debug-01
+# 复查指定区域时可追加 --roi 0.1 0.1 0.2 0.1 --flip none
+```
+
+`frames` 使用 `uint8` 灰度或 BGR 图像；不同片段应分别诊断。工具输出实际尝试的候选优先级、裁剪与预处理 PNG、原始文字、耗时、淘汰原因和最终结果。输出目录须为新目录，会自动加入 `.gitignore`，其中比赛画面和识别文字仅供本地排查。诊断不会打开直播或修改保存的设置。
+
 ## 验证与限制
 
 - H.264 输出 MPEG-TS HLS，HEVC 输出 fMP4 HLS。Safari 走原生 HLS，支持 MSE 的浏览器优先用包内 hls.js。
 - OCR 需至少 3 帧连续走表；停表、遮挡或无计时画面可能无法自动对齐。
 - 历史验证见 [基线](docs/validation/validation.md)、[0.1.1](docs/validation/validation-0.1.1.md)、[0.1.2](docs/validation/validation-0.1.2.md)、[0.1.3](docs/validation/validation-0.1.3.md)、[0.1.4](docs/validation/validation-0.1.4.md)。
+- OCR 优化对比见 [第一轮](docs/validation/validation-ocr-2026-09-13.md)和[第二轮](docs/validation/validation-ocr-round-2-2026-09-13.md)。
 - **待验收**：不同来源同场精确同步、连续两小时运行、Windows/macOS 原生、实体手机 Safari。
 
 ## 开发

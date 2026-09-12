@@ -5,7 +5,7 @@ import re
 import statistics
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
@@ -16,7 +16,7 @@ from footboy.environment import resolve_binary
 
 CLOCK_RE = re.compile(r"(?<![\d:：.])(\d{1,3})\s*[:：.]\s*(\d{2})(?![\d:：.])")
 FLIPS = ("none", "h", "v", "hv")
-STYLES = ("standard", "condensed")
+STYLES = ("standard", "condensed", "adaptive")
 
 
 class OcrError(RuntimeError):
@@ -103,6 +103,125 @@ class ClockProbeResult:
         return statistics.median(sample.clock for sample in self.samples)
 
 
+@dataclass(frozen=True, slots=True)
+class OcrProgress:
+    state: str
+    phase: str = "search"
+    attempts: int = 0
+    elapsed: float = 0.0
+    total: int = 0
+    config: ProbeConfig | None = None
+    frame_index: int | None = None
+    clock: int | None = None
+    text: str | None = None
+    seconds: float | None = None
+    samples: int = 0
+    residual: float | None = None
+    reason: str | None = None
+    priority: int | None = None
+    crop: np.ndarray | None = None
+    image: np.ndarray | None = None
+
+    def public_dict(self) -> dict[str, Any]:
+        # Images are delivered separately; never copy full arrays into status JSON.
+        return {
+            "state": self.state,
+            "phase": self.phase,
+            "attempts": self.attempts,
+            "elapsed": round(self.elapsed, 3),
+            "total": self.total,
+            "config": self.config.to_dict() if self.config else None,
+            "frame_index": self.frame_index,
+            "clock": self.clock,
+            "text": self.text,
+            "seconds": round(self.seconds, 3) if self.seconds is not None else None,
+            "samples": self.samples,
+            "residual": self.residual,
+            "reason": self.reason,
+            "priority": self.priority,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _Reading:
+    clock: int | None
+    text: str
+    seconds: float
+    crop: np.ndarray
+    image: np.ndarray | None
+
+
+class _ProbeSession:
+    def __init__(
+        self,
+        backend: OcrBackend,
+        total: int,
+        budget: float,
+        stop_event: threading.Event | None,
+        on_progress: Callable[[OcrProgress], None] | None,
+    ) -> None:
+        self.backend = backend
+        self.total = total
+        self.started = time.monotonic()
+        self.deadline = self.started + budget
+        self.budget = budget
+        self.stop_event = stop_event
+        self.on_progress = on_progress
+        self.attempts = 0
+        self.phase = "search"
+        self.durations: list[float] = []
+
+    def check(self) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise OcrCancelled("测量已取消")
+        _check_deadline(self.deadline)
+
+    def emit(self, state: str, **details: Any) -> None:
+        if self.on_progress is not None:
+            self.on_progress(
+                OcrProgress(
+                    state=state,
+                    phase=self.phase,
+                    attempts=self.attempts,
+                    elapsed=time.monotonic() - self.started,
+                    total=self.total,
+                    **details,
+                )
+            )
+
+    def read(
+        self, frame: np.ndarray, config: ProbeConfig, index: int = 0, *, discovery: bool = False
+    ) -> int | None:
+        self.check()
+        deadline = self.deadline
+        if discovery:
+            # Leave time to read the remaining frames if this candidate is valid.
+            typical = statistics.median(self.durations[-8:]) if self.durations else 0.1
+            reserve = min(self.budget / 4, max(0.05, typical) * (self.total - 1))
+            deadline -= reserve
+        _check_deadline(deadline)
+        self.attempts += 1
+        try:
+            reading = _read_clock(frame, config, self.backend, deadline=deadline)
+        except OcrError as exc:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise OcrCancelled("测量已取消") from exc
+            raise
+        self.check()  # A synchronous backend must not return a late success.
+        self.durations.append(reading.seconds)
+        self.emit(
+            "reading",
+            config=config,
+            frame_index=index,
+            clock=reading.clock,
+            text=reading.text,
+            seconds=reading.seconds,
+            crop=reading.crop,
+            image=reading.image,
+        )
+        return reading.clock
+
+
 class TesseractBackend:
     def __init__(self, command: str | None = None) -> None:
         try:
@@ -116,16 +235,20 @@ class TesseractBackend:
             raise OcrError("未找到 Tesseract 程序；请安装或指定 --tesseract-command") from exc
         self._module = pytesseract
 
-    def read(self, image: np.ndarray, *, raw_line: bool = False) -> str:
+    def read(self, image: np.ndarray, *, raw_line: bool = False, timeout: float = 2.0) -> str:
+        if timeout <= 0:
+            raise OcrTimeout("Tesseract 识别预算已用尽")
         try:
             return str(
                 self._module.image_to_string(
                     image,
                     config=f"--psm {13 if raw_line else 7} -c tessedit_char_whitelist=0123456789:",
-                    timeout=2,
+                    timeout=min(2.0, timeout),
                 )
             )
         except RuntimeError as exc:
+            if "timeout" in str(exc).lower():
+                raise OcrTimeout("Tesseract 识别超时，请重试或缩小识别区域") from exc
             raise OcrError(f"Tesseract 识别超时或失败: {exc}") from exc
 
 
@@ -182,7 +305,18 @@ def preprocess(crop: np.ndarray, inverted: bool, style: str = "standard") -> np.
     scaled = cv2.resize(crop, None, fx=8 if condensed else 4, fy=4, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY) if scaled.ndim == 3 else scaled
     mode = cv2.THRESH_BINARY_INV if inverted else cv2.THRESH_BINARY
-    if condensed:
+    if style == "adaptive":
+        # Remove gradual illumination changes before thresholding. Unlike a
+        # fixed cutoff this preserves faint strokes on either light or dark
+        # panels. Keep this fallback separate from the proven fast styles.
+        background = cv2.GaussianBlur(gray, (0, 0), max(1, gray.shape[0] * 0.3))
+        normalized = np.clip(gray.astype(np.float32) - background + 128, 0, 255).astype(np.uint8)
+        _, binary = cv2.threshold(normalized, 0, 255, mode | cv2.THRESH_OTSU)
+        border = np.concatenate((binary[0], binary[-1], binary[:, 0], binary[:, -1]))
+        binary = cv2.copyMakeBorder(
+            binary, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255 if np.mean(border) > 127 else 0
+        )
+    elif condensed:
         # Small, bright broadcast digits need separation from antialiasing and
         # background graphics; Otsu can merge their narrow strokes and colon.
         _, binary = cv2.threshold(gray, 175, 255, mode)
@@ -194,15 +328,37 @@ def preprocess(crop: np.ndarray, inverted: bool, style: str = "standard") -> np.
     return binary
 
 
-def read_with_config(frame: np.ndarray, config: ProbeConfig, backend: OcrBackend) -> int | None:
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OcrTimeout("自动识别超时，请重试或缩小识别区域")
+
+
+def _read_clock(
+    frame: np.ndarray,
+    config: ProbeConfig,
+    backend: OcrBackend,
+    *,
+    deadline: float | None = None,
+) -> _Reading:
+    _check_deadline(deadline)
+    started = time.monotonic()
     transformed = flip_frame(frame, config.flip)
     crop = _crop_normalized(transformed, config.roi)
     if crop.size == 0:
-        return None
+        return _Reading(None, "", time.monotonic() - started, crop, None)
     image = preprocess(crop, config.inverted, config.style)
-    if config.style == "condensed" and isinstance(backend, TesseractBackend):
-        return parse_clock(backend.read(image, raw_line=True))
-    return parse_clock(backend.read(image))
+    _check_deadline(deadline)
+    if isinstance(backend, TesseractBackend):
+        timeout = min(2.0, deadline - time.monotonic()) if deadline is not None else 2.0
+        text = backend.read(image, raw_line=config.style == "condensed", timeout=timeout)
+    else:
+        text = backend.read(image)
+    _check_deadline(deadline)
+    return _Reading(parse_clock(text), text, time.monotonic() - started, crop, image)
+
+
+def read_with_config(frame: np.ndarray, config: ProbeConfig, backend: OcrBackend) -> int | None:
+    return _read_clock(frame, config, backend).clock
 
 
 def probe_clock(
@@ -213,52 +369,100 @@ def probe_clock(
     allow_manual: bool = False,
     budget: float = 15.0,
     stop_event: threading.Event | None = None,
+    on_progress: Callable[[OcrProgress], None] | None = None,
 ) -> ClockProbeResult:
     if len(frames) < 3:
         raise OcrError("至少需要 3 个关键帧才能锁定比赛时钟")
-    deadline = time.monotonic() + budget
+    if not math.isfinite(budget):
+        raise ValueError("OCR 预算必须是有限秒数")
+    session = _ProbeSession(backend, len(frames), budget, stop_event, on_progress)
+    try:
+        session.check()
+        result = _probe_clock(frames, backend, saved, allow_manual, session)
+        session.check()
+        session.emit(
+            "locked", config=result.config, samples=len(result.samples), residual=result.residual
+        )
+        return result
+    except OcrError as exc:
+        state = (
+            "cancelled"
+            if isinstance(exc, OcrCancelled)
+            else "timeout"
+            if isinstance(exc, OcrTimeout)
+            else "stopped"
+            if isinstance(exc, StoppedClock)
+            else "not_found"
+            if isinstance(exc, ManualSelectionRequired)
+            else "error"
+        )
+        session.emit(state, reason=str(exc))
+        raise
 
-    def check_budget() -> None:
-        if stop_event is not None and stop_event.is_set():
-            raise OcrCancelled("测量已取消")
-        if time.monotonic() >= deadline:
-            raise OcrTimeout("自动识别超时，请重试或缩小识别区域")
+
+def _probe_clock(
+    frames: list[tuple[float, np.ndarray]],
+    backend: OcrBackend,
+    saved: ProbeConfig | None,
+    allow_manual: bool,
+    session: _ProbeSession,
+) -> ClockProbeResult:
+    tried: set[ProbeConfig] = set()
 
     if saved:
         # Retry the selected region before considering any other location.
         # Backend failures, cancellation and timeouts are not evidence of a bad ROI.
+        session.phase = "saved"
         for style in (saved.style, *(item for item in STYLES if item != saved.style)):
             config = replace(saved, style=style)
-            samples = _read_series(frames, config, backend, check_budget=check_budget)
+            tried.add(config)
+            samples = _read_series(frames, config, backend, session=session)
             result = _validate_series(samples, config)
             if result:
                 return result
+            session.emit("rejected", config=config, reason="无法形成连续三帧走表")
 
     stopped = 0
     first_readings: dict[ProbeConfig, int] = {}
-    for config in _discover_candidates(
-        frames[0][1], backend, check_budget=check_budget, first_readings=first_readings
-    ):
-        samples = _read_series(
-            frames,
-            config,
+    for near in [saved, None] if saved else [None]:
+        session.phase = "nearby" if near else "search"
+        session.emit("searching")
+        for config in _discover_candidates(
+            frames[0][1],
             backend,
-            check_budget=check_budget,
-            first_clock=first_readings.get(config),
-        )
-        try:
-            result = _validate_series(samples, config)
-        except StoppedClock:
-            stopped += 1
-            continue
-        if result:
-            return result
+            check_budget=session.check,
+            first_readings=first_readings,
+            near=near,
+            tried=tried,
+            session=session,
+        ):
+            samples = _read_series(
+                frames,
+                config,
+                backend,
+                first_clock=first_readings.get(config),
+                session=session,
+            )
+            try:
+                result = _validate_series(samples, config)
+            except StoppedClock:
+                stopped += 1
+                session.emit("rejected", config=config, reason="连续三帧停表")
+                continue
+            if result:
+                return result
+            session.emit("rejected", config=config, reason="无法形成连续三帧走表")
     if stopped:
         raise StoppedClock("候选比赛时钟连续 3 帧不动，本轮视为停表")
     if not allow_manual:
         raise ManualSelectionRequired("自动 OCR 未锁定，请在网页框选比赛时钟")
+    session.check()
     manual = _manual_config(frames[0][1], backend)
-    result = _validate_series(_read_series(frames, manual, backend), manual)
+    # Explicit interactive selection can take longer than the automatic search
+    # budget. Give its validation a new budget after the user finishes choosing.
+    session.deadline = time.monotonic() + session.budget
+    session.phase = "manual"
+    result = _validate_series(_read_series(frames, manual, backend, session=session), manual)
     if not result:
         raise OcrError("手动框选区域仍无法连续识别比赛时钟")
     return result
@@ -270,21 +474,34 @@ def _discover_candidates(
     *,
     check_budget: Any = lambda: None,
     first_readings: dict[ProbeConfig, int] | None = None,
+    near: ProbeConfig | None = None,
+    tried: set[ProbeConfig] | None = None,
+    session: _ProbeSession | None = None,
 ) -> Iterator[ProbeConfig]:
     candidates = []
-    variants = (("standard", False), ("condensed", False), ("standard", True), ("condensed", True))
-    for flip_index, flip in enumerate(FLIPS):
+    variants = (
+        ("standard", False),
+        ("condensed", False),
+        ("standard", True),
+        ("condensed", True),
+        ("adaptive", False),
+        ("adaptive", True),
+    )
+    for flip_index, flip in enumerate((near.flip,) if near else FLIPS):
         check_budget()
         transformed = flip_frame(frame, flip)
-        localized = [
-            roi for roi in _text_rois(transformed) if _has_edges(_crop_normalized(transformed, roi))
-        ]
+        rois = (
+            _text_rois(transformed, bounds=_nearby_bounds(near.roi))
+            if near
+            else _text_rois(transformed)
+        )
+        localized = [roi for roi in rois if _has_edges(_crop_normalized(transformed, roi))]
         for rank, roi in enumerate(localized):
             for variant, (style, inverted) in enumerate(variants):
                 priority = rank + 4 * variant + 4 * flip_index
                 config = ProbeConfig(roi, flip, inverted, style)
                 candidates.append((priority, variant, flip_index, len(candidates), config))
-        for rank, roi in enumerate(_candidate_rois()):
+        for rank, roi in enumerate([] if near else _candidate_rois()):
             if roi not in localized and _has_edges(_crop_normalized(transformed, roi)):
                 for variant, inverted in enumerate((False, True)):
                     priority = 24 + rank + 4 * variant + 4 * flip_index
@@ -294,16 +511,37 @@ def _discover_candidates(
     # Interleave increasingly expensive alternatives with lower ranked regions.
     # A candidate just outside the leading group must not wait for every flip
     # and preprocessing combination of all the preceding background patches.
-    for _, _, _, _, config in sorted(candidates):
+    attempts = 0
+    for priority, _, _, _, config in sorted(candidates):
         check_budget()
-        clock = read_with_config(frame, config, backend)
+        if near and attempts >= 8:
+            break
+        if tried is not None:
+            if config in tried:
+                continue
+            tried.add(config)
+        attempts += 1
+        if session is not None:
+            session.emit("candidate", config=config, priority=priority)
+            clock = session.read(frame, config, discovery=True)
+        else:
+            clock = read_with_config(frame, config, backend)
         if clock is not None:
             if first_readings is not None:
                 first_readings[config] = clock
             yield config
 
 
-def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
+def _nearby_bounds(roi: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x, y, width, height = roi
+    left, top = max(0, x - width * 2), max(0, y - height * 3)
+    right, bottom = min(1, x + width * 3), min(1, y + height * 4)
+    return left, top, right - left, bottom - top
+
+
+def _text_rois(
+    frame: np.ndarray, *, bounds: tuple[float, float, float, float] | None = None
+) -> list[tuple[float, float, float, float]]:
     """Locate short text lines, keeping scoreboard neighbours outside the crop."""
     height, width = frame.shape[:2]
     if width > 1280:
@@ -318,10 +556,17 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
     boxes = set()
     for threshold, mode in ((175, cv2.THRESH_BINARY), (80, cv2.THRESH_BINARY_INV)):
         _, mask = cv2.threshold(gray, threshold, 255, mode)
-        mask[round(height * 0.25) : round(height * 0.38), :] = 0
-        mask[round(height * 0.62) : round(height * 0.75), :] = 0
-        mask[round(height * 0.38) : round(height * 0.62), : round(width * 0.24)] = 0
-        mask[round(height * 0.38) : round(height * 0.62), round(width * 0.76) :] = 0
+        if bounds is None:
+            mask[round(height * 0.25) : round(height * 0.38), :] = 0
+            mask[round(height * 0.62) : round(height * 0.75), :] = 0
+            mask[round(height * 0.38) : round(height * 0.62), : round(width * 0.24)] = 0
+            mask[round(height * 0.38) : round(height * 0.62), round(width * 0.76) :] = 0
+        else:
+            x, y, w, h = bounds
+            mask[: round(y * height)] = 0
+            mask[round((y + h) * height) :] = 0
+            mask[:, : round(x * width)] = 0
+            mask[:, round((x + w) * width) :] = 0
         for kernel in kernels:
             joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
             # Dark digits inside a bright scoreboard are nested contours.
@@ -435,17 +680,58 @@ def _read_series(
     *,
     check_budget: Any = lambda: None,
     first_clock: int | None = None,
+    session: _ProbeSession | None = None,
 ) -> list[ClockSample | None]:
-    result = []
-    for index, (pts, frame) in enumerate(frames):
+    result: list[ClockSample | None] = [None] * len(frames)
+    known: set[int] = set()
+    if first_clock is not None:
+        result[0] = ClockSample(pts=frames[0][0], clock=first_clock)
+        known.add(0)
+    if session is not None:
+        session.emit("validating", config=config)
+    # Every third frame separates the unknown frames into runs of at most two.
+    # A missing first frame alone must not discard a good later run. Successful
+    # candidates still read every frame and return the original complete series.
+    order = dict.fromkeys([*range(2, len(frames), 3), *range(len(frames))])
+    for index in order:
+        if index in known:
+            continue
         check_budget()
-        clock = (
-            first_clock
-            if index == 0 and first_clock is not None
-            else read_with_config(frame, config, backend)
-        )
-        result.append(ClockSample(pts=pts, clock=clock) if clock is not None else None)
+        pts, frame = frames[index]
+        if session is not None:
+            clock = session.read(frame, config, index)
+        else:
+            clock = read_with_config(frame, config, backend)
+        result[index] = ClockSample(pts=pts, clock=clock) if clock is not None else None
+        known.add(index)
+        if not _series_possible(result, known):
+            break
     return result
+
+
+def _series_possible(samples: list[ClockSample | None], known: set[int]) -> bool:
+    """An upper bound: unknown samples may work; known gaps cannot be bridged."""
+    possible = static_possible = 0
+    for index, current in enumerate(samples):
+        if index in known and (current is None or not math.isfinite(current.pts)):
+            possible = static_possible = 0
+            continue
+        previous = samples[index - 1] if index else None
+        if current is not None and previous is not None:
+            if (
+                current.pts <= previous.pts
+                or abs((current.clock - previous.clock) - (current.pts - previous.pts)) > 1.0
+            ):
+                possible = 0
+            if current.pts <= previous.pts or current.clock != previous.clock:
+                static_possible = 0
+        possible += 1
+        static_possible += 1
+        # A third static frame still matters even when walking is impossible:
+        # stopping early must not turn StoppedClock into a request for a new ROI.
+        if max(possible, static_possible) >= 3:
+            return True
+    return False
 
 
 def _validate_series(
