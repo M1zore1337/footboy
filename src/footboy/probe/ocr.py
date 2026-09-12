@@ -235,8 +235,17 @@ def probe_clock(
                 return result
 
     stopped = 0
-    for config in _discover_candidates(frames[0][1], backend, check_budget=check_budget):
-        samples = _read_series(frames, config, backend, check_budget=check_budget)
+    first_readings: dict[ProbeConfig, int] = {}
+    for config in _discover_candidates(
+        frames[0][1], backend, check_budget=check_budget, first_readings=first_readings
+    ):
+        samples = _read_series(
+            frames,
+            config,
+            backend,
+            check_budget=check_budget,
+            first_clock=first_readings.get(config),
+        )
         try:
             result = _validate_series(samples, config)
         except StoppedClock:
@@ -256,22 +265,42 @@ def probe_clock(
 
 
 def _discover_candidates(
-    frame: np.ndarray, backend: OcrBackend, *, check_budget: Any = lambda: None
+    frame: np.ndarray,
+    backend: OcrBackend,
+    *,
+    check_budget: Any = lambda: None,
+    first_readings: dict[ProbeConfig, int] | None = None,
 ) -> Iterator[ProbeConfig]:
-    for flip in FLIPS:
+    candidates = []
+    variants = (("standard", False), ("condensed", False), ("standard", True), ("condensed", True))
+    for flip_index, flip in enumerate(FLIPS):
         check_budget()
         transformed = flip_frame(frame, flip)
-        localized = _text_rois(transformed)
-        for roi in dict.fromkeys([*localized, *_candidate_rois()]):
-            crop = _crop_normalized(transformed, roi)
-            if not _has_edges(crop):
-                continue
-            for style in STYLES if roi in localized else ("standard",):
-                for inverted in (False, True):
-                    check_budget()
-                    config = ProbeConfig(roi=roi, flip=flip, inverted=inverted, style=style)
-                    if read_with_config(frame, config, backend) is not None:
-                        yield config
+        localized = [
+            roi for roi in _text_rois(transformed) if _has_edges(_crop_normalized(transformed, roi))
+        ]
+        for rank, roi in enumerate(localized):
+            for variant, (style, inverted) in enumerate(variants):
+                priority = rank + 4 * variant + 4 * flip_index
+                config = ProbeConfig(roi, flip, inverted, style)
+                candidates.append((priority, variant, flip_index, len(candidates), config))
+        for rank, roi in enumerate(_candidate_rois()):
+            if roi not in localized and _has_edges(_crop_normalized(transformed, roi)):
+                for variant, inverted in enumerate((False, True)):
+                    priority = 24 + rank + 4 * variant + 4 * flip_index
+                    config = ProbeConfig(roi, flip, inverted)
+                    candidates.append((priority, variant, flip_index, len(candidates), config))
+
+    # Interleave increasingly expensive alternatives with lower ranked regions.
+    # A candidate just outside the leading group must not wait for every flip
+    # and preprocessing combination of all the preceding background patches.
+    for _, _, _, _, config in sorted(candidates):
+        check_budget()
+        clock = read_with_config(frame, config, backend)
+        if clock is not None:
+            if first_readings is not None:
+                first_readings[config] = clock
+            yield config
 
 
 def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
@@ -306,8 +335,63 @@ def _text_rois(frame: np.ndarray) -> list[tuple[float, float, float, float]]:
                 left, top = max(0, x - pad_x), max(0, y - pad_y)
                 right, bottom = min(width, x + w + pad_x), min(height, y + h + pad_y)
                 boxes.add((left, top, right - left, bottom - top))
-    ordered = sorted(boxes, key=lambda box: (box[1], box[0]))
-    return [(x / width, y / height, w / width, h / height) for x, y, w, h in ordered[:64]]
+    ranked = sorted(
+        boxes,
+        key=lambda box: (
+            -_text_score(gray[box[1] : box[1] + box[3], box[0] : box[0] + box[2]]),
+            box[1],
+            box[0],
+            box[2],
+            box[3],
+        ),
+    )
+    selected: list[tuple[int, int, int, int]] = []
+    for box in ranked:
+        if not any(_same_text_box(box, previous) for previous in selected):
+            selected.append(box)
+            if len(selected) == 64:
+                break
+    return [(x / width, y / height, w / width, h / height) for x, y, w, h in selected]
+
+
+def _text_score(gray: np.ndarray) -> float:
+    """Prefer aligned glyphs on a clean panel over textured broadcast backgrounds."""
+    height = gray.shape[0]
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    border = np.concatenate((binary[0], binary[-1], binary[:, 0], binary[:, -1]))
+    white_border = float(np.mean(border)) / 255
+    foreground = cv2.bitwise_not(binary) if white_border > 0.5 else binary
+    _, _, components, _ = cv2.connectedComponentsWithStats(foreground)
+    glyphs = [
+        (y, h)
+        for _, y, w, h, area in components[1:]
+        if h >= height * 0.45 and w <= height * 1.2 and area >= 3
+    ]
+    # These are ranking hints, not filters: narrow fonts can have joined digits,
+    # faint colons, or three-digit minutes and must still reach the OCR backend.
+    count_score = max(0, 1 - abs(len(glyphs) - 4) / 4)
+    alignment = (
+        max(0, 1 - float(np.std([y + h for y, h in glyphs])) / max(1, height * 0.25))
+        if glyphs
+        else 0
+    )
+    clean_border = abs(white_border - 0.5) * 2
+    density = cv2.countNonZero(foreground) / foreground.size
+    density_score = max(0, 1 - abs(density - 0.25) * 2)
+    return 3 * count_score + 2 * alignment + 2 * clean_border + density_score
+
+
+def _same_text_box(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> bool:
+    x, y, width, height = first
+    other_x, other_y, other_width, other_height = second
+    if abs(width - other_width) > max(2, min(width, other_width) * 0.1):
+        return False
+    if abs(height - other_height) > max(2, min(height, other_height) * 0.1):
+        return False
+    overlap = max(0, min(x + width, other_x + other_width) - max(x, other_x)) * max(
+        0, min(y + height, other_y + other_height) - max(y, other_y)
+    )
+    return overlap / (width * height + other_width * other_height - overlap) >= 0.85
 
 
 def _candidate_rois() -> list[tuple[float, float, float, float]]:
@@ -350,11 +434,16 @@ def _read_series(
     backend: OcrBackend,
     *,
     check_budget: Any = lambda: None,
+    first_clock: int | None = None,
 ) -> list[ClockSample | None]:
     result = []
-    for pts, frame in frames:
+    for index, (pts, frame) in enumerate(frames):
         check_budget()
-        clock = read_with_config(frame, config, backend)
+        clock = (
+            first_clock
+            if index == 0 and first_clock is not None
+            else read_with_config(frame, config, backend)
+        )
         result.append(ClockSample(pts=pts, clock=clock) if clock is not None else None)
     return result
 

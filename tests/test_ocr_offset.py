@@ -16,6 +16,7 @@ from footboy.probe.ocr import (
     OcrTimeout,
     ProbeConfig,
     StoppedClock,
+    _discover_candidates,
     _validate_series,
     parse_clock,
     probe_clock,
@@ -163,6 +164,47 @@ def test_missing_clock_requests_roi_without_opening_a_manual_prompt(monkeypatch)
     )
     with pytest.raises(ManualSelectionRequired):
         probe_clock(probe_frames(), object())
+
+
+@pytest.mark.parametrize("first_clock", [0, 3714])
+def test_discovery_reading_is_reused_without_skipping_a_validation_frame(monkeypatch, first_clock):
+    monkeypatch.setattr("footboy.probe.ocr._text_rois", lambda _: [CONFIG.roi])
+    monkeypatch.setattr("footboy.probe.ocr._candidate_rois", lambda: [])
+    monkeypatch.setattr("footboy.probe.ocr._has_edges", lambda _: True)
+    readings = iter(range(first_clock, first_clock + 3))
+    calls = []
+
+    def read(image):
+        clock = next(readings)
+        calls.append(clock)
+        return f"{clock // 60:02}:{clock % 60:02}"
+
+    result = probe_clock(probe_frames(), SimpleNamespace(read=read))
+
+    assert calls == list(range(first_clock, first_clock + 3))
+    assert result.k == first_clock
+    assert [(sample.pts, sample.clock) for sample in result.samples] == [
+        (float(index), first_clock + index) for index in range(3)
+    ]
+
+
+def test_discovery_reaches_later_text_line_before_exhausting_variants(monkeypatch):
+    rois = [(index / 20, 0.0, 0.04, 0.2) for index in range(10)]
+    monkeypatch.setattr("footboy.probe.ocr._text_rois", lambda _: rois)
+    monkeypatch.setattr("footboy.probe.ocr._candidate_rois", lambda: [])
+    monkeypatch.setattr("footboy.probe.ocr._has_edges", lambda _: True)
+    expected = ProbeConfig(rois[-1], "none", False)
+    attempts = []
+
+    def read(frame, config, backend):
+        attempts.append(config)
+        return 3714 if config == expected else None
+
+    monkeypatch.setattr("footboy.probe.ocr.read_with_config", read)
+    result = next(_discover_candidates(np.zeros((100, 400, 3), dtype=np.uint8), object()))
+
+    assert result == expected
+    assert len(attempts) <= 30
 
 
 def test_stopped_clock_does_not_hide_another_sources_backend_error(monkeypatch):

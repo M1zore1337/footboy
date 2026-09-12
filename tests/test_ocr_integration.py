@@ -216,6 +216,75 @@ def test_tesseract_retries_condensed_style_inside_saved_roi(flip):
     assert ProbeConfig.from_dict(result.config.to_dict()) == result.config
 
 
+class CountingTesseractBackend(TesseractBackend):
+    def __init__(self):
+        super().__init__(TESSERACT)
+        self.calls = 0
+
+    def read(self, image, *, raw_line=False):
+        self.calls += 1
+        return super().read(image, raw_line=raw_line)
+
+
+def textured_clock_frames(*, flip="none"):
+    """Moving texture produces many plausible text boxes before the small clock."""
+    random = np.random.default_rng(19)
+    frames = []
+    for index in range(4):
+        image = cv2.resize(
+            random.integers(0, 256, (180, 320, 3), dtype=np.uint8),
+            (1280, 720),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        cv2.rectangle(image, (60, 40), (310, 74), (30, 8, 20), -1)
+        cv2.putText(
+            image,
+            "HOME  2 - 2  AWAY",
+            (66, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (245, 245, 245),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.rectangle(image, (145, 76), (235, 99), (30, 8, 20), -1)
+        clock = 3714 + index * 2
+        cv2.putText(
+            image,
+            f"{clock // 60:02}:{clock % 60:02}",
+            (163, 93),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.5,
+            (245, 245, 245),
+            1,
+            cv2.LINE_AA,
+        )
+        frames.append((1000.125 + index * 2, flip_frame(image, flip)))
+    return frames
+
+
+@pytest.mark.parametrize("flip", ["none", "h", "v", "hv"])
+def test_tesseract_finds_small_clock_among_textured_candidates(flip):
+    backend = CountingTesseractBackend()
+    result = probe_clock(textured_clock_frames(flip=flip), backend)
+
+    assert [sample.clock for sample in result.samples] == [3714, 3716, 3718, 3720]
+    assert result.k == pytest.approx(2713.875)
+    assert result.residual == 0
+    assert result.config.flip == flip
+    assert backend.calls <= (30 if flip == "none" else 80)
+
+
+def test_tesseract_recovers_from_saved_team_name_region():
+    saved = ProbeConfig((62 / 1280, 43 / 720, 69 / 1280, 24 / 720), "none", False)
+    backend = CountingTesseractBackend()
+    result = probe_clock(textured_clock_frames(), backend, saved=saved)
+
+    assert [sample.clock for sample in result.samples] == [3714, 3716, 3718, 3720]
+    assert result.config.roi != saved.roi
+    assert backend.calls <= 40
+
+
 @pytest.mark.parametrize(
     ("bili_origin", "bili_clock", "expected"),
     [(1000.5, 2712, 11.625), (1000.5, 2688, -12.375), (9000.5, 2688, -8012.375)],
