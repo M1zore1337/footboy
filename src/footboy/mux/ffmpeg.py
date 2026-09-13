@@ -7,7 +7,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TextIO
 
@@ -217,6 +217,84 @@ def _format_offset(value: float) -> str:
     return "0" if rendered in {"", "-0"} else rendered
 
 
+class _BufferedVideoInput:
+    """Read live HLS independently of the slower commentary's mux schedule."""
+
+    def __init__(self, source: Source, ffmpeg: str | Path, health: MuxHealth) -> None:
+        # A demuxer's thread_queue_size does not bypass FFmpeg's scheduling of
+        # multiple inputs. Waiting for delayed audio can let a short upstream
+        # playlist expire. A separate FIFO muxer keeps fetching those segments.
+        # Its packet queue is bounded and never deliberately drops packets.
+        command = [
+            resolve_binary(ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-nostats",
+            "-copyts",
+            *_input_options(source, video_input=True),
+            "-i",
+            source.url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-f",
+            "fifo",
+            "-fifo_format",
+            "mpegts",
+            "-queue_size",
+            "4096",
+            "-drop_pkts_on_overflow",
+            "0",
+            "-format_opts",
+            "mpegts_copyts=1",
+            "pipe:1",
+        ]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+        )
+        self._reader = threading.Thread(
+            target=_consume_stderr,
+            args=(self.process.stderr, health),
+            name="ffmpeg-input-stderr",
+            daemon=True,
+        )
+        self._reader.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        _stop_process(self.process, timeout)
+        self._reader.join(timeout=2)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if pipe:
+                pipe.close()
+
+
+def _stop_process(process: subprocess.Popen[str], timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if process.stdin is not None:
+            process.stdin.write("q\n")
+            process.stdin.flush()
+        else:
+            # stdin carries buffered media, so it cannot also accept commands.
+            process.terminate()
+        process.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait(timeout=2)
+
+
 class FfmpegMuxer:
     def __init__(
         self,
@@ -230,6 +308,7 @@ class FfmpegMuxer:
         self.health = MuxHealth()
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
+        self._buffered_input: _BufferedVideoInput | None = None
         self._lock = threading.RLock()
         self.generation = 0
         self.audio = AudioMix()
@@ -250,22 +329,36 @@ class FfmpegMuxer:
                 if self.audio.original_enabled
                 else None
             )
-            command = build_ffmpeg_command(
-                video,
-                bili,
-                offset,
-                self.output_dir,
-                ffmpeg=self.ffmpeg,
-                generation=self.generation,
-                audio=self.audio,
-                audio_origin=self.audio_origin,
-            )
+            health = MuxHealth(generation=self.generation)
+            buffered = None
             flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self._check_cancelled()
             try:
+                mux_video = video
+                if video.kind == "hls" and video.url.startswith(("http://", "https://")):
+                    buffered = _BufferedVideoInput(video, self.ffmpeg, health)
+                    mux_video = replace(
+                        video,
+                        url="pipe:0",
+                        kind="mpegts",
+                        headers={},
+                        cookies=[],
+                        no_proxy=False,
+                    )
+                command = build_ffmpeg_command(
+                    mux_video,
+                    bili,
+                    offset,
+                    self.output_dir,
+                    ffmpeg=self.ffmpeg,
+                    generation=self.generation,
+                    audio=self.audio,
+                    audio_origin=self.audio_origin,
+                )
+                self._check_cancelled()
                 self._process = subprocess.Popen(
                     command,
-                    stdin=subprocess.PIPE,
+                    stdin=buffered.process.stdout if buffered else subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -275,13 +368,22 @@ class FfmpegMuxer:
                     creationflags=flags,
                 )
             except OSError as exc:
+                if buffered:
+                    buffered.stop()
                 raise MuxError(tr("Cannot start FFmpeg: {0}", exc)) from exc
-            self.health = MuxHealth(
-                running=True,
-                pid=self._process.pid,
-                started_at=time.time(),
-                generation=self.generation,
-            )
+            except BaseException:
+                if buffered:
+                    buffered.stop()
+                raise
+            if buffered and buffered.process.stdout:
+                # Only the child muxer consumes this binary pipe. Closing our
+                # duplicate also lets the producer see a stopped consumer.
+                buffered.process.stdout.close()
+            self._buffered_input = buffered
+            health.running = True
+            health.pid = self._process.pid
+            health.started_at = time.time()
+            self.health = health
             process = self._process
             health = self.health
             self._reader = threading.Thread(
@@ -301,16 +403,11 @@ class FfmpegMuxer:
             process = self._process
             if not process:
                 return
-            if process.poll() is None:
-                try:
-                    assert process.stdin is not None
-                    process.stdin.write("q\n")
-                    process.stdin.flush()
-                    process.wait(timeout=timeout)
-                except (OSError, subprocess.TimeoutExpired):
-                    process.kill()
-                    process.wait(timeout=2)
+            _stop_process(process, timeout)
             self._refresh_exit()
+        if self._buffered_input:
+            self._buffered_input.stop(timeout)
+            self._buffered_input = None
         if self._reader and self._reader is not threading.current_thread():
             self._reader.join(timeout=2)
         for pipe in (process.stdin, process.stderr):

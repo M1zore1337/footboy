@@ -41,6 +41,8 @@ def make_clip(
     duration: float = 8,
     frequency: int = 700,
     sample_rate: int = 48000,
+    frame_rate: int = 25,
+    keyframe_interval: int = 50,
 ) -> None:
     command = [
         str(FFMPEG),
@@ -51,7 +53,7 @@ def make_clip(
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=320x180:rate=25",
+        f"testsrc2=size=320x180:rate={frame_rate}",
         "-f",
         "lavfi",
         "-i",
@@ -67,7 +69,7 @@ def make_clip(
         "-bf",
         "0",
         "-g",
-        "50",
+        str(keyframe_interval),
         "-c:a",
         "aac",
         "-b:a",
@@ -104,12 +106,14 @@ def media_server(tmp_path):
             if cookie is None or cookie.value != "fixture":
                 self.send_error(403)
                 return
-            if self.path.endswith("?paced=1"):
+            if self.path.endswith(("?paced=1", "?paced=1&finite=1")):
                 # Emit FLV tags at 4x wall speed, preserving original PTS.
+                data = (tmp_path / self.path.split("?")[0].lstrip("/")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "video/x-flv")
+                if self.path.endswith("&finite=1"):
+                    self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
-                data = (tmp_path / self.path.split("?")[0].lstrip("/")).read_bytes()
                 try:
                     self.wfile.write(data[:13])
                     cursor, first, start = 13, None, time.monotonic()
@@ -606,6 +610,134 @@ def test_hls_direct_access_preserves_pts_and_bili_proxy(
         assert all(row.get("Cookie") == "sid=fixture" for row in requests)
     finally:
         mux.stop()
+
+
+def test_short_hls_window_survives_waiting_for_delayed_commentary(tmp_path, media_server):
+    base, _ = media_server
+    video_file = tmp_path / "video.flv"
+    make_clip(video_file, 1000, frame_rate=50, keyframe_interval=25)
+    make_clip(tmp_path / "bili.flv", 988, duration=24)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    reference = upstream / "all.m3u8"
+    subprocess.run(
+        [
+            str(FFMPEG),
+            "-v",
+            "error",
+            "-copyts",
+            "-i",
+            str(video_file),
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "0.5",
+            "-hls_list_size",
+            "0",
+            "-hls_segment_filename",
+            str(upstream / "seg_%03d.ts"),
+            str(reference),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    segments = sorted(upstream.glob("seg_*.ts"))
+    started = []
+    requests = []
+
+    class RollingHls(SimpleHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            if not started:
+                started.append(time.monotonic())
+            available = min(len(segments), 3 + int((time.monotonic() - started[0]) / 0.5))
+            first = max(0, available - 3)
+            if self.path == "/live.m3u8":
+                # A 1.5-second live window expires while the muxer initially
+                # waits for the older commentary, even though its URL is valid.
+                lines = [
+                    "#EXTM3U",
+                    "#EXT-X-VERSION:3",
+                    "#EXT-X-TARGETDURATION:1",
+                    f"#EXT-X-MEDIA-SEQUENCE:{first}",
+                ]
+                for segment in segments[first:available]:
+                    lines.extend(("#EXTINF:0.5,", segment.name))
+                if available == len(segments):
+                    lines.append("#EXT-X-ENDLIST")
+                data = ("\n".join(lines) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path.startswith("/seg_"):
+                index = int(Path(self.path).stem.split("_")[1])
+                requests.append(index)
+                if index < first:
+                    self.send_error(404)
+                    return
+            super().do_GET()
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(RollingHls, directory=str(upstream))
+    )
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    video = source(f"http://127.0.0.1:{server.server_port}/live.m3u8")
+    video.kind = "hls"
+    bili = source(base + "/bili.flv?paced=1&finite=1")
+    mux = FfmpegMuxer(tmp_path / "output", ffmpeg=str(FFMPEG))
+    recorded = tmp_path / "recorded"
+    recorded.mkdir()
+
+    def capture_finished_segments():
+        # The normal output playlist retires early segments. Retain a copy of
+        # each completed segment so the assertion covers the entire input.
+        for segment in mux.output_dir.glob("*.ts"):
+            destination = recorded / segment.name
+            if not destination.exists():
+                shutil.copy2(segment, destination)
+        return mux.poll() is not None
+
+    buffered = None
+    try:
+        mux.start(video, bili, 0)
+        buffered = mux._buffered_input
+        wait_for(capture_finished_segments, timeout=25)
+        capture_finished_segments()
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        output_segments = sorted(recorded.glob("*.ts"))
+        pts = []
+        for output in output_segments:
+            with av.open(str(output)) as container:
+                pts.extend(
+                    float(packet.pts * packet.time_base)
+                    for packet in container.demux(video=0)
+                    if packet.pts is not None
+                )
+        pts.sort()
+        assert len(pts) == 400
+        assert max(np.diff(pts)) == pytest.approx(0.02, abs=0.00002)
+        result = first_pts(output_segments[0])
+        expected = first_pts(reference)["video"] - first_pts(tmp_path / "bili.flv")["audio"]
+        assert result["video"] - result["audio"] == pytest.approx(expected, abs=0.025)
+        assert np.array_equal(first_picture(reference), first_picture(output_segments[0]))
+        assert set(requests) == set(range(len(segments)))
+    finally:
+        mux.stop()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+    if buffered is not None:
+        assert buffered.process.poll() is not None
+        assert not buffered._reader.is_alive()
 
 
 @pytest.mark.skipif(

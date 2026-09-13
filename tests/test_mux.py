@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -126,4 +127,33 @@ def test_cancelled_audio_sampling_never_launches_ffmpeg(
     with pytest.raises(MuxError, match="已取消"):
         muxer.start(video, bili, 0)
     assert len(sampled) == (0 if cancel_before_sampling else 1)
+    assert not muxer.health.running
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_buffered_input_is_closed_if_mux_startup_fails(tmp_path, monkeypatch, cancel):
+    cancellation = threading.Event()
+    video, bili = _sources()
+    stopped = []
+
+    class BufferedInput:
+        def __init__(self, *_):
+            self.process = SimpleNamespace(stdout=object())
+            if cancel:
+                cancellation.set()
+
+        def stop(self):
+            stopped.append(True)
+
+    def fail(*args, **kwargs):
+        assert not cancel, "Cancellation must be checked before spawning the muxer"
+        raise OSError("cannot start muxer")
+
+    monkeypatch.setattr("footboy.mux.ffmpeg._BufferedVideoInput", BufferedInput)
+    monkeypatch.setattr("footboy.mux.ffmpeg.subprocess.Popen", fail)
+    muxer = FfmpegMuxer(tmp_path, stop_event=cancellation)
+    with pytest.raises(MuxError):
+        muxer.start(video, bili, 0)
+    assert stopped == [True]
+    assert muxer._buffered_input is None
     assert not muxer.health.running
