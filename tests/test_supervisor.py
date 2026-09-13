@@ -84,6 +84,56 @@ def test_manual_adjustment_wins_over_in_flight_measurement(tmp_path, monkeypatch
     assert supervisor.confidence == {"method": "manual"}
 
 
+def test_periodic_ocr_does_not_undo_five_second_manual_correction(tmp_path, monkeypatch) -> None:
+    supervisor = supervisor_at(tmp_path, initial_offset=-177.321)
+    supervisor.video = Source("video.flv")
+    supervisor.bili = Source("bili.flv")
+    applied = []
+    monkeypatch.setattr(supervisor.muxer, "restart", lambda _v, _b, value: applied.append(value))
+
+    supervisor.request_offset_delta(5000)
+    supervisor._apply_adjustment()
+    finish(supervisor, -177.321)
+    finish(supervisor, -177.4)
+
+    status = supervisor.public_status()
+    assert applied == [-172.321]
+    assert status["offset_seconds"] == status["applied_offset_seconds"] == -172.321
+    assert status["confidence"] == {"method": "manual"}
+    assert status["aligned"] and not status["adjust_pending"]
+    assert "保留手动偏移" in status["message"]
+    assert supervisor.store.offset("0@video.example") == -172.321
+
+
+@pytest.mark.parametrize("error", [StoppedClock("中场停表"), MeasurementError("无法识别", [])])
+def test_failed_periodic_ocr_preserves_manual_alignment(tmp_path, error) -> None:
+    supervisor = supervisor_at(tmp_path)
+    supervisor.request_offset_delta(5000)
+    finish(supervisor, 0, error=error)
+    finish(supervisor, 0)
+    finish(supervisor, 0)
+
+    assert supervisor.offset == 5
+    assert supervisor.aligned
+    assert supervisor.confidence == {"method": "manual"}
+
+
+def test_explicit_successful_sync_returns_manual_offset_to_automatic_mode(tmp_path) -> None:
+    supervisor = supervisor_at(tmp_path)
+    supervisor.request_offset_delta(5000)
+    finish(supervisor, 0, mode="manual", error=MeasurementError("暂时无法识别", []))
+    finish(supervisor, 0)
+    finish(supervisor, 0)
+    assert supervisor.offset == 5
+
+    finish(supervisor, 1, mode="manual")
+    assert supervisor.offset == 1
+    assert supervisor.confidence["method"] == "ocr"
+    finish(supervisor, 3)
+    finish(supervisor, 3)
+    assert supervisor.offset == 3
+
+
 def test_drift_requires_two_consistent_successful_verifications(tmp_path) -> None:
     supervisor = supervisor_at(tmp_path)
     supervisor.applied_offset = 0

@@ -413,6 +413,14 @@ def _probe_clock(
         # Retry the selected region before considering any other location.
         # Backend failures, cancellation and timeouts are not evidence of a bad ROI.
         session.phase = "saved"
+        # An obscured first frame cannot establish that the selected boundary
+        # is complete. Later frames may otherwise lock a truncated m:ss.
+        for _, frame in frames:
+            session.check()
+            complete = _complete_text_roi(flip_frame(frame, saved.flip), saved.roi)
+            if complete != saved.roi:
+                saved = replace(saved, roi=complete)
+                break
         for style in (saved.style, *(item for item in STYLES if item != saved.style)):
             config = replace(saved, style=style)
             tried.add(config)
@@ -592,11 +600,86 @@ def _text_rois(
     )
     selected: list[tuple[int, int, int, int]] = []
     for box in ranked:
+        box = _complete_text_box(gray, box)
         if not any(_same_text_box(box, previous) for previous in selected):
             selected.append(box)
             if len(selected) == 64:
                 break
     return [(x / width, y / height, w / width, h / height) for x, y, w, h in selected]
+
+
+def _complete_text_roi(
+    frame: np.ndarray, roi: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    height, width = frame.shape[:2]
+    x, y, w, h = roi
+    left, top = round(x * width), round(y * height)
+    box = (left, top, round((x + w) * width) - left, round((y + h) * height) - top)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    complete = _complete_text_box(gray, box)
+    if complete == box:
+        return roi
+    x, y, w, h = complete
+    return x / width, y / height, w / width, h / height
+
+
+def _complete_text_box(
+    gray: np.ndarray, box: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    """Recover adjacent glyphs before a truncated m:ss can pass the walking check."""
+    x, y, width, height = box
+    crop = gray[y : y + height, x : x + width]
+    if min(crop.shape, default=0) < 3:
+        return box
+    threshold, binary = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    border = np.concatenate((binary[0], binary[-1], binary[:, 0], binary[:, -1]))
+    mode = cv2.THRESH_BINARY_INV if np.mean(border) > 127 else cv2.THRESH_BINARY
+    left, top = max(0, x - height), max(0, y - height // 2)
+    right = min(gray.shape[1], x + width + height)
+    bottom = min(gray.shape[0], y + height + height // 2)
+    _, foreground = cv2.threshold(gray[top:bottom, left:right], threshold, 255, mode)
+    _, _, components, _ = cv2.connectedComponentsWithStats(foreground)
+    glyphs = [
+        (int(gx) + left, int(gy) + top, int(gw), int(gh))
+        for gx, gy, gw, gh, area in components[1:]
+        if max(3, height * 0.4) <= gh <= height * 1.4 and gw <= height * 1.2 and area >= 3
+    ]
+    anchors = [
+        glyph
+        for glyph in glyphs
+        if x <= glyph[0] + glyph[2] / 2 < x + width and y <= glyph[1] + glyph[3] / 2 < y + height
+    ]
+    if len(anchors) < 2:
+        return box
+    glyph_height = statistics.median(glyph[3] for glyph in anchors)
+    baseline = statistics.median(glyph[1] + glyph[3] for glyph in anchors)
+    aligned = [
+        glyph
+        for glyph in glyphs
+        if abs(glyph[3] - glyph_height) <= max(2, glyph_height * 0.25)
+        and abs(glyph[1] + glyph[3] - baseline) <= max(1, glyph_height * 0.15)
+    ]
+    anchors = [glyph for glyph in anchors if glyph in aligned]
+    if len(anchors) < 2:
+        return box
+    start = min(glyph[0] for glyph in anchors)
+    end = max(glyph[0] + glyph[2] for glyph in anchors)
+    # Limit growth to a character-sized gap on the same baseline, rather than
+    # blindly widening the crop into neighbouring scores and other rows.
+    gap = max(2, glyph_height * 0.65)
+    for gx, _, gw, _ in sorted(aligned, reverse=True):
+        if gx < start and 0 <= start - (gx + gw) <= gap:
+            start = gx
+    for gx, _, gw, _ in sorted(aligned):
+        if gx + gw > end and 0 <= gx - end <= gap:
+            end = gx + gw
+    padding = max(2, math.ceil(glyph_height * 0.2))
+    # Preserve well-framed selections exactly, including their chosen margins.
+    if start >= x + padding and end <= x + width - padding:
+        return box
+    new_left = max(0, min(x, start - padding))
+    new_right = min(gray.shape[1], max(x + width, end + padding))
+    return new_left, y, new_right - new_left, height
 
 
 def _text_score(gray: np.ndarray) -> float:

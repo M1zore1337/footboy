@@ -254,7 +254,7 @@ def source(url: str, *, hevc=False) -> Source:
     )
 
 
-@pytest.mark.parametrize("offset", [-60.0, -12.375, 0.0, 7.5, 60.0])
+@pytest.mark.parametrize("offset", [-60.0, -12.375, 0.0, 5.0, 7.5, 60.0])
 def test_signed_offsets_preserve_relative_pts_and_video_pixels(tmp_path, media_server, offset):
     base, requests = media_server
     video_file, bili_file = tmp_path / "video.flv", tmp_path / "bili.flv"

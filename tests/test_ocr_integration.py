@@ -75,6 +75,36 @@ def test_tesseract_discovers_clock_without_saved_roi():
     assert len(result.samples) >= 3
 
 
+@pytest.mark.parametrize("flip", ["none", "h", "v", "hv"])
+@pytest.mark.parametrize("dark_digits", [False, True])
+def test_saved_roi_recovers_a_missing_leading_minute_digit(flip, dark_digits):
+    frames = clock_frames(1000.125, 2775)
+    if dark_digits:
+        for _, image in frames:
+            image[16:73, 20:199] = 255 - image[16:73, 20:199]
+    frames = [(pts, flip_frame(image, flip)) for pts, image in frames]
+    # The first digit lies outside the saved selection; the remaining 6:15
+    # still advances normally and used to be accepted as a valid clock.
+    saved = ProbeConfig((55 / 640, 16 / 360, 143 / 640, 56 / 360), flip, False)
+    result = probe_clock(frames, TesseractBackend(TESSERACT), saved=saved)
+
+    assert [sample.clock for sample in result.samples] == [2775, 2777, 2779, 2781]
+    assert result.k == pytest.approx(1774.875)
+    assert result.residual == 0
+    assert result.config.roi[0] < saved.roi[0]
+    assert result.config.flip == flip
+
+
+def test_cropped_clock_can_recover_after_an_occluded_first_frame():
+    frames = clock_frames(1000.125, 2775)
+    frames[0][1].fill(0)
+    saved = ProbeConfig((55 / 640, 16 / 360, 143 / 640, 56 / 360), "none", False)
+    result = probe_clock(frames, TesseractBackend(TESSERACT), saved=saved)
+
+    assert [sample.clock for sample in result.samples] == [2777, 2779, 2781]
+    assert result.k == pytest.approx(1774.875)
+
+
 def test_tesseract_stopped_clock_is_rejected():
     with pytest.raises(StoppedClock):
         probe_clock(
@@ -350,7 +380,12 @@ def test_adaptive_saved_style_recovers_small_clock_with_uneven_brightness(dark_d
 
 @pytest.mark.parametrize(
     ("bili_origin", "bili_clock", "expected"),
-    [(1000.5, 2712, 11.625), (1000.5, 2688, -12.375), (9000.5, 2688, -8012.375)],
+    [
+        (1000.125, 2705, 5.0),
+        (1000.5, 2712, 11.625),
+        (1000.5, 2688, -12.375),
+        (9000.5, 2688, -8012.375),
+    ],
 )
 def test_tesseract_alignment_preserves_independent_pts_origins(
     tmp_path,

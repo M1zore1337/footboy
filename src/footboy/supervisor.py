@@ -79,6 +79,7 @@ class Supervisor:
         self.applied_offset: float | None = None
         self.aligned = config.initial_offset is not None and not config.auto_measure
         self.confidence: dict[str, Any] | None = {"method": "manual"} if self.aligned else None
+        self._manual_offset = self.aligned
         self.last_verified_at: str | None = None
         self.message = "尚未启动"
         self.phase = "INIT"
@@ -410,6 +411,7 @@ class Supervisor:
                 progress["reason"] = "已采用最新手动偏移"
             self.aligned = True
             self.confidence = {"method": "manual"}
+            self._manual_offset = True
             self.message = "手动偏移已更新，1.5 秒后应用"
             self._adjust_deadline = time.monotonic() + 1.5
             self.store.set_offset(self._offset_key, self.offset)
@@ -588,6 +590,7 @@ class Supervisor:
                     progress["state"] = "cancelled"
             return
         self.last_verified_at = _now_iso()
+        keep_manual = mode == "verify" and self._manual_offset
         if error is not None:
             self._verify_candidate = None
             self.aligned = False
@@ -612,6 +615,13 @@ class Supervisor:
                 )
                 self.confidence = None
                 self._needs_roi = error.needs_roi if isinstance(error, MeasurementError) else []
+            if keep_manual:
+                self.aligned = True
+                self.confidence = {"method": "manual"}
+                self.message = (
+                    f"自动复核未完成，保留手动偏移 D={self.offset:.3f}s："
+                    f"{_sanitize_ffmpeg_line(str(error))}"
+                )
             return
         assert result is not None
         for label, key, source_result in (
@@ -630,6 +640,15 @@ class Supervisor:
         self._needs_roi = []
         self.confidence = {"method": "ocr", **result.confidence.public_dict()}
         difference = result.offset - self.offset
+        if keep_manual:
+            self._verify_candidate = None
+            self.aligned = True
+            self.confidence = {"method": "manual"}
+            self.message = (
+                f"保留手动偏移 D={self.offset:.3f}s；OCR 建议调整 {difference:+.3f}s，"
+                "点击立即同步可重新自动对齐"
+            )
+            return
         if mode == "verify":
             if abs(difference) <= 1.0:
                 self._verify_candidate = None
@@ -644,6 +663,7 @@ class Supervisor:
                 return
         self._verify_candidate = None
         with self._lock:
+            self._manual_offset = False
             self.offset = round(result.offset, 3)
             self.aligned = True
             self.store.set_offset(self._offset_key, self.offset)
