@@ -27,3 +27,14 @@ agents.md
 .codex
 .agents
 .claude
+/.handoff/
+/ocr-debug*/
+
+# 编辑器与操作系统
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
