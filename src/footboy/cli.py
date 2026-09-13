@@ -9,65 +9,114 @@ from pathlib import Path
 
 from footboy.app import Application
 from footboy.environment import check_binary as _check_binary
+from footboy.i18n import ArgumentParser, configure_cli_language, tr
 from footboy.serve.http import ControlServer
 from footboy.supervisor import SupervisorConfig
 
 
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(
+def parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
+    configure_cli_language(argv)
+    result = ArgumentParser(
         prog="footboy",
-        description="启动 Footboy（足小子）WebUI，将比赛画面与 B站音源按源 PTS 对齐。",
-    )
-    result.add_argument("--video-page", help="第三方比赛页面 URL；省略后从 WebUI 输入")
-    result.add_argument("--bili-room", help="B站直播间 URL；与 --video-page 同时填写")
-    result.add_argument("--video-direct", action="store_true", help="比赛地址为媒体直链")
-    result.add_argument("--video-line", help="比赛页面线路名称，例如 高清直播5；支持圈号数字")
-    result.add_argument(
-        "--video-no-proxy", action="store_true", help="比赛页面与媒体流直连，不使用代理"
-    )
-    result.add_argument("--bili-direct", action="store_true", help="B站地址为媒体直链（P0）")
-    result.add_argument("--output-dir", type=Path, default=Path("hls_out"))
-    result.add_argument("--state-file", type=Path, default=Path("state.json"))
-    result.add_argument("--host", default="0.0.0.0")
-    result.add_argument("--port", type=int, default=8080)
-    result.add_argument(
-        "--ffmpeg", default="ffmpeg", help="自定义程序路径；默认先查 PATH，再查 tools"
+        allow_abbrev=False,
+        description=tr(
+            "Start the Footboy web console and synchronize match video with Bilibili audio using source PTS."
+        ),
     )
     result.add_argument(
-        "--ffprobe", default="ffprobe", help="自定义程序路径；默认先查 PATH，再查 tools"
+        "--video-page", help=tr("Match page URL; omit to enter it in the web console")
     )
-    result.add_argument("--bili-cookies", type=Path, help="可选 Netscape cookies.txt")
-    result.add_argument("--ocr", choices=("auto", "rapidocr", "tesseract"), default="auto")
-    result.add_argument("--tesseract-command", help="自定义程序路径；默认先查 PATH，再查 tools")
-    result.add_argument("--offset", type=float, help="初始有符号 D 秒；正值推后 B站音频")
     result.add_argument(
-        "--no-auto-measure", action="store_true", help="关闭启动和周期 OCR，手动调节"
+        "--bili-room", help=tr("Bilibili live room URL; provide together with --video-page")
     )
-    result.add_argument("--headless-sniff", action="store_true", help="自动嗅探时不显示浏览器窗口")
+    result.add_argument(
+        "--video-direct", action="store_true", help=tr("Treat the match URL as a direct media URL")
+    )
+    result.add_argument(
+        "--video-line",
+        help=tr("Stream label as shown on the match page; circled numbers are supported"),
+    )
+    result.add_argument(
+        "--video-no-proxy",
+        action="store_true",
+        help=tr("Bypass proxies for the match page and media stream"),
+    )
+    result.add_argument(
+        "--bili-direct",
+        action="store_true",
+        help=tr("Treat the Bilibili URL as a direct media URL (P0)"),
+    )
+    result.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("hls_out"),
+        help=tr("HLS output directory (default: hls_out)"),
+    )
+    result.add_argument(
+        "--state-file",
+        type=Path,
+        default=Path("state.json"),
+        help=tr("Saved settings file (default: state.json)"),
+    )
+    result.add_argument("--host", default="0.0.0.0", help=tr("Listen address (default: 0.0.0.0)"))
+    result.add_argument("--port", type=int, default=8080, help=tr("Listen port (default: 8080)"))
+    result.add_argument(
+        "--ffmpeg", default="ffmpeg", help=tr("Executable path; by default search PATH, then tools")
+    )
+    result.add_argument(
+        "--ffprobe",
+        default="ffprobe",
+        help=tr("Executable path; by default search PATH, then tools"),
+    )
+    result.add_argument("--bili-cookies", type=Path, help=tr("Optional Netscape cookies.txt file"))
+    result.add_argument(
+        "--ocr",
+        choices=("auto", "rapidocr", "tesseract"),
+        default="auto",
+        help=tr("OCR engine (default: auto)"),
+    )
+    result.add_argument(
+        "--tesseract-command", help=tr("Executable path; by default search PATH, then tools")
+    )
+    result.add_argument(
+        "--offset",
+        type=float,
+        help=tr("Initial signed offset D in seconds; positive values delay Bilibili audio"),
+    )
+    result.add_argument(
+        "--no-auto-measure",
+        action="store_true",
+        help=tr("Disable startup and periodic OCR; adjust manually"),
+    )
+    result.add_argument(
+        "--headless-sniff",
+        action="store_true",
+        help=tr("Discover streams without showing a browser window"),
+    )
     result.add_argument("--verify-interval", type=float, default=120.0, help=argparse.SUPPRESS)
-    result.add_argument("--check", action="store_true", help="只检查 FFmpeg / ffprobe 环境")
+    result.add_argument("--check", action="store_true", help=tr("Check FFmpeg / ffprobe and exit"))
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
-    argument_parser = parser()
+    argument_parser = parser(argv)
     args = argument_parser.parse_args(argv)
     if bool(args.video_page) != bool(args.bili_room):
-        argument_parser.error("--video-page 与 --bili-room 必须同时提供，也可以都省略")
+        argument_parser.error(tr("Provide both --video-page and --bili-room, or omit both"))
     if not 0 <= args.port <= 65535:
-        argument_parser.error("--port 必须在 0..65535")
+        argument_parser.error(tr("--port must be between 0 and 65535"))
     if args.offset is not None and not math.isfinite(args.offset):
-        argument_parser.error("--offset 必须是有限数值")
+        argument_parser.error(tr("--offset must be a finite number"))
     if not math.isfinite(args.verify_interval) or args.verify_interval < 1:
-        argument_parser.error("--verify-interval 必须至少为 1 秒")
+        argument_parser.error(tr("--verify-interval must be at least 1 second"))
     if args.check:
         try:
             _check_binary(args.ffmpeg, minimum_major=6)
             _check_binary(args.ffprobe)
         except RuntimeError as exc:
-            print(f"环境检查失败: {exc}", file=sys.stderr)
+            print(tr("Environment check failed: {0}", exc), file=sys.stderr)
             return 2
-        print("FFmpeg / ffprobe 检查通过")
+        print(tr("FFmpeg / ffprobe checks passed"))
         return 0
     config = SupervisorConfig(
         video_page_url=args.video_page or "",
@@ -109,10 +158,10 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        print(f"Footboy 启动失败: {exc}", file=sys.stderr)
+        print(tr("Footboy failed to start: {0}", exc), file=sys.stderr)
         return 1
     finally:
-        print("正在停止 Footboy……", flush=True)
+        print(tr("Stopping Footboy…"), flush=True)
         app.close()
         server.stop()
     return 0

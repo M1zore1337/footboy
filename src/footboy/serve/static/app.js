@@ -1,5 +1,6 @@
 'use strict';
 
+const {t, setText, getLanguage} = window.FootboyI18n;
 const $ = id => document.getElementById(id);
 const player = $('player');
 let currentStatus = null;
@@ -27,13 +28,13 @@ let audioSending = false;
 let audioVersion = 0;
 let accessToken = '';
 const accessStorageKey = 'footboy.controlToken';
-const invalidAccessMessage = '控制密钥无效或已过期，请使用本次启动终端中的控制页链接或密钥。';
+const invalidAccessMessage = t("The control token is invalid or expired. Use the console link or token from the current startup.");
 
 const phaseNames = {
-  IDLE: '等待连接', CHECK: '检查环境', INIT: '准备连接', RESOLVE: '获取直播间',
-  SNIFF: '选择比赛线路', MEASURE: '识别比赛时钟', VERIFY: '复核时钟', RUN: '直播运行中',
-  'P0-RUN': '直链测试中', ADJUST: '正在应用偏移', RECOVER: '正在恢复连接',
-  STOPPING: '正在停止', STOPPED: '任务已停止', ERROR: '连接失败'
+  IDLE: t("Ready to connect"), CHECK: t("Checking environment"), INIT: t("Preparing connection"), RESOLVE: t("Resolving live room"),
+  SNIFF: t("Choose a match stream"), MEASURE: t("Reading match clocks"), VERIFY: t("Verifying clocks"), RUN: t("Live stream running"),
+  'P0-RUN': t("Direct stream test"), ADJUST: t("Applying offset"), RECOVER: t("Reconnecting"),
+  STOPPING: t("Stopping"), STOPPED: t("Session stopped"), ERROR: t("Connection failed")
 };
 
 function newEditor() {
@@ -48,7 +49,7 @@ resetEditors();
 
 function toast(message, error = false) {
   clearTimeout(toastTimer);
-  $('toast').textContent = message;
+  setText($('toast'), message);
   $('toast').classList.toggle('error', error);
   $('toast').hidden = false;
   toastTimer = setTimeout(() => { $('toast').hidden = true; }, error ? 6500 : 3500);
@@ -73,8 +74,8 @@ function readAccessLink() {
 function showAccessPanel(message) {
   $('access-panel').hidden = false;
   $('workspace').inert = true;
-  if (message) $('access-message').textContent = message;
-  $('phase-text').textContent = '等待验证';
+  if (message) setText($('access-message'), message);
+  setText($('phase-text'), t("Waiting for authentication"));
   $('phase').classList.remove('running', 'busy');
   currentStatus = null;
   clearTimeout(audioTimer); audioDirty = false; audioVersion += 1;
@@ -99,6 +100,7 @@ async function timedFetch(path, options = {}, timeout = 8000) {
   try {
     const headers = new Headers(options.headers);
     if (token) headers.set('Authorization', `Bearer ${token}`);
+    if (path.startsWith('/api/')) headers.set('Accept-Language', getLanguage());
     const response = await fetch(path, {...options, headers, signal: controller.signal});
     if (response.status === 401 && token && token === accessToken) {
       setAccessToken('');
@@ -114,7 +116,7 @@ async function post(path, body = {}) {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  if (!response.ok) throw new Error(result.error || t('Request failed ({0})', response.status));
   statusRevision += 1;
   refresh();
   return result;
@@ -135,7 +137,7 @@ function parseHeaders(text) {
     const line = raw.trim();
     if (!line) continue;
     const colon = line.indexOf(':');
-    if (colon <= 0) throw new Error('请求头需使用「名称: 值」，每行一条');
+    if (colon <= 0) throw new Error(t("Use Name: Value for each header, one per line"));
     result[line.slice(0, colon).trim()] = line.slice(colon + 1).trim();
   }
   return result;
@@ -148,7 +150,7 @@ $('source-form').addEventListener('submit', async event => {
   try {
     const initial = $('initial-offset').value;
     const offset = initial === '' ? null : Number(initial);
-    if (offset !== null && !Number.isFinite(offset)) throw new Error('初始偏移必须是有限数值');
+    if (offset !== null && !Number.isFinite(offset)) throw new Error(t("The initial offset must be a finite number"));
     await post('/api/start', {
       video_url: $('video-url').value.trim(), bili_url: $('bili-url').value.trim(),
       video_direct: $('video-direct').checked, bili_direct: $('bili-direct').checked,
@@ -158,7 +160,7 @@ $('source-form').addEventListener('submit', async event => {
       video_headers: parseHeaders($('video-headers').value),
       bili_headers: parseHeaders($('bili-headers').value)
     });
-    toast('正在连接，两路直播的进度会显示在控制台');
+    toast(t("Connecting. Progress for both streams will appear in the console."));
   } catch (error) { toast(error.message, true); }
   finally { submitting = false; refresh(); }
 });
@@ -166,17 +168,17 @@ $('source-form').addEventListener('submit', async event => {
 document.querySelectorAll('[data-delta]').forEach(button => {
   action(button, '/api/offset', () => ({delta_ms: Number(button.dataset.delta)}));
 });
-action($('remeasure'), '/api/remeasure', {}, '正在识别两路比赛时钟并重新同步');
-action($('resniff'), '/api/resniff', {}, '请在本机浏览器重新选择比赛线路');
-action($('stop'), '/api/stop', {}, '正在停止任务');
-action($('cancel-source'), '/api/source', {id: null}, '已暂停当前线路的自动选择');
+action($('remeasure'), '/api/remeasure', {}, t("Reading both match clocks and synchronizing"));
+action($('resniff'), '/api/resniff', {}, t("Choose a match stream in the browser on the host computer"));
+action($('stop'), '/api/stop', {}, t("Stopping the session"));
+action($('cancel-source'), '/api/source', {id: null}, t("Automatic selection paused for the current stream"));
 $('line-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (lineSubmitting || !$('line-choice').value) return;
   lineSubmitting = true; $('switch-line').disabled = true;
   try {
     await post('/api/line', {text: $('line-choice').value});
-    toast('正在获取所选线路，通过探测后切换');
+    toast(t("Fetching the selected stream; switching after validation"));
   } catch (error) { toast(error.message, true); }
   finally { lineSubmitting = false; refresh(); }
 });
@@ -192,7 +194,7 @@ function audioValues() {
 }
 function updateAudioLabels() {
   for (const name of ['original', 'commentary']) {
-    $(`${name}-volume-value`).textContent = `${$(`${name}-volume`).value}%`;
+    setText($(`${name}-volume-value`), `${$(`${name}-volume`).value}%`);
   }
 }
 async function sendAudio() {
@@ -213,20 +215,20 @@ for (const id of ['original-enabled', 'original-volume', 'commentary-volume']) {
     audioDirty = true; audioVersion += 1;
     updateAudioLabels();
     $('original-volume').disabled = !$('original-enabled').checked;
-    $('audio-state').textContent = '音量待应用';
+    setText($('audio-state'), t("Audio levels pending"));
     clearTimeout(audioTimer); audioTimer = setTimeout(sendAudio, 300);
   });
 }
 function clockTime(value) {
-  if (!value) return '尚未复核';
+  if (!value) return t("Not yet verified");
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleTimeString('zh-CN', {hour12: false});
+  return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleTimeString(getLanguage(), {hour12: false});
 }
 function elapsed(value) {
   if (!Number.isFinite(value)) return '—';
   const seconds = Math.floor(value);
-  return seconds >= 3600 ? `${Math.floor(seconds / 3600)}时 ${Math.floor(seconds % 3600 / 60)}分`
-    : seconds >= 60 ? `${Math.floor(seconds / 60)}分 ${seconds % 60}秒` : `${seconds}秒`;
+  return seconds >= 3600 ? t('{0}h {1}m', Math.floor(seconds / 3600), Math.floor(seconds % 3600 / 60))
+    : seconds >= 60 ? t('{0}m {1}s', Math.floor(seconds / 60), seconds % 60) : t('{0}s', seconds);
 }
 
 function updateStatus(status) {
@@ -246,7 +248,7 @@ function updateStatus(status) {
     clearTimeout(audioTimer); audioDirty = false; audioVersion += 1;
     lastSession = session; resetEditors(); detachPlayer();
   }
-  $('phase-text').textContent = phaseNames[status.state] || status.state;
+  setText($('phase-text'), phaseNames[status.state] || status.state);
   $('phase').classList.toggle('running', Boolean(status.ffmpeg?.running));
   $('phase').classList.toggle('busy', active && !['RUN', 'P0-RUN', 'ERROR'].includes(status.state));
   $('source-fields').disabled = active;
@@ -261,7 +263,7 @@ function updateStatus(status) {
     || Boolean(status.sniffer?.running) || Boolean(status.source_switching);
   document.querySelectorAll('[data-delta]').forEach(button => { button.disabled = !controllable; });
   $('remeasure').disabled = !controllable || !status.video || !status.capabilities?.roi;
-  $('remeasure').textContent = status.measurement?.running ? '↻ 正在同步…' : '↻ 立即同步';
+  setText($('remeasure'), status.measurement?.running ? t("↻ Syncing…") : t("↻ Sync now"));
   $('audio-controls').hidden = !status.capabilities?.audio_mix;
   const audioReady = controllable && Boolean(status.video);
   const originalAvailable = Boolean(status.video?.has_audio);
@@ -273,8 +275,8 @@ function updateStatus(status) {
     $('original-volume').value = Math.round(audio.original_volume * 100);
     $('commentary-volume').value = Math.round(audio.commentary_volume * 100);
     updateAudioLabels();
-    $('audio-state').textContent = !audioReady ? '' : !originalAvailable ? '原直播不含音轨'
-      : JSON.stringify(status.audio) !== JSON.stringify(status.applied_audio) ? '音量待应用' : '';
+    setText($('audio-state'), !audioReady ? '' : !originalAvailable ? t("The original stream has no audio track")
+      : JSON.stringify(status.audio) !== JSON.stringify(status.applied_audio) ? t("Audio levels pending") : '');
   }
   $('original-volume').disabled = !audioReady || !originalAvailable || !$('original-enabled').checked;
   $('flip').disabled = !controllable;
@@ -282,55 +284,55 @@ function updateStatus(status) {
   if (active && typeof status.auto_measure === 'boolean') $('auto-measure').checked = status.auto_measure;
 
   const offset = Number(status.offset_seconds || 0);
-  $('offset-value').textContent = `${offset >= 0 ? '+' : '−'}${Math.abs(offset).toFixed(3)}`;
+  setText($('offset-value'), `${offset >= 0 ? '+' : '−'}${Math.abs(offset).toFixed(3)}`);
   const confidence = status.confidence;
   const manual = confidence?.method?.startsWith('manual');
   const aligned = Boolean(status.aligned);
-  $('alignment').textContent = !active ? '未对齐' : confidence?.stopped ? '检测到停表'
-    : aligned ? manual ? '手动设置' : '自动已对齐' : '未对齐';
+  setText($('alignment'), !active ? t("Not aligned") : confidence?.stopped ? t("Clock stopped")
+    : aligned ? manual ? t("Manual offset") : t("Auto-aligned") : t("Not aligned"));
   $('alignment').classList.toggle('warning', !active || !aligned || Boolean(confidence?.stopped));
-  $('offset-note').textContent = !active ? '连接后即可调节' : status.adjust_pending
-    ? `待应用 · 当前播放 ${Number(status.applied_offset_seconds ?? offset).toFixed(3)}s`
-    : '正值推后 B 站音频';
-  $('ffmpeg-status').textContent = status.ffmpeg?.running ? '运行中' : active ? '等待启动' : '未运行';
+  setText($('offset-note'), !active ? t("Connect to adjust") : status.adjust_pending
+    ? t('Pending · Playing at {0}s', Number(status.applied_offset_seconds ?? offset).toFixed(3))
+    : t("Positive values delay Bilibili audio"));
+  setText($('ffmpeg-status'), status.ffmpeg?.running ? t("Running") : active ? t("Waiting to start") : t("Not running"));
   $('health-light').classList.toggle('on', Boolean(status.ffmpeg?.running));
-  $('confidence').textContent = confidence?.video_samples != null
-    ? `画面 ${confidence.video_samples} · 音源 ${confidence.bili_samples} 帧` : manual ? '手动设置' : '—';
+  setText($('confidence'), confidence?.video_samples != null
+    ? t('Video {0} · Audio {1} frames', confidence.video_samples, confidence.bili_samples) : manual ? t("Manual offset") : '—');
   const residuals = [confidence?.video_residual, confidence?.bili_residual];
-  $('residual').textContent = residuals.every(Number.isFinite) ? `${Math.max(...residuals).toFixed(3)} 秒` : '—';
-  $('last-verified').textContent = clockTime(status.last_verified_at);
-  $('uptime').textContent = status.ffmpeg?.running ? elapsed(status.ffmpeg.uptime_seconds) : '—';
-  $('status-message').textContent = status.message || '等待连接';
+  setText($('residual'), residuals.every(Number.isFinite) ? t('{0} s', Math.max(...residuals).toFixed(3)) : '—');
+  setText($('last-verified'), clockTime(status.last_verified_at));
+  setText($('uptime'), status.ffmpeg?.running ? elapsed(status.ffmpeg.uptime_seconds) : '—');
+  setText($('status-message'), status.message || t("Ready to connect"));
   $('status-message').classList.toggle('warning', active && !aligned || status.state === 'ERROR');
-  $('logs').textContent = [
-    `状态：${status.state}`,
-    `处理速度：${status.ffmpeg?.speed == null ? '尚无数据' : `${status.ffmpeg.speed.toFixed(2)}x`}`,
-    `DTS 异常：${status.ffmpeg?.non_monotonic_dts || 0}`,
+  setText($('logs'), [
+    t('State: {0}', status.state),
+    t('Processing speed: {0}', status.ffmpeg?.speed == null ? t("No data yet") : `${status.ffmpeg.speed.toFixed(2)}x`),
+    t('DTS anomalies: {0}', status.ffmpeg?.non_monotonic_dts || 0),
     ...(status.ffmpeg?.stderr_tail || [])
-  ].join('\n');
+  ].join('\n'));
   $('source-info').hidden = !active;
-  $('source-info').textContent = [
-    status.video ? `画面 · ${status.video.line_text || status.video.domain} · ${status.video.video_codec || '探测中'}${status.video.height ? ` / ${status.video.height}p` : ''}` : '',
-    status.bili ? `音源 · ${status.bili.domain} · ${status.bili.audio_codec || '探测中'}` : ''
-  ].filter(Boolean).join('  ｜  ') || (active ? '正在获取直播信息…' : '');
+  setText($('source-info'), [
+    status.video ? t('Video · {0} · {1}{2}', status.video.line_text || status.video.domain, status.video.video_codec || t("Probing"), status.video.height ? ` / ${status.video.height}p` : '') : '',
+    status.bili ? t('Audio · {0} · {1}', status.bili.domain, status.bili.audio_codec || t("Probing")) : ''
+  ].filter(Boolean).join('  ｜  ') || (active ? t("Fetching stream information…") : ''));
   const ocrStates = Object.values(status.measurement?.sources || {}).map(source => source.ocr?.state);
-  $('measurement-state').textContent = status.measurement?.running ? '正在采样与识别…'
-    : ocrStates.includes('error') ? '采样或识别失败' : ocrStates.includes('timeout') ? '识别超时'
-    : ocrStates.includes('stopped') ? '比赛时钟停表'
-    : status.measurement?.needs_roi?.length ? '请框选未识别的时钟' : aligned && !manual ? '时钟已锁定' : '等待采样';
+  setText($('measurement-state'), status.measurement?.running ? t("Capturing and reading clocks…")
+    : ocrStates.includes('error') ? t("Capture or recognition failed") : ocrStates.includes('timeout') ? t("Recognition timed out")
+    : ocrStates.includes('stopped') ? t("Match clock stopped")
+    : status.measurement?.needs_roi?.length ? t("Select the undetected clock") : aligned && !manual ? t("Clock locked") : t("Waiting for frames"));
   $('measurement-state').classList.toggle('busy', Boolean(status.measurement?.running));
   updateCandidates(status.sniffer);
   updateLines(status, controllable);
   updatePreview(status);
   if (!active) {
     if (playerGeneration !== null) detachPlayer();
-    $('placeholder-title').textContent = status.state === 'ERROR' ? '连接尚未完成' : '你的主场，准备就绪';
-    $('placeholder-note').textContent = status.state === 'ERROR' ? '查看连接状态，调整设置后重新开始。' : '连接两路直播，比赛将在这里开始。';
-    $('player-state').textContent = '等待视频源';
+    setText($('placeholder-title'), status.state === 'ERROR' ? t("Connection incomplete") : t("Your home ground is ready"));
+    setText($('placeholder-note'), status.state === 'ERROR' ? t("Check the connection status, adjust settings, and try again.") : t("Connect both streams to start watching here."));
+    setText($('player-state'), t("Waiting for video"));
   } else if (playerGeneration === null) {
-    $('placeholder-title').textContent = status.ffmpeg?.running ? '正在等待直播分片' : '正在连接两路直播';
-    $('placeholder-note').textContent = '取流和缓冲完成后，即可开始观看。';
-    $('player-state').textContent = status.ffmpeg?.running ? '正在缓冲' : '正在连接';
+    setText($('placeholder-title'), status.ffmpeg?.running ? t("Waiting for live segments") : t("Connecting both streams"));
+    setText($('placeholder-note'), t("Playback starts once the streams are ready and buffered."));
+    setText($('player-state'), status.ffmpeg?.running ? t("Buffering") : t("Connecting"));
   }
   if (active && status.ffmpeg?.running) ensurePlayback(status);
 }
@@ -357,14 +359,14 @@ function updateLines(status, controllable) {
     || (status.source_switching && !sniffer.running);
   const current = status.video?.line_text;
   const pending = sniffer.pending_line || (sniffer.running ? sniffer.selected_line : null);
-  $('current-line').textContent = [current ? `当前：${current}` : '等待线路验收',
-    pending ? `正在获取：${pending}` : ''].filter(Boolean).join(' · ');
+  setText($('current-line'), [current ? t('Current: {0}', current) : t("Waiting for stream validation"),
+    pending ? t('Fetching: {0}', pending) : ''].filter(Boolean).join(' · '));
 }
 
 function updateCandidates(sniffer) {
   $('candidates-panel').hidden = !sniffer?.running;
   if (!sniffer?.running) return;
-  $('sniff-message').textContent = sniffer.message || '稳定播放 5 秒后开始倒计时，可点选立即确认。';
+  setText($('sniff-message'), sniffer.message || t("Auto-selection starts after 5 seconds of stable playback. Select a stream to confirm now."));
   const keep = new Set();
   for (const item of [...(sniffer.candidates || [])].sort((a, b) => a.id - b.id)) {
     keep.add(String(item.id));
@@ -374,14 +376,14 @@ function updateCandidates(sniffer) {
       const head = document.createElement('div'); head.className = 'candidate-head';
       const label = document.createElement('span'); label.className = 'candidate-label';
       const button = document.createElement('button'); button.type = 'button';
-      button.className = 'button secondary small'; button.textContent = '选用';
-      action(button, '/api/source', {id: item.id}, '正在验收所选线路');
+      button.className = 'button secondary small'; setText(button, t("Select"));
+      action(button, '/api/source', {id: item.id}, t("Validating the selected stream"));
       head.append(label, button);
       const url = document.createElement('p'); url.className = 'candidate-url';
       row.append(head, url); $('candidates').append(row);
     }
-    row.querySelector('.candidate-label').textContent = `${item.line_text || `线路 ${item.id}`} · ${item.cancelled ? '已暂停自动选择' : item.browser_blocked ? '等待媒体探测' : item.active ? `正在播放${item.countdown != null ? ` · ${item.countdown}s` : ''}` : '等待分片'}`;
-    row.querySelector('.candidate-url').textContent = item.url;
+    setText(row.querySelector('.candidate-label'), t('{0} · {1}', item.line_text || t('Stream {0}', item.id), item.cancelled ? t("Auto-selection paused") : item.browser_blocked ? t("Waiting for media validation") : item.active ? t('Playing{0}', item.countdown != null ? ` · ${item.countdown}s` : '') : t("Waiting for segments")));
+    setText(row.querySelector('.candidate-url'), item.url);
   }
   $('candidates').querySelectorAll('.candidate').forEach(row => {
     if (!keep.has(row.dataset.id)) row.remove();
@@ -411,12 +413,12 @@ async function ensurePlayback(status, force = false) {
     if (generation !== (currentStatus.ffmpeg?.generation || 'p0')) return;
     attachPlayer(generation);
   } catch (error) {
-    $('player-state').textContent = '等待直播恢复';
+    setText($('player-state'), t("Waiting for the stream to resume"));
   } finally { playbackProbe = false; }
 }
 
 function retryPlayback(message) {
-  $('player-message').textContent = message;
+  setText($('player-message'), message);
   clearTimeout(playerRetry);
   playerRetry = setTimeout(() => {
     if (currentStatus && activeSession(currentStatus) && currentStatus.ffmpeg?.running) {
@@ -428,8 +430,8 @@ function retryPlayback(message) {
 function attachPlayer(generation) {
   detachPlayer(); playerGeneration = generation;
   const source = `/live.m3u8?g=${encodeURIComponent(generation)}`;
-  $('player-state').textContent = '正在缓冲';
-  $('player-message').textContent = '视频保持原画质 · 使用 B 站直播间音源';
+  setText($('player-state'), t("Buffering"));
+  setText($('player-message'), t("Original video quality · Bilibili commentary"));
   // Chromium can advertise native HLS while failing to parse live TS streams.
   // Keep native playback on Apple browsers and use MSE elsewhere when available.
   const nativeHls = Boolean(player.canPlayType('application/vnd.apple.mpegurl'));
@@ -444,11 +446,11 @@ function attachPlayer(generation) {
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        retryPlayback('当前媒体无法播放，正在重试；HEVC 画面需要浏览器支持。');
-      } else retryPlayback('直播暂时中断，正在等待恢复…');
+        retryPlayback(t("Cannot play this media; retrying. HEVC video requires browser support."));
+      } else retryPlayback(t("Stream interrupted; waiting to resume…"));
     });
   } else {
-    $('player-message').textContent = '浏览器不支持此 HLS 播放方式，可用 Safari 或外部播放器打开播放地址。';
+    setText($('player-message'), t("This browser cannot play this HLS stream. Open the playback URL in Safari or an external player."));
   }
 }
 
@@ -459,20 +461,20 @@ async function tryPlay() {
 $('play-button').addEventListener('click', () => { player.muted = false; tryPlay(); });
 $('retry-play').addEventListener('click', () => {
   if (currentStatus && activeSession(currentStatus)) ensurePlayback(currentStatus, true);
-  else toast('请先连接直播源');
+  else toast(t("Connect the live sources first"));
 });
 player.addEventListener('loadeddata', () => { $('player-placeholder').hidden = true; });
 player.addEventListener('playing', () => {
-  $('player-state').textContent = '正在播放'; $('play-button').hidden = true;
+  setText($('player-state'), t("Playing")); $('play-button').hidden = true;
   $('player-placeholder').hidden = true;
 });
-player.addEventListener('waiting', () => { if (playerGeneration !== null) $('player-state').textContent = '正在缓冲'; });
-player.addEventListener('pause', () => { if (playerGeneration !== null) $('player-state').textContent = '已暂停'; });
+player.addEventListener('waiting', () => { if (playerGeneration !== null) setText($('player-state'), t("Buffering")); });
+player.addEventListener('pause', () => { if (playerGeneration !== null) setText($('player-state'), t("Paused")); });
 player.addEventListener('error', () => {
-  if (playerGeneration !== null) retryPlayback('播放器等待直播恢复，可尝试重新载入。');
+  if (playerGeneration !== null) retryPlayback(t("Waiting for the stream to resume. Try reloading the player."));
 });
 player.addEventListener('ended', () => {
-  if (currentStatus && activeSession(currentStatus)) retryPlayback('等待新一段直播…');
+  if (currentStatus && activeSession(currentStatus)) retryPlayback(t("Waiting for new live segments…"));
 });
 
 function updatePreview(status) {
@@ -496,7 +498,7 @@ function updatePreview(status) {
     loadPreview(label, editor, meta.version);
   }
   const meta = status.measurement?.sources?.[sourceLabel];
-  $('snapshot-time').textContent = meta?.captured_at ? `采样于 ${clockTime(meta.captured_at)}` : '以采样截图为准';
+  setText($('snapshot-time'), meta?.captured_at ? t('Captured at {0}', clockTime(meta.captured_at)) : t("Based on the captured frame"));
   drawRoi();
 }
 
@@ -504,7 +506,7 @@ async function loadOcrImages(label, editor, version) {
   await Promise.all(['crop', 'processed'].map(async kind => {
     try {
       const response = await timedFetch(`/api/ocr/${label}/${kind}.png?v=${encodeURIComponent(version)}`, {cache: 'no-store'});
-      if (!response.ok) throw new Error('本次识别图像暂不可用');
+      if (!response.ok) throw new Error(t("The OCR image is currently unavailable"));
       const blob = await response.blob();
       if (editors[label] !== editor || editor.ocrVersion !== version) return;
       const url = URL.createObjectURL(blob), image = new Image();
@@ -534,17 +536,17 @@ function drawOcrFeedback() {
   const progress = currentStatus?.measurement?.sources?.[sourceLabel]?.ocr || {};
   const reading = progress.reading;
   const states = {
-    queued: '区域已保存，等待重新采样', sampling: '正在采样比赛画面…',
-    searching: progress.phase === 'nearby' ? '正在选区周边寻找时钟…' : '正在画面中寻找时钟…',
-    stopped: '比赛时钟停表，保留当前偏移', timeout: '识别超时，可缩小选区后重试',
-    error: '采样或识别失败，请查看详情', not_found: '未锁定，请框选完整比赛计时',
-    cancelled: '本轮已取消', locked: `连续 ${progress.samples || 3} 帧走表通过`
+    queued: t("Region saved; waiting for new frames"), sampling: t("Capturing match frames…"),
+    searching: progress.phase === 'nearby' ? t("Looking for the clock near your selection…") : t("Looking for the clock in the frame…"),
+    stopped: t("Match clock stopped; keeping the current offset"), timeout: t("Recognition timed out; try a smaller region"),
+    error: t("Capture or recognition failed; see details"), not_found: t("Clock not locked; select the full match clock"),
+    cancelled: t("This round was cancelled"), locked: t('Running clock confirmed across {0} consecutive frames', progress.samples || 3)
   };
-  $('ocr-reading-state').textContent = editor.dirty ? '选区已修改，保存后试读'
-    : reading ? reading.clock == null ? '最近单帧试读：未读到时间' : `最近单帧试读：${matchClock(reading.clock)}`
-    : states[progress.state] || '等待试读比赛时钟';
-  $('ocr-validation-state').textContent = editor.dirty ? '当前选区尚未验证'
-    : states[progress.state] || '尚未锁定，至少需要连续 3 帧走表';
+  setText($('ocr-reading-state'), editor.dirty ? t("Region changed; save to read the clock")
+    : reading ? reading.clock == null ? t("Latest frame: no clock found") : t('Latest frame: {0}', matchClock(reading.clock))
+    : states[progress.state] || t("Waiting for a clock reading"));
+  setText($('ocr-validation-state'), editor.dirty ? t("This selection has not been validated")
+    : states[progress.state] || t("Not locked; a running clock across at least 3 consecutive frames is required"));
   $('ocr-diagnostics').hidden = editor.dirty || !reading && !progress.reason;
   for (const [kind, id] of [['crop', 'ocr-actual-crop'], ['processed', 'ocr-processed']]) {
     const target = $(id), image = editor.ocrImages[kind];
@@ -554,18 +556,18 @@ function drawOcrFeedback() {
       target.getContext('2d').drawImage(image, 0, 0);
     }
   }
-  $('ocr-details').textContent = [
-    reading ? `原始识别文字：${reading.text?.trim() || '（空）'} · 第 ${reading.frame_index + 1} 帧` : '',
-    reading?.seconds != null ? `单次试读 ${reading.seconds.toFixed(3)} 秒` : '',
-    progress.attempts != null ? `本轮 ${progress.attempts} 次试读 · ${(progress.elapsed || 0).toFixed(3)} 秒` : '',
+  setText($('ocr-details'), [
+    reading ? t('Raw OCR text: {0} · Frame {1}', reading.text?.trim() || t("(empty)"), reading.frame_index + 1) : '',
+    reading?.seconds != null ? t('Reading time: {0} s', reading.seconds.toFixed(3)) : '',
+    progress.attempts != null ? t('{0} attempts this round · {1} s', progress.attempts, (progress.elapsed || 0).toFixed(3)) : '',
     progress.reason || ''
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n'));
 }
 
 async function loadPreview(label, editor, version) {
   try {
     const response = await timedFetch(`/api/snapshot/${label}.jpg?v=${encodeURIComponent(version)}`, {cache: 'no-store'});
-    if (!response.ok) throw new Error('采样画面暂不可用');
+    if (!response.ok) throw new Error(t("The frame snapshot is currently unavailable"));
     const blob = await response.blob();
     if (editors[label] !== editor || editor.version !== version) return;
     const url = URL.createObjectURL(blob);
@@ -619,8 +621,8 @@ function drawRoi() {
     context.fillRect(0, top, left, rh); context.fillRect(left + rw, top, width - left - rw, rh);
     context.strokeStyle = '#c2f86e'; context.lineWidth = Math.max(2, width / 400);
     context.strokeRect(left, top, rw, rh);
-    $('roi-summary').textContent = `${Math.round(rw)} × ${Math.round(rh)} 像素的识别区域`;
-  } else $('roi-summary').textContent = '拖动框选完整的比赛计时';
+    setText($('roi-summary'), t('Clock region: {0} × {1} px', Math.round(rw), Math.round(rh)));
+  } else setText($('roi-summary'), t("Drag around the full match clock"));
   ['x', 'y', 'w', 'h'].forEach((axis, index) => {
     const input = $(`roi-${axis}`);
     if (document.activeElement !== input) input.value = editor.roi ? (editor.roi[index] * 100).toFixed(1) : '';
@@ -678,7 +680,7 @@ canvas.addEventListener('pointercancel', () => { dragStart = null; });
 });
 $('save-roi').addEventListener('click', async () => {
   const editor = editors[sourceLabel], label = sourceLabel;
-  if (!validRoi(editor.roi)) { toast('请在画面内选择有效的时钟区域', true); return; }
+  if (!validRoi(editor.roi)) { toast(t("Select a valid clock region within the frame"), true); return; }
   $('save-roi').disabled = true;
   const selection = {source: label, roi: editor.roi.slice(), flip: editor.flip, inverted: editor.inverted};
   try {
@@ -689,7 +691,7 @@ $('save-roi').addEventListener('click', async () => {
       const meta = currentStatus?.measurement?.sources?.[label];
       if (meta) meta.ocr = {state: 'queued'};
     }
-    toast('识别区域已保存，正在重新测量');
+    toast(t("Clock region saved; remeasuring"));
   } catch (error) { toast(error.message, true); }
   finally { drawRoi(); }
 });
@@ -700,8 +702,8 @@ $('copy-link').addEventListener('click', async () => {
   try {
     if (navigator.clipboard?.writeText && window.isSecureContext) await navigator.clipboard.writeText(input.value);
     else { input.focus(); input.select(); if (!document.execCommand('copy')) throw new Error(); }
-    toast('播放地址已复制');
-  } catch (_error) { input.focus(); input.select(); toast('请复制已选中的播放地址'); }
+    toast(t("Playback URL copied"));
+  } catch (_error) { input.focus(); input.select(); toast(t("Copy the selected playback URL")); }
 });
 
 async function refresh() {
@@ -713,6 +715,7 @@ async function refresh() {
   }
   const token = accessToken;
   const revision = statusRevision;
+  const language = getLanguage();
   $('access-submit').disabled = true;
   refreshBusy = true;
   try {
@@ -720,21 +723,28 @@ async function refresh() {
     if (response.status === 401) return;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const status = await response.json();
-    if (token !== accessToken || revision !== statusRevision) return;
+    if (token !== accessToken || revision !== statusRevision || language !== getLanguage()) return;
     updateStatus(status);
     $('access-panel').hidden = true;
     $('workspace').inert = false;
   } catch (_error) {
-    $('phase-text').textContent = '控制台连接中断';
+    setText($('phase-text'), t("Console disconnected"));
     $('phase').classList.remove('running');
-    $('status-message').textContent = '正在尝试重新连接本机服务，请确认 Footboy 仍在运行。';
+    setText($('status-message'), t("Reconnecting to the host. Check that Footboy is still running."));
     $('status-message').classList.add('warning');
   } finally {
     refreshBusy = false;
     $('access-submit').disabled = false;
-    if (accessToken) refreshTimer = setTimeout(refresh, token === accessToken ? 2000 : 0);
+    if (accessToken) refreshTimer = setTimeout(refresh, token === accessToken && language === getLanguage() && revision === statusRevision ? 2000 : 0);
   }
 }
+window.addEventListener('languagechange', () => {
+  statusRevision += 1;
+  $('toast').hidden = true;
+  if (currentStatus) updateStatus(currentStatus);
+  else drawRoi();
+  refresh();
+});
 if (!readAccessLink()) {
   try { accessToken = sessionStorage.getItem(accessStorageKey) || ''; }
   catch (_error) { /* Ask for the control link when storage is unavailable. */ }

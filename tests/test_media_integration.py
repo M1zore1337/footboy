@@ -723,6 +723,18 @@ def test_webui_playback_roi_adjustment_and_stop(tmp_path, media_server, viewport
             assert app.session.video.no_proxy and not app.session.bili.no_proxy
             initial_generation = app.session.muxer.generation
 
+            page.locator("#language").select_option("en")
+            expect(page.locator("#phase-text")).to_have_text("Live stream running")
+            playing_at_switch = page.evaluate("document.getElementById('player').currentTime")
+            wait_for_page(
+                page,
+                "start => document.getElementById('player').currentTime > start + 0.5",
+                arg=playing_at_switch,
+            )
+            assert app.session.muxer.generation == initial_generation
+            page.locator("#language").select_option("zh-CN")
+            expect(page.locator("#phase-text")).to_have_text("直播运行中")
+
             page.locator("#remeasure").click()
             expect(page.locator("#roi-empty")).to_be_hidden()
             page.locator("#flip").select_option("h")

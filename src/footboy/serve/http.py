@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from footboy.i18n import exception_message, localize, request_language, tr
 from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.sources.lines import validate_line_text
 
@@ -81,15 +82,19 @@ class ControlServer:
         )
         self._cleanup_thread.start()
         addresses = ["127.0.0.1", *_lan_ipv4_addresses()] if self.host == "0.0.0.0" else [self.host]
-        print(f"本次控制密钥：{self.access_token}")
-        print("控制页（仅将含密钥的链接交给可信操作者）：")
+        print(tr("Control token for this session: {0}", self.access_token))
+        print(tr("Console links (share links containing the token only with trusted operators):"))
         for address in addresses:
             print(f"  http://{address}:{self.port}/#token={self.access_token}")
-        print("HLS 播放地址（无需控制密钥）：")
+        print(tr("HLS playback URLs (no control token required):"))
         for address in addresses:
             print(f"  http://{address}:{self.port}/live.m3u8")
         if os.name == "nt":
-            print("若其他设备无法访问，请在 Windows 防火墙首次提示中允许专用网络访问。")
+            print(
+                tr(
+                    "If other devices cannot connect, allow private network access in Windows Firewall."
+                )
+            )
 
     def stop(self) -> None:
         self._cleanup_stop.set()
@@ -113,7 +118,10 @@ class ControlServer:
                 generation = health.get("generation") if health.get("running") else None
                 self._cleaner.collect(generation)
             except Exception as exc:
-                logger.warning("HLS 文件回收暂不可用（%s），将稍后重试", type(exc).__name__)
+                logger.warning(
+                    tr("HLS cleanup is temporarily unavailable (%s); will retry later"),
+                    type(exc).__name__,
+                )
             if self._cleanup_stop.wait(OUTPUT_CLEANUP_INTERVAL):
                 return
 
@@ -122,7 +130,7 @@ def _handler_factory(
     controller: Controller, hls_dir: Path, *, access_token: str
 ) -> type[BaseHTTPRequestHandler]:
     if not access_token:
-        raise ValueError("控制密钥不能为空")
+        raise ValueError(tr("The control token must not be empty"))
     static_dir = Path(__file__).with_name("static").resolve()
     index_path = static_dir / "index.html"
 
@@ -173,7 +181,10 @@ def _handler_factory(
                 label = path.rsplit("/", 1)[-1][:-4]
                 preview = getattr(controller, "preview", lambda _: None)(label)
                 if preview is None:
-                    self._send_json({"error": "尚无采样画面"}, status=HTTPStatus.NOT_FOUND)
+                    self._send_json(
+                        {"error": tr("No frame snapshot is available yet")},
+                        status=HTTPStatus.NOT_FOUND,
+                    )
                 else:
                     self._send_bytes(preview, "image/jpeg", no_store=True)
                 return
@@ -183,7 +194,10 @@ def _handler_factory(
                 version = parse_qs(urlsplit(self.path).query).get("v", [None])[0]
                 preview = getattr(controller, "ocr_image", lambda *_: None)(label, kind, version)
                 if preview is None:
-                    self._send_json({"error": "本次识别图像暂不可用"}, status=HTTPStatus.NOT_FOUND)
+                    self._send_json(
+                        {"error": tr("The OCR image is currently unavailable")},
+                        status=HTTPStatus.NOT_FOUND,
+                    )
                 else:
                     self._send_bytes(preview, "image/png", no_store=True)
                 return
@@ -210,7 +224,7 @@ def _handler_factory(
                 return
             if self.headers.get_content_type() != "application/json":
                 self._send_json(
-                    {"ok": False, "error": "请求必须使用 application/json"},
+                    {"ok": False, "error": tr("Requests must use application/json")},
                     status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
                 )
                 return
@@ -219,12 +233,12 @@ def _handler_factory(
                 if path == "/api/offset":
                     delta = body.get("delta_ms")
                     if isinstance(delta, bool) or not isinstance(delta, (int, float)):
-                        raise ValueError("delta_ms 必须是数字")
+                        raise ValueError(tr("delta_ms must be a number"))
                     if not math.isfinite(delta) or delta != int(delta):
-                        raise ValueError("delta_ms 必须是有限整数")
+                        raise ValueError(tr("delta_ms must be a finite integer"))
                     delta_int = int(delta)
                     if abs(delta_int) > 300_000:
-                        raise ValueError("单次调整不得超过 300 秒")
+                        raise ValueError(tr("A single adjustment must not exceed 300 seconds"))
                     controller.request_offset_delta(delta_int)
                 elif path == "/api/remeasure":
                     controller.request_remeasure()
@@ -245,7 +259,11 @@ def _handler_factory(
                         or not isinstance(identifier, int)
                         or identifier < 1
                     ):
-                        raise ValueError("线路 id 必须是正整数；null 取消自动选择")
+                        raise ValueError(
+                            tr(
+                                "Stream id must be a positive integer; use null to cancel automatic selection"
+                            )
+                        )
                     self._controller_action("request_select_source", identifier)
                 elif path == "/api/line":
                     self._controller_action(
@@ -255,15 +273,20 @@ def _handler_factory(
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
             except (ValueError, UnicodeError, KeyError, TypeError, OverflowError) as exc:
-                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._send_json(
+                    {"ok": False, "error": exception_message(exc)}, status=HTTPStatus.BAD_REQUEST
+                )
                 return
             except NotImplementedError as exc:
                 self._send_json(
-                    {"ok": False, "error": str(exc)}, status=HTTPStatus.METHOD_NOT_ALLOWED
+                    {"ok": False, "error": exception_message(exc)},
+                    status=HTTPStatus.METHOD_NOT_ALLOWED,
                 )
                 return
             except RuntimeError as exc:
-                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.CONFLICT)
+                self._send_json(
+                    {"ok": False, "error": exception_message(exc)}, status=HTTPStatus.CONFLICT
+                )
                 return
             self._send_json({"ok": True}, status=HTTPStatus.ACCEPTED)
 
@@ -276,7 +299,10 @@ def _handler_factory(
                 or self.headers.get("Sec-Fetch-Site") in {"cross-site", "same-site"}
             ):
                 self._send_json(
-                    {"ok": False, "error": "控制接口仅接受同源浏览器请求"},
+                    {
+                        "ok": False,
+                        "error": tr("The control API only accepts same-origin browser requests"),
+                    },
                     status=HTTPStatus.FORBIDDEN,
                 )
                 return False
@@ -287,7 +313,7 @@ def _handler_factory(
                 token.lstrip(" ").encode("utf-8"), access_token.encode("ascii")
             ):
                 self._send_json(
-                    {"ok": False, "error": "请使用本次启动的控制密钥"},
+                    {"ok": False, "error": tr("Use the control token printed at this startup")},
                     status=HTTPStatus.UNAUTHORIZED,
                 )
                 return False
@@ -296,7 +322,7 @@ def _handler_factory(
         def _controller_action(self, name: str, *args: Any) -> None:
             method = getattr(controller, name, None)
             if method is None:
-                raise NotImplementedError("此运行模式不支持该操作")
+                raise NotImplementedError(tr("This operation is not supported in the current mode"))
             method(*args)
 
         def _hls_candidate(self, request_path: str) -> Path | None:
@@ -386,23 +412,28 @@ def _handler_factory(
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError as exc:
-                raise ValueError("Content-Length 无效") from exc
+                raise ValueError(tr("Invalid Content-Length")) from exc
             if length < 0 or length > 64 * 1024:
-                raise ValueError("请求体过大")
+                raise ValueError(tr("Request body is too large"))
             raw = self.rfile.read(length) if length else b"{}"
 
             def invalid_constant(value: str) -> None:
-                raise ValueError(f"JSON 不能包含 {value}")
+                raise ValueError(tr("JSON must not contain {0}", value))
 
             value = json.loads(raw.decode("utf-8"), parse_constant=invalid_constant)
             if not isinstance(value, dict):
-                raise ValueError("请求体必须是 JSON 对象")
+                raise ValueError(tr("The request body must be a JSON object"))
             return value
 
         def _send_json(self, value: object, *, status: HTTPStatus = HTTPStatus.OK) -> None:
-            payload = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            language = request_language(self.headers.get("Accept-Language"))
+            payload = json.dumps(
+                localize(value, language), ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Language", language)
+            self.send_header("Vary", "Accept-Language")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             if status == HTTPStatus.UNAUTHORIZED:
@@ -452,17 +483,17 @@ def _byte_range(requested: str | None, length: int) -> tuple[int, int]:
         return 0, length - 1
     match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
     if not match or not (match[1] or match[2]) or length == 0:
-        raise ValueError("无效字节范围")
+        raise ValueError(tr("Invalid byte range"))
     if match[1]:
         start = int(match[1])
         end = min(int(match[2]), length - 1) if match[2] else length - 1
     else:
         suffix = int(match[2])
         if suffix == 0:
-            raise ValueError("无效字节范围")
+            raise ValueError(tr("Invalid byte range"))
         start, end = max(0, length - suffix), length - 1
     if start > end or start >= length:
-        raise ValueError("无效字节范围")
+        raise ValueError(tr("Invalid byte range"))
     return start, end
 
 

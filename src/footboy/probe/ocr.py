@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from footboy.environment import resolve_binary
+from footboy.i18n import exception_message, tr
 
 CLOCK_RE = re.compile(r"(?<![\d:：.])(\d{1,3})\s*[:：.]\s*(\d{2})(?![\d:：.])")
 FLIPS = ("none", "h", "v", "hv")
@@ -53,7 +54,7 @@ class ProbeConfig:
 
     def __post_init__(self) -> None:
         if len(self.roi) != 4 or not all(math.isfinite(v) for v in self.roi):
-            raise ValueError("ROI 必须包含四个有限数值")
+            raise ValueError(tr("ROI must contain four finite numbers"))
         x, y, width, height = self.roi
         if (
             x < 0
@@ -63,11 +64,11 @@ class ProbeConfig:
             or x + width > 1.000001
             or y + height > 1.000001
         ):
-            raise ValueError("ROI 必须位于画面内，坐标范围为 0..1")
+            raise ValueError(tr("ROI must fit within the frame, with coordinates between 0 and 1"))
         if self.flip not in FLIPS or not isinstance(self.inverted, bool):
-            raise ValueError("翻转或极性无效")
+            raise ValueError(tr("Invalid flip or polarity"))
         if self.style not in STYLES:
-            raise ValueError("OCR 预处理样式无效")
+            raise ValueError(tr("Invalid OCR preprocessing style"))
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ProbeConfig:
@@ -174,7 +175,7 @@ class _ProbeSession:
 
     def check(self) -> None:
         if self.stop_event is not None and self.stop_event.is_set():
-            raise OcrCancelled("测量已取消")
+            raise OcrCancelled(tr("Measurement cancelled"))
         _check_deadline(self.deadline)
 
     def emit(self, state: str, **details: Any) -> None:
@@ -206,7 +207,7 @@ class _ProbeSession:
             reading = _read_clock(frame, config, self.backend, deadline=deadline)
         except OcrError as exc:
             if self.stop_event is not None and self.stop_event.is_set():
-                raise OcrCancelled("测量已取消") from exc
+                raise OcrCancelled(tr("Measurement cancelled")) from exc
             raise
         self.check()  # A synchronous backend must not return a late success.
         self.durations.append(reading.seconds)
@@ -228,7 +229,7 @@ class TesseractBackend:
         try:
             import pytesseract  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
-            raise OcrError("未安装 pytesseract") from exc
+            raise OcrError(tr("pytesseract is not installed")) from exc
         # Each source already has its own OCR worker. OpenMP teams inside both
         # Tesseract processes can contend badly on small machines, especially
         # after OpenCV has initialized its pool. Keep explicit user tuning.
@@ -237,12 +238,14 @@ class TesseractBackend:
         try:
             pytesseract.get_tesseract_version()
         except Exception as exc:
-            raise OcrError("未找到 Tesseract 程序；请安装或指定 --tesseract-command") from exc
+            raise OcrError(
+                tr("Tesseract was not found; install it or set --tesseract-command")
+            ) from exc
         self._module = pytesseract
 
     def read(self, image: np.ndarray, *, raw_line: bool = False, timeout: float = 2.0) -> str:
         if timeout <= 0:
-            raise OcrTimeout("Tesseract 识别预算已用尽")
+            raise OcrTimeout(tr("Tesseract time budget exhausted"))
         try:
             return str(
                 self._module.image_to_string(
@@ -252,9 +255,11 @@ class TesseractBackend:
                 )
             )
         except RuntimeError as exc:
-            if "timeout" in str(exc).lower():
-                raise OcrTimeout("Tesseract 识别超时，请重试或缩小识别区域") from exc
-            raise OcrError(f"Tesseract 识别超时或失败: {exc}") from exc
+            if "timeout" in exception_message(exc).lower():
+                raise OcrTimeout(
+                    tr("Tesseract timed out; retry or select a smaller clock region")
+                ) from exc
+            raise OcrError(tr("Tesseract timed out or failed: {0}", exc)) from exc
 
 
 class RapidOcrBackend:
@@ -262,7 +267,7 @@ class RapidOcrBackend:
         try:
             from rapidocr_onnxruntime import RapidOCR  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
-            raise OcrError("未安装 rapidocr-onnxruntime") from exc
+            raise OcrError(tr("rapidocr-onnxruntime is not installed")) from exc
         self._engine = RapidOCR()
 
     def read(self, image: np.ndarray) -> str:
@@ -278,15 +283,15 @@ def make_backend(name: str = "auto", *, tesseract_command: str | None = None) ->
         try:
             return RapidOcrBackend()
         except Exception as exc:
-            errors.append(str(exc))
+            errors.append(exception_message(exc))
             if name == "rapidocr":
                 raise
     if name in {"auto", "tesseract"}:
         try:
             return TesseractBackend(tesseract_command)
         except OcrError as exc:
-            errors.append(str(exc))
-    raise OcrError("没有可用 OCR 后端；" + "；".join(errors))
+            errors.append(exception_message(exc))
+    raise OcrError(tr("No OCR backend is available; ") + tr("; ").join(errors))
 
 
 def parse_clock(text: str) -> int | None:
@@ -335,7 +340,7 @@ def preprocess(crop: np.ndarray, inverted: bool, style: str = "standard") -> np.
 
 def _check_deadline(deadline: float | None) -> None:
     if deadline is not None and time.monotonic() >= deadline:
-        raise OcrTimeout("自动识别超时，请重试或缩小识别区域")
+        raise OcrTimeout(tr("Automatic OCR timed out; retry or select a smaller clock region"))
 
 
 def _read_clock(
@@ -377,9 +382,9 @@ def probe_clock(
     on_progress: Callable[[OcrProgress], None] | None = None,
 ) -> ClockProbeResult:
     if len(frames) < 3:
-        raise OcrError("至少需要 3 个关键帧才能锁定比赛时钟")
+        raise OcrError(tr("At least 3 keyframes are required to lock onto the match clock"))
     if not math.isfinite(budget):
-        raise ValueError("OCR 预算必须是有限秒数")
+        raise ValueError(tr("The OCR time budget must be a finite number of seconds"))
     session = _ProbeSession(backend, len(frames), budget, stop_event, on_progress)
     try:
         session.check()
@@ -401,7 +406,7 @@ def probe_clock(
             if isinstance(exc, ManualSelectionRequired)
             else "error"
         )
-        session.emit(state, reason=str(exc))
+        session.emit(state, reason=exception_message(exc))
         raise
 
 
@@ -433,7 +438,11 @@ def _probe_clock(
             result = _validate_series(samples, config)
             if result:
                 return result
-            session.emit("rejected", config=config, reason="无法形成连续三帧走表")
+            session.emit(
+                "rejected",
+                config=config,
+                reason=tr("Could not confirm a running clock across three consecutive frames"),
+            )
 
     stopped = 0
     first_readings: dict[ProbeConfig, int] = {}
@@ -460,15 +469,27 @@ def _probe_clock(
                 result = _validate_series(samples, config)
             except StoppedClock:
                 stopped += 1
-                session.emit("rejected", config=config, reason="连续三帧停表")
+                session.emit(
+                    "rejected",
+                    config=config,
+                    reason=tr("Clock stopped across three consecutive frames"),
+                )
                 continue
             if result:
                 return result
-            session.emit("rejected", config=config, reason="无法形成连续三帧走表")
+            session.emit(
+                "rejected",
+                config=config,
+                reason=tr("Could not confirm a running clock across three consecutive frames"),
+            )
     if stopped:
-        raise StoppedClock("候选比赛时钟连续 3 帧不动，本轮视为停表")
+        raise StoppedClock(
+            tr("Candidate clock unchanged across 3 frames; treating this round as a stopped clock")
+        )
     if not allow_manual:
-        raise ManualSelectionRequired("自动 OCR 未锁定，请在网页框选比赛时钟")
+        raise ManualSelectionRequired(
+            tr("Automatic OCR could not lock on; select the match clock in the web console")
+        )
     session.check()
     manual = _manual_config(frames[0][1], backend)
     # Explicit interactive selection can take longer than the automatic search
@@ -477,7 +498,7 @@ def _probe_clock(
     session.phase = "manual"
     result = _validate_series(_read_series(frames, manual, backend, session=session), manual)
     if not result:
-        raise OcrError("手动框选区域仍无法连续识别比赛时钟")
+        raise OcrError(tr("Could not consistently read the match clock in the selected region"))
     return result
 
 
@@ -847,7 +868,11 @@ def _validate_series(
         if current.clock == previous.clock and current.pts > previous.pts:
             static_run += 1
             if static_run >= 3:
-                raise StoppedClock("比赛时钟连续 3 帧不动，本轮视为停表")
+                raise StoppedClock(
+                    tr(
+                        "Match clock unchanged across 3 frames; treating this round as a stopped clock"
+                    )
+                )
         else:
             static_run = 1
         delta_error = abs((current.clock - previous.clock) - (current.pts - previous.pts))
@@ -891,13 +916,15 @@ def _manual_config(frame: np.ndarray, backend: OcrBackend) -> ProbeConfig:
     cv2.imshow("Footboy flips (choose 1-4 in terminal)", montage)
     cv2.waitKey(1)
     try:
-        choice = input("OCR 自动锁定失败，请按画面选择翻转方向 1-4: ").strip()
+        choice = input(
+            tr("Automatic OCR could not lock on; choose the frame orientation (1–4): ")
+        ).strip()
         index = int(choice) - 1
         if index not in range(4):
             raise ValueError
     except ValueError as exc:
         cv2.destroyAllWindows()
-        raise OcrError("翻转方向选择无效") from exc
+        raise OcrError(tr("Invalid orientation selection")) from exc
     cv2.destroyAllWindows()
     mode = FLIPS[index]
     transformed = flip_frame(frame, mode)
@@ -906,7 +933,7 @@ def _manual_config(frame: np.ndarray, backend: OcrBackend) -> ProbeConfig:
     )
     cv2.destroyAllWindows()
     if width <= 0 or height <= 0:
-        raise OcrError("没有选择 OCR 区域")
+        raise OcrError(tr("No OCR region selected"))
     frame_height, frame_width = transformed.shape[:2]
     roi = (x / frame_width, y / frame_height, width / frame_width, height / frame_height)
     for style in STYLES:
@@ -914,4 +941,4 @@ def _manual_config(frame: np.ndarray, backend: OcrBackend) -> ProbeConfig:
             config = ProbeConfig(roi=roi, flip=mode, inverted=inverted, style=style)
             if read_with_config(frame, config, backend) is not None:
                 return config
-    raise OcrError("框选区域未识别到 mm:ss")
+    raise OcrError(tr("No mm:ss clock found in the selected region"))

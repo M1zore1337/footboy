@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from footboy.cli import _check_binary
+from footboy.i18n import ArgumentParser, configure_cli_language, tr
 from footboy.mux.ffmpeg import FfmpegMuxer
 from footboy.serve.http import ControlServer
 from footboy.sources.media_probe import ffprobe_source
@@ -23,7 +24,7 @@ class P0Controller:
         self.video = video
         self.bili = bili
         self.offset = offset
-        self.message = "P0 手工混流运行中"
+        self.message = tr("P0 manual muxing is running")
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.started_at = time.time()
 
@@ -36,37 +37,74 @@ class P0Controller:
             "last_verified_at": None,
             "message": self.message,
             "ffmpeg": self.muxer.health.public_dict(),
-            "estimated_latency_seconds": "6-10 + 较慢源自身延迟",
+            "estimated_latency_seconds": tr("6–10 seconds + slower source latency"),
         }
 
     def request_offset_delta(self, delta_ms: int) -> None:
         self.events.put(("offset", delta_ms))
 
     def request_remeasure(self) -> None:
-        self.message = "P0 不含自动测量；请使用偏移按钮"
+        self.message = tr("P0 has no automatic measurement; use the offset buttons")
 
     def request_resniff(self) -> None:
-        self.message = "P0 使用手抄直链；请重启命令更换线路"
+        self.message = tr("P0 uses direct media URLs; restart the command to change streams")
 
 
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="P0：用两条手抄直链验证双直播输入、偏移和 HLS。")
-    result.add_argument("--video-url", required=True)
-    result.add_argument("--bili-url", required=True)
-    result.add_argument("--offset", required=True, type=float, help="D 秒；正值推后 B 站音频")
-    result.add_argument("--video-header", action="append", default=[], metavar="NAME:VALUE")
-    result.add_argument("--video-no-proxy", action="store_true", help="比赛媒体流直连，不使用代理")
-    result.add_argument("--bili-header", action="append", default=[], metavar="NAME:VALUE")
-    result.add_argument("--output-dir", type=Path, default=Path("hls_out"))
-    result.add_argument("--host", default="0.0.0.0")
-    result.add_argument("--port", type=int, default=8080)
-    result.add_argument("--ffmpeg", default="ffmpeg")
-    result.add_argument("--ffprobe", default="ffprobe")
+def parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
+    configure_cli_language(argv)
+    result = ArgumentParser(
+        prog="footboy-p0",
+        allow_abbrev=False,
+        description=tr("P0: validate two live inputs, offset, and HLS using direct media URLs."),
+    )
+    result.add_argument("--video-url", required=True, help=tr("Direct match media URL"))
+    result.add_argument("--bili-url", required=True, help=tr("Direct commentary media URL"))
+    result.add_argument(
+        "--offset",
+        required=True,
+        type=float,
+        help=tr("Offset D in seconds; positive values delay Bilibili audio"),
+    )
+    result.add_argument(
+        "--video-header",
+        action="append",
+        default=[],
+        metavar="NAME:VALUE",
+        help=tr("Match request header; repeat for multiple headers"),
+    )
+    result.add_argument(
+        "--video-no-proxy",
+        action="store_true",
+        help=tr("Bypass proxies for the match media stream"),
+    )
+    result.add_argument(
+        "--bili-header",
+        action="append",
+        default=[],
+        metavar="NAME:VALUE",
+        help=tr("Commentary request header; repeat for multiple headers"),
+    )
+    result.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("hls_out"),
+        help=tr("HLS output directory (default: hls_out)"),
+    )
+    result.add_argument("--host", default="0.0.0.0", help=tr("Listen address (default: 0.0.0.0)"))
+    result.add_argument("--port", type=int, default=8080, help=tr("Listen port (default: 8080)"))
+    result.add_argument(
+        "--ffmpeg", default="ffmpeg", help=tr("Executable path; by default search PATH, then tools")
+    )
+    result.add_argument(
+        "--ffprobe",
+        default="ffprobe",
+        help=tr("Executable path; by default search PATH, then tools"),
+    )
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    args = parser(argv).parse_args(argv)
     try:
         _check_binary(args.ffmpeg, minimum_major=6)
         _check_binary(args.ffprobe)
@@ -80,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         ffprobe_source(video, ffprobe=args.ffprobe)
         ffprobe_source(bili, ffprobe=args.ffprobe)
     except Exception as exc:
-        print(f"P0 输入验收失败: {exc}", file=sys.stderr)
+        print(tr("P0 input validation failed: {0}", exc), file=sys.stderr)
         return 2
     muxer = FfmpegMuxer(args.output_dir, ffmpeg=args.ffmpeg)
     controller = P0Controller(muxer, video, bili, args.offset)
@@ -107,18 +145,18 @@ def main(argv: list[str] | None = None) -> int:
                 if not isinstance(payload, (int, float)) or isinstance(payload, bool):
                     continue
                 controller.offset = round(controller.offset + int(payload) / 1000, 3)
-                controller.message = "等待 1.5 秒去抖后应用手动偏移"
+                controller.message = tr("Applying the manual offset after a 1.5-second debounce")
                 deadline = time.monotonic() + 1.5
             if deadline is not None and time.monotonic() >= deadline:
                 muxer.restart(video, bili, controller.offset)
-                controller.message = f"已应用 D={controller.offset:.3f}s"
+                controller.message = tr("Applied D={0:.3f}s", controller.offset)
                 deadline = None
             code = muxer.poll()
             if code is not None:
-                print(f"ffmpeg 提前退出，code={code}", file=sys.stderr)
+                print(tr("FFmpeg exited early, code={0}", code), file=sys.stderr)
                 return 1
     finally:
-        print("正在向 ffmpeg 写入 q 并刷新播放列表……")
+        print(tr("Sending q to FFmpeg and flushing the playlist…"))
         muxer.stop()
         server.stop()
     return 0
@@ -129,7 +167,7 @@ def _headers(values: list[str]) -> dict[str, str]:
     for value in values:
         name, separator, content = value.partition(":")
         if not separator or not name.strip() or "\r" in content or "\n" in content:
-            raise ValueError(f"无效请求头: {value!r}")
+            raise ValueError(tr("Invalid header: {0!r}", value))
         result[name.strip()] = content.strip()
     return result
 

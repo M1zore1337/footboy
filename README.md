@@ -1,5 +1,7 @@
 # Footboy（足小子）
 
+**简体中文** | [English](README.en.md)
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/M1zore1337/footboy/actions/workflows/ci.yml/badge.svg)](https://github.com/M1zore1337/footboy/actions/workflows/ci.yml)
@@ -9,6 +11,15 @@
 把看球网站的比赛画面与 B 站直播间的解说音源同步组合，输出局域网 HLS 串流。
 
 ![Footboy 控制台](docs/images/webui-1440.png)
+
+<details>
+<summary>查看手机端界面（390px）</summary>
+
+<img src="docs/images/webui-390.png" alt="Footboy 手机端控制台" width="390">
+
+</details>
+
+截图展示默认中文的未连接界面。
 
 > **项目初衷**：平时看球习惯看第三方看球网站的画面，同时听 B 站主播解说；但两路直播往往有数秒甚至几十秒的时延差，手动暂停对齐既麻烦又容易再次漂移。Footboy 通过 OCR 识别两路画面的比赛走表，自动计算时间轴偏差并混流，输出局域网 HLS 串流供手机、电视或平板观看。
 >
@@ -22,6 +33,7 @@
 - **独立音量调节**：两路分别控制音量和静音，可单独听主播解说，也可混入原比赛现场声。
 - **线路切换**：比赛源支持按页面文字选择线路，新源探测通过后平滑接替播放。
 - **多端同看**：开箱即用输出局域网 HLS，支持手机 Safari、电视盒子与 VLC 等各类播放器。
+- **中英文切换**：默认中文；Web 控制台右上角可切换 English，命令行使用 `--lang en`，两者语言选择互不影响。
 
 ```mermaid
 flowchart TD
@@ -58,6 +70,7 @@ flowchart TD
 ## 目录
 
 - [快速开始](#快速开始)
+- [语言切换](#语言切换)
 - [外部依赖准备](#外部依赖准备)
 - [连接与观看指南](#连接与观看指南)
 - [跨设备与局域网观看](#跨设备与局域网观看)
@@ -127,6 +140,15 @@ Footboy 控制台已就绪：
 > - **Windows 执行权限**：若 PowerShell 提示禁止运行脚本，可使用管理员权限运行 `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`，或直接执行 `.\.venv\Scripts\footboy.exe`。
 
 ---
+
+## 语言切换
+
+项目默认使用中文，并提供完整的 [英文使用文档](README.en.md)。
+
+- **Web UI**：在右上角语言选择器切换为 **English**。选择保存在当前浏览器中；切换不会重启直播，也不会清空已输入的地址或未保存的 ROI 选区。不同浏览器可以分别使用中文和英文。
+- **CLI**：使用 `footboy --lang en` 或 `footboy --lang en --help`；`footboy-p0` 与 `python -m footboy.tools.ocr_diagnose` 同样支持 `--lang en`。使用 `--lang zh-CN` 可显式选择中文。
+- **环境变量**：设置 `FOOTBOY_LANG=en` 可更改 CLI 的默认语言，命令行 `--lang` 优先。网页语言由浏览器单独选择。
+- **原始内容**：直播网站的线路名称、地址、OCR 原始识别文字保持原样；指定线路时仍需输入源页面上显示的实际名称。
 
 ## 外部依赖准备
 
@@ -283,6 +305,7 @@ footboy \
 
 | 常用参数 | 默认值 | 说明 |
 | :--- | :--- | :--- |
+| `--lang {zh-CN,en}` | `zh-CN` | CLI 输出语言；优先于 `FOOTBOY_LANG` 环境变量 |
 | `--video-page URL` | - | 比赛直播页面 URL |
 | `--bili-room URL` | - | B 站直播间 URL |
 | `--video-line "名称"` | - | 按页面文字自动选线（例如：`高清直播⑤`；支持圈号数字） |
@@ -311,6 +334,8 @@ footboy \
 <summary><b>展开查看：RESTful 控制接口定义（供二次开发或脚本自动化）</b></summary>
 
 所有 `/api/*` 请求（包含状态、截图）均需在请求头携带 `Authorization: Bearer <本次控制密钥>`。POST 请求必须声明 `Content-Type: application/json`。
+
+可用 `Accept-Language: en` 获取英文状态和错误提示，或用 `Accept-Language: zh-CN` 获取中文；未指定时默认中文。响应通过 `Content-Language` 标明语言，接口字段名、状态代码和源数据不变。
 
 | 接口端点 | 方法 | 说明 |
 | :--- | :--- | :--- |
@@ -368,6 +393,7 @@ git config core.hooksPath .githooks                  # 启用内置 Git Commit �
 ruff check src tests                                 # 代码静态规范审查
 ruff format --check src tests                        # 格式规范审查
 node --check src/footboy/serve/static/app.js         # 前端脚本语法校验
+node --check src/footboy/serve/static/i18n.js        # 语言表与切换脚本校验
 python -m pytest -ra -m "not slow"                   # 快速单元测试（秒级回归）
 python -m pytest -ra -m "slow and not browser"       # 媒体处理与实际 OCR 测试
 python -m build                                      # 打包 Wheel 与源码分发包

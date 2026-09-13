@@ -13,6 +13,7 @@ from typing import TextIO
 
 from footboy.diagnostics import redact_diagnostic
 from footboy.environment import resolve_binary
+from footboy.i18n import tr
 from footboy.probe.timeline import sample_audio_start
 from footboy.sources.models import DIRECT_HTTP_PROXY, Source
 
@@ -32,12 +33,12 @@ class AudioMix:
 
     def __post_init__(self) -> None:
         if not isinstance(self.original_enabled, bool):
-            raise ValueError("原直播声音开关必须为布尔值")
+            raise ValueError(tr("The original audio toggle must be a boolean"))
         for value in (self.original_volume, self.commentary_volume):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError("音量必须是 0 到 1 的数值")
+                raise ValueError(tr("Volume must be a number between 0 and 1"))
             if not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError("音量必须是 0 到 1 的数值")
+                raise ValueError(tr("Volume must be a number between 0 and 1"))
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -88,7 +89,7 @@ def build_ffmpeg_command(
     audio_origin: float | None = None,
 ) -> list[str]:
     if not math.isfinite(offset):
-        raise ValueError("偏移必须是有限数值")
+        raise ValueError(tr("Offset must be a finite number"))
     output = Path(output_dir).resolve()
     hevc = (video.video_codec or "").lower() in {"hevc", "h265"}
     segment_extension = "m4s" if hevc else "ts"
@@ -112,9 +113,9 @@ def build_ffmpeg_command(
     command.extend(["-map", "0:v:0", "-c:v", "copy"])
     if audio.original_enabled:
         if not video.has_audio:
-            raise ValueError("当前原直播不含音轨")
+            raise ValueError(tr("The match stream has no audio track"))
         if audio_origin is None or not math.isfinite(audio_origin):
-            raise ValueError("混音需要有效的原直播音频起始 PTS")
+            raise ValueError(tr("Mixing requires a valid starting PTS for the original audio"))
         # amix combines samples, not timestamps. Give both inputs the same
         # source-PTS origin before mixing, including silence or trimming.
         # first_pts is interpreted at the input sample rate. Normalize that
@@ -239,7 +240,7 @@ class FfmpegMuxer:
         with self._lock:
             self._check_cancelled()
             if self._process and self._process.poll() is None:
-                raise MuxError("ffmpeg 已经在运行")
+                raise MuxError(tr("FFmpeg is already running"))
             self.output_dir.mkdir(parents=True, exist_ok=True)
             if fresh:
                 self._clear_generated_outputs()
@@ -274,7 +275,7 @@ class FfmpegMuxer:
                     creationflags=flags,
                 )
             except OSError as exc:
-                raise MuxError(f"无法启动 ffmpeg: {exc}") from exc
+                raise MuxError(tr("Cannot start FFmpeg: {0}", exc)) from exc
             self.health = MuxHealth(
                 running=True,
                 pid=self._process.pid,
@@ -293,7 +294,7 @@ class FfmpegMuxer:
 
     def _check_cancelled(self) -> None:
         if self._stop_event is not None and self._stop_event.is_set():
-            raise MuxError("混流启动已取消")
+            raise MuxError(tr("Muxer startup cancelled"))
 
     def stop(self, timeout: float = 5.0) -> None:
         with self._lock:

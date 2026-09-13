@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from footboy.i18n import tr
 from footboy.sources.models import Source
 
 
@@ -28,22 +29,24 @@ class AudioOffsetResult:
 
 def capture_pcm(source: Source, *, duration: float = 90.0, sample_rate: int = 8000) -> PcmCapture:
     if not 60 <= duration <= 120:
-        raise ValueError("音频相关采集时长必须在 60 到 120 秒之间")
+        raise ValueError(tr("Audio correlation capture must last between 60 and 120 seconds"))
     try:
         import av
     except ImportError as exc:
-        raise AudioCorrelationError("未安装 PyAV") from exc
+        raise AudioCorrelationError(tr("PyAV is not installed")) from exc
     try:
         container = av.open(source.url, options=source.pyav_options())
     except Exception as exc:
-        raise AudioCorrelationError(f"无法打开 {source.domain} 音频流: {exc}") from exc
+        raise AudioCorrelationError(
+            tr("Cannot open the audio stream from {0}: {1}", source.domain, exc)
+        ) from exc
     arrays: list[np.ndarray] = []
     first_pts: float | None = None
     collected = 0
     target = round(duration * sample_rate)
     try:
         if not container.streams.audio:
-            raise AudioCorrelationError(f"{source.domain} 不含音频")
+            raise AudioCorrelationError(tr("{0} has no audio", source.domain))
         stream = container.streams.audio[0]
         resampler = av.AudioResampler(format="s16", layout="mono", rate=sample_rate)
         for frame in container.decode(stream):
@@ -59,11 +62,13 @@ def capture_pcm(source: Source, *, duration: float = 90.0, sample_rate: int = 80
     except AudioCorrelationError:
         raise
     except Exception as exc:
-        raise AudioCorrelationError(f"采集 {source.domain} PCM 失败: {exc}") from exc
+        raise AudioCorrelationError(
+            tr("Failed to capture PCM from {0}: {1}", source.domain, exc)
+        ) from exc
     finally:
         container.close()
     if first_pts is None or collected < sample_rate * 10:
-        raise AudioCorrelationError("音频样本太少，无法相关")
+        raise AudioCorrelationError(tr("Too few audio samples for correlation"))
     return PcmCapture(first_pts, np.concatenate(arrays)[:target], sample_rate)
 
 
@@ -75,18 +80,20 @@ def correlate_offset(
     min_peak_ratio: float = 1.25,
 ) -> AudioOffsetResult:
     if video.sample_rate != bili.sample_rate:
-        raise ValueError("两路 PCM 采样率必须一致")
+        raise ValueError(tr("Both PCM streams must use the same sample rate"))
     try:
         from scipy.signal import butter, sosfilt  # pyright: ignore[reportMissingImports]
     except ImportError as exc:
-        raise AudioCorrelationError("音频相关后端需要 scipy") from exc
+        raise AudioCorrelationError(tr("Audio correlation requires scipy")) from exc
     sample_rate = video.sample_rate
     sos = butter(6, [300, 3000], btype="bandpass", fs=sample_rate, output="sos")
     first = sosfilt(sos, video.samples)
     second = sosfilt(sos, bili.samples)
     lag_samples, ratio = _gcc_phat(first, second, round(max_lag * sample_rate))
     if not math.isfinite(ratio) or ratio < min_peak_ratio:
-        raise AudioCorrelationError(f"互相关峰值不唯一（峰/次峰={ratio:.2f}）")
+        raise AudioCorrelationError(
+            tr("Ambiguous cross-correlation peak (peak/runner-up={0:.2f})", ratio)
+        )
     lag = lag_samples / sample_rate
     return AudioOffsetResult(
         offset=(video.first_pts - bili.first_pts) + lag,

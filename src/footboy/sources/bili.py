@@ -10,6 +10,8 @@ from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any
 
+from footboy.i18n import tr
+
 from .models import Source
 
 API_URL = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
@@ -33,18 +35,20 @@ class BiliResolver:
         try:
             return self._resolve_ytdlp(room_url)
         except Exception as exc:  # yt-dlp extractors fail in many site-specific ways
-            errors.append(f"yt-dlp: {exc}")
+            errors.append(tr("yt-dlp: {0}", exc))
         try:
             return self._resolve_api(room_url)
         except Exception as exc:
-            errors.append(f"B站 API: {exc}")
-        raise BiliResolveError("无法解析 B 站直播流；" + "；".join(errors))
+            errors.append(tr("Bilibili API: {0}", exc))
+        raise BiliResolveError(
+            tr("Cannot resolve the Bilibili live stream; ") + tr("; ").join(errors)
+        )
 
     def _resolve_ytdlp(self, room_url: str) -> Source:
         try:
             import yt_dlp
         except ImportError as exc:
-            raise BiliResolveError("未安装 yt-dlp") from exc
+            raise BiliResolveError(tr("yt-dlp is not installed")) from exc
 
         options: dict[str, Any] = {
             "quiet": True,
@@ -60,9 +64,9 @@ class BiliResolver:
         with yt_dlp.YoutubeDL(options) as downloader:  # pyright: ignore[reportArgumentType]
             info = downloader.extract_info(room_url, download=False)
         if not isinstance(info, dict):
-            raise BiliResolveError("yt-dlp 未返回直播信息")
+            raise BiliResolveError(tr("yt-dlp returned no live stream information"))
         if info.get("is_live") is not True and info.get("live_status") != "is_live":
-            raise BiliResolveError("未开播或轮播")
+            raise BiliResolveError(tr("The room is offline or playing a rerun"))
 
         formats = [item for item in (info.get("formats") or []) if isinstance(item, dict)]
         if info.get("url"):
@@ -81,7 +85,7 @@ class BiliResolver:
                 continue
             candidates.append(item)
         if not candidates:
-            raise BiliResolveError("yt-dlp 未找到不高于 1080p 的 FLV 直播格式")
+            raise BiliResolveError(tr("yt-dlp found no live FLV format at 1080p or below"))
         chosen = max(
             candidates,
             key=lambda item: (
@@ -132,12 +136,12 @@ class BiliResolver:
             with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (OSError, urllib.error.URLError, ValueError) as exc:
-            raise BiliResolveError(f"请求失败: {exc}") from exc
+            raise BiliResolveError(tr("Request failed: {0}", exc)) from exc
         if payload.get("code") != 0:
             raise BiliResolveError(str(payload.get("message") or payload.get("code")))
         data = payload.get("data") or {}
         if data.get("live_status", (data.get("room_info") or {}).get("live_status")) != 1:
-            raise BiliResolveError("未开播或轮播")
+            raise BiliResolveError(tr("The room is offline or playing a rerun"))
 
         playurl = (data.get("playurl_info") or {}).get("playurl") or {}
         streams = playurl.get("stream") or []
@@ -155,12 +159,12 @@ class BiliResolver:
                     if codec.get("base_url") and codec.get("url_info"):
                         candidates.append((qn, avc_first, codec, fmt))
         if not candidates:
-            raise BiliResolveError("API 未返回可用 FLV 地址")
+            raise BiliResolveError(tr("The API returned no usable FLV URL"))
         _, _, codec, _ = max(candidates, key=lambda row: (row[0], row[1]))
         url_info = codec["url_info"][0]
         direct_url = f"{url_info.get('host', '')}{codec['base_url']}{url_info.get('extra', '')}"
         if not direct_url.startswith(("http://", "https://")):
-            raise BiliResolveError("API 返回了无效直播地址")
+            raise BiliResolveError(tr("The API returned an invalid stream URL"))
         return Source(
             url=direct_url,
             headers=headers,
@@ -177,7 +181,7 @@ class BiliResolver:
         try:
             jar.load(ignore_discard=True, ignore_expires=False)
         except (OSError, ValueError) as exc:
-            raise BiliResolveError(f"无法读取 Netscape cookies 文件: {exc}") from exc
+            raise BiliResolveError(tr("Cannot read the Netscape cookies file: {0}", exc)) from exc
         return jar
 
     def _cookies_as_dicts(self) -> list[dict[str, Any]]:
@@ -197,9 +201,9 @@ def _room_id(room_url: str) -> str:
     parts = urllib.parse.urlsplit(room_url)
     match = re.fullmatch(r"/(?:blanc/)?(\d+)/?", parts.path)
     if parts.scheme not in {"http", "https"} or parts.hostname != "live.bilibili.com":
-        raise BiliResolveError("请输入 live.bilibili.com 的直播间 URL")
+        raise BiliResolveError(tr("Enter a live.bilibili.com room URL"))
     if not match:
-        raise BiliResolveError("B站直播间 URL 格式不正确")
+        raise BiliResolveError(tr("Invalid Bilibili room URL"))
     return match.group(1)
 
 

@@ -5,6 +5,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from footboy.i18n import tr
 from footboy.sources.models import Source
 
 
@@ -17,15 +18,17 @@ def _sample_packet(source: Source, kind: str, stop_event: threading.Event) -> tu
 
     started = time.monotonic()
     if stop_event.is_set():
-        raise TimelineProbeError("时间轴采样已取消")
+        raise TimelineProbeError(tr("Timeline sampling cancelled"))
     try:
         with av.open(source.url, options=source.pyav_options(), timeout=(8.0, 5.0)) as container:
             streams = container.streams.video if kind == "video" else container.streams.audio
             if not streams:
-                raise TimelineProbeError("时间轴采样缺少所需媒体轨道")
+                raise TimelineProbeError(
+                    tr("Required media tracks are missing for timeline sampling")
+                )
             for packet in container.demux(streams[0]):
                 if stop_event.is_set() or time.monotonic() - started > 15:
-                    raise TimelineProbeError("时间轴采样已取消或超时")
+                    raise TimelineProbeError(tr("Timeline sampling cancelled or timed out"))
                 if packet.size and packet.pts is not None and packet.time_base is not None:
                     pts = float(packet.pts * packet.time_base)
                     if math.isfinite(pts):
@@ -33,8 +36,8 @@ def _sample_packet(source: Source, kind: str, stop_event: threading.Event) -> tu
                         # the live edges is only an initial timeline estimate.
                         return pts, started
     except (OSError, ValueError) as exc:
-        raise TimelineProbeError(f"无法读取源时间轴：{exc}") from exc
-    raise TimelineProbeError("时间轴采样没有有效 PTS")
+        raise TimelineProbeError(tr("Cannot read the source timeline: {0}", exc)) from exc
+    raise TimelineProbeError(tr("Timeline sampling returned no valid PTS"))
 
 
 def sample_audio_start(source: Source, *, stop_event: threading.Event | None = None) -> float:

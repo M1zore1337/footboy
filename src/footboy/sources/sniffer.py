@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+from footboy.i18n import tr
+
 from .lines import LINE_SELECTOR, is_line_label, normalize_line_text, validate_line_text
 from .media_probe import MediaProbeError, ffprobe_source
 from .models import Source
@@ -119,13 +121,15 @@ class StreamSniffer:
         auto_select: bool = True,
     ) -> Source:
         if self._abort.is_set():
-            raise SniffError("嗅探已取消")
+            raise SniffError(tr("Stream discovery cancelled"))
         try:
             from playwright.sync_api import Error as PlaywrightError
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise SniffError(
-                "未安装 Playwright；请先安装依赖并运行 playwright install chromium"
+                tr(
+                    "Playwright is not installed; install the dependencies and run playwright install chromium"
+                )
             ) from exc
 
         self._candidates.clear()
@@ -140,7 +144,7 @@ class StreamSniffer:
         self._pending_line = validate_line_text(preferred_line_text, optional=True)
         self._auto_select = auto_select
         self._generation += 1
-        self.message = "正在查找页面线路"
+        self.message = tr("Looking for streams on the page")
         self._started = time.monotonic()
         self.running = True
         self._stop_keyboard.clear()
@@ -182,10 +186,19 @@ class StreamSniffer:
                         )
                         if response is not None and response.status >= 400:
                             raise SniffError(
-                                f"比赛页面拒绝访问（HTTP {response.status}），无法获取线路列表"
+                                tr(
+                                    "The match page denied access (HTTP {0}); cannot list streams",
+                                    response.status,
+                                )
                             )
                     except PlaywrightError as exc:
-                        print(f"页面加载未完全结束，将继续嗅探: {exc}", file=sys.stderr)
+                        print(
+                            tr(
+                                "The page did not finish loading; continuing stream discovery: {0}",
+                                exc,
+                            ),
+                            file=sys.stderr,
+                        )
                     return self._selection_loop()
                 finally:
                     browser.close()
@@ -202,13 +215,13 @@ class StreamSniffer:
 
     def select(self, identifier: int | None) -> None:
         if not self.running:
-            raise ValueError("当前没有正在进行的嗅探")
+            raise ValueError(tr("No stream discovery is in progress"))
         self._commands.put(str(identifier) if identifier is not None else "c")
 
     def select_line(self, text: str) -> None:
         text = validate_line_text(text)
         if not self.running:
-            raise ValueError("当前没有正在进行的嗅探")
+            raise ValueError(tr("No stream discovery is in progress"))
         assert text is not None
         with self._lock:
             self._pending_line = text  # Also invalidate a probe already running on another line.
@@ -260,7 +273,9 @@ class StreamSniffer:
                 return playwright.chromium.launch(**kwargs)
             except error_type as exc:
                 failures.append(f"{channel or 'chromium'}: {exc}")
-        raise SniffError("Chrome、Edge 和 Playwright Chromium 均无法启动：" + "；".join(failures))
+        raise SniffError(
+            tr("Could not start Chrome, Edge, or Playwright Chromium: ") + tr("; ").join(failures)
+        )
 
     @staticmethod
     def _close_popup(page: Any, main_page: Any) -> None:
@@ -303,7 +318,7 @@ class StreamSniffer:
             self._selected_line = text
             self._pending_line = None
             self._auto_select = True
-            self.message = f"正在获取线路：{text}"
+            self.message = tr("Fetching stream: {0}", text)
 
     def _on_line_click(self, _source: Any, text: str) -> None:
         if is_line_label(text) or (
@@ -328,7 +343,9 @@ class StreamSniffer:
                             return True
                 except Exception:
                     self._pending_line = text
-        self.message = f"未找到或无法点击线路“{text}”，请在页面或控制台重新选择"
+        self.message = tr(
+            'Could not find or click stream "{0}"; choose another in the page or console', text
+        )
         return False
 
     def _on_response(self, response: Any) -> None:
@@ -463,13 +480,13 @@ class StreamSniffer:
                     response = self._context.request.get(url, headers=headers, timeout=5_000)
                     try:
                         if not 200 <= response.status < 300:
-                            raise ValueError("播放列表不可用")
+                            raise ValueError(tr("Playlist unavailable"))
                         body = response.body().decode("utf-8", errors="replace")
                         url = response.url
                     finally:
                         response.dispose()
                     if not _live_playlist(body):
-                        raise ValueError("不是直播播放列表")
+                        raise ValueError(tr("Not a live playlist"))
                     child = _first_variant(url, body)
                     if child:
                         url = child
@@ -477,9 +494,11 @@ class StreamSniffer:
                     segments = _playlist_segments(url, body)
                     break
                 if not segments:
-                    raise ValueError("直播播放列表没有分片")
+                    raise ValueError(tr("The live playlist has no segments"))
             except Exception:
-                self.message = "浏览器阻止了媒体请求，直播播放列表验收失败，请重新选线路"
+                self.message = tr(
+                    "The browser blocked the media request and playlist validation failed; choose another stream"
+                )
                 return
         with self._lock:
             if generation != self._generation or self._pending_line:
@@ -498,7 +517,7 @@ class StreamSniffer:
                 segment_duration=_playlist_segment_duration(body) if kind == "hls" else 2.0,
             )
             self._next_identifier += 1
-            self.message = "已获取浏览器拦截的媒体请求，等待 ffprobe 验收"
+            self.message = tr("Captured the blocked media request; waiting for ffprobe validation")
 
     def _last_click_text(self) -> str | None:
         if self._page is None:
@@ -515,7 +534,7 @@ class StreamSniffer:
         last_discovery = 0.0
         while time.monotonic() - self._started < self.timeout:
             if self._abort.is_set():
-                raise SniffError("嗅探已取消")
+                raise SniffError(tr("Stream discovery cancelled"))
             self._page.wait_for_timeout(250)
             now = time.monotonic()
             try:
@@ -541,7 +560,7 @@ class StreamSniffer:
                 for candidate in ranked[:1]:
                     candidate.cancelled_until = now + 30
                     candidate.stable_since = None
-                print("已取消当前自动选择，继续嗅探。")
+                print(tr("Automatic selection cancelled; continuing stream discovery."))
             chosen = None
             if command in {"", "enter"} and ranked:
                 chosen = ranked[0]
@@ -553,14 +572,20 @@ class StreamSniffer:
                     chosen = best
             if chosen is not None:
                 try:
-                    self.message = "正在用 ffprobe 验收所选线路"
+                    self.message = tr("Validating the selected stream with ffprobe")
                     return self._confirm(chosen)
                 except MediaProbeError as exc:
                     chosen.cancelled_until = time.monotonic() + 30
                     chosen.stable_since = None
-                    self.message = f"线路探测失败，请换线路: {exc}"
+                    self.message = tr("Stream validation failed; choose another stream: {0}", exc)
                     print(self.message, file=sys.stderr)
-        raise SniffError(f"{self.timeout:g} 秒内未确认可用直播线路；{self.message}")
+        raise SniffError(
+            tr(
+                "No usable live stream confirmed within {0:g} seconds; {1}",
+                self.timeout,
+                self.message,
+            )
+        )
 
     def _update_stability(self, now: float) -> None:
         with self._lock:
@@ -591,28 +616,43 @@ class StreamSniffer:
     @staticmethod
     def _print_candidates(candidates: list[Candidate], now: float) -> None:
         if not candidates:
-            print("等待播放请求……（请在浏览器中选择比赛和线路）", end="\r", flush=True)
+            print(
+                tr("Waiting for playback requests… (select a match and stream in the browser)"),
+                end="\r",
+                flush=True,
+            )
             return
-        print("\n候选直播流：")
+        print(tr("\nCandidate live streams:"))
         for candidate in candidates:
             active = candidate.active(now)
             stable = now - candidate.stable_since if candidate.stable_since is not None else 0
             if active and stable >= 5:
-                status = f"正在播放，{max(0, 10 - stable):.0f}s 后自动确认"
+                status = tr("Playing; auto-confirming in {0:.0f}s", max(0, 10 - stable))
             elif active:
-                status = f"正在播放，稳定确认 {stable:.0f}/5s"
+                status = tr("Playing; checking stability {0:.0f}/5s", stable)
             elif candidate.browser_blocked:
-                status = "浏览器拦截，等待媒体探测"
+                status = tr("Blocked by the browser; waiting for media validation")
             else:
-                status = "未发现近期分片"
+                status = tr("No recent segments found")
             print(
-                f"  [{candidate.identifier}] {candidate.line_text or '未命名线路'}  {status}  {candidate.display_url}"
+                tr(
+                    "  [{0}] {1}  {2}  {3}",
+                    candidate.identifier,
+                    candidate.line_text or tr("Unnamed stream"),
+                    status,
+                    candidate.display_url,
+                )
             )
-        print("回车确认首项，输入编号确认指定项，输入 c 取消当前自动选择。", flush=True)
+        print(
+            tr(
+                "Press Enter to confirm the first stream, enter its number to choose another, or c to cancel automatic selection."
+            ),
+            flush=True,
+        )
 
     def _confirm(self, candidate: Candidate) -> Source:
         if self._abort.is_set():
-            raise SniffError("嗅探已取消")
+            raise SniffError(tr("Stream discovery cancelled"))
         generation = self._generation
         cookies = self._context.cookies([candidate.url, *candidate.segments])
         source = Source(
@@ -625,11 +665,15 @@ class StreamSniffer:
         )
         probed = ffprobe_source(source, ffprobe=self.ffprobe, timeout=15)
         if self._abort.is_set():
-            raise SniffError("嗅探已取消")
+            raise SniffError(tr("Stream discovery cancelled"))
         if generation != self._generation or self._pending_line:
-            raise MediaProbeError("线路已更换，忽略旧线路的探测结果")
+            raise MediaProbeError(tr("Stream changed; ignoring the previous stream's probe result"))
         print(
-            f"已确认线路: codec={probed.video_codec}, audio={'yes' if probed.has_audio else 'no'}"
+            tr(
+                "Stream confirmed: codec={0}, audio={1}",
+                probed.video_codec,
+                "yes" if probed.has_audio else "no",
+            )
         )
         return probed
 

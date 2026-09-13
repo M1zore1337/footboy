@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from footboy.i18n import get_language, tr
 from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.serve.http import FILE_CHUNK_SIZE, ControlServer
 
@@ -129,6 +130,41 @@ def test_status_is_private_and_hls_remains_public(running_server) -> None:
     with urllib.request.urlopen(head) as response:
         assert response.headers.get_content_type() == "video/mp2t"
         assert response.headers["Content-Length"] == "7"
+
+
+def test_api_localizes_status_and_errors_per_client(running_server, monkeypatch):
+    controller, base, _ = running_server
+    initial_language = get_language()
+    message = tr("Fetching stream: {0}", "高清直播⑤")
+    monkeypatch.setattr(
+        controller, "public_status", lambda: {"message": message, "line_text": "高清直播⑤"}
+    )
+    for language, expected in [
+        ("en", "Fetching stream: 高清直播⑤"),
+        ("zh-CN", "正在获取线路：高清直播⑤"),
+    ]:
+        headers = {"Accept-Language": language}
+        with urllib.request.urlopen(
+            api_request(running_server, "/api/status", headers=headers)
+        ) as response:
+            value = json.load(response)
+            assert value["message"] == expected
+            assert value["line_text"] == "高清直播⑤"
+            assert response.headers["Content-Language"] == language
+            assert "Accept-Language" in response.headers["Vary"]
+    invalid = api_request(
+        running_server, "/api/offset", data=b'{"delta_ms":"bad"}', headers={"Accept-Language": "en"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(invalid)
+    assert error.value.code == 400
+    assert json.load(error.value)["error"] == "delta_ms must be a number"
+    unauthorized = urllib.request.Request(base + "/api/status", headers={"Accept-Language": "en"})
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(unauthorized)
+    assert error.value.code == 401
+    assert json.load(error.value)["error"] == "Use the control token printed at this startup"
+    assert get_language() == initial_language
 
 
 def test_control_actions_and_validation(running_server) -> None:

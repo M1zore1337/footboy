@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from footboy.i18n import tr
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,19 +29,23 @@ class StateStore:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 logger.warning(
-                    "无法加载状态文件 %s（%s），将使用默认设置；原文件尚未修改",
+                    tr(
+                        "Cannot load state file %s (%s); using defaults without modifying the original file"
+                    ),
                     self.path,
                     type(exc).__name__,
                 )
                 return
             if not isinstance(loaded, dict):
-                logger.warning("状态文件 %s 不是 JSON 对象，将使用默认设置", self.path)
+                logger.warning(tr("State file %s is not a JSON object; using defaults"), self.path)
                 return
             for key in ("sources", "offsets"):
                 if isinstance(loaded.get(key), dict):
                     self._data[key] = loaded[key]
                 elif key in loaded:
-                    logger.warning("状态文件 %s 的 %s 字段无效，将使用默认设置", self.path, key)
+                    logger.warning(
+                        tr("State file %s has an invalid %s field; using defaults"), self.path, key
+                    )
 
     def source_probe(self, key: str) -> dict[str, Any] | None:
         with self._lock:
@@ -60,7 +66,7 @@ class StateStore:
 
     def set_offset(self, key: str, value: float) -> None:
         if not math.isfinite(value):
-            raise ValueError("偏移必须是有限数值")
+            raise ValueError(tr("Offset must be a finite number"))
         with self._lock:
             self._data["offsets"][key] = float(value)
             self._save()

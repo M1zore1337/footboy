@@ -14,6 +14,7 @@ license = "MIT AND Apache-2.0"
 license-files = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
+  "THIRD_PARTY_NOTICES.en.md",
   "src/footboy/serve/static/vendor/hls.LICENSE",
   "src/footboy/serve/static/vendor/Apache-2.0.txt",
 ]
@@ -62,7 +63,7 @@ footboy-p0 = "footboy.tools.p0:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-footboy = ["serve/static/*.html", "serve/static/*.css", "serve/static/*.js", "serve/static/vendor/*"]
+footboy = ["locales/*.json", "serve/static/*.html", "serve/static/*.css", "serve/static/*.js", "serve/static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

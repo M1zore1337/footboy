@@ -7,6 +7,8 @@ import signal
 import subprocess
 from pathlib import Path
 
+from footboy.i18n import tr
+
 
 def resolve_binary(name: str | Path) -> str:
     """Resolve explicit paths, then PATH, then local tool installations."""
@@ -36,7 +38,12 @@ def resolve_binary(name: str | Path) -> str:
 def check_binary(name: str, minimum_major: int | None = None) -> None:
     resolved = resolve_binary(name)
     if resolved == name and not Path(resolved).is_file() and not shutil.which(resolved):
-        raise RuntimeError(f"找不到 {name}；请检查自定义路径、PATH 或项目 tools 目录")
+        raise RuntimeError(
+            tr(
+                "Cannot find {0}; check the executable path, PATH, or the project tools directory",
+                name,
+            )
+        )
     try:
         result = subprocess.run(
             [str(resolved), "-version"],
@@ -47,9 +54,9 @@ def check_binary(name: str, minimum_major: int | None = None) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"无法执行 {name}: {exc}") from exc
+        raise RuntimeError(tr("Cannot run {0}: {1}", name, exc)) from exc
     if result.returncode != 0:
-        raise RuntimeError(f"{name} -version 返回 {result.returncode}")
+        raise RuntimeError(tr("{0} -version returned {1}", name, result.returncode))
     if minimum_major is not None:
         match = re.search(r"ffmpeg version\s+(?:n)?(\d+)", result.stdout, re.IGNORECASE)
         supported = bool(match and int(match.group(1)) >= minimum_major)
@@ -63,8 +70,10 @@ def check_binary(name: str, minimum_major: int | None = None) -> None:
             )
             supported = bool(library and int(library.group(1)) >= 60)
         if not supported:
-            version = match.group(1) if match else "无法识别"
-            raise RuntimeError(f"需要 FFmpeg {minimum_major}.0+，当前主版本 {version}")
+            version = match.group(1) if match else tr("unknown")
+            raise RuntimeError(
+                tr("FFmpeg {0}.0+ is required; detected major version: {1}", minimum_major, version)
+            )
 
 
 def binary_crash_reason(returncode: int | None) -> str | None:
@@ -79,8 +88,8 @@ def binary_crash_reason(returncode: int | None) -> str | None:
         if name in {"SIGSEGV", "SIGBUS", "SIGABRT", "SIGILL", "SIGFPE", "SIGSYS"}:
             return name
     return {
-        0xC0000005: "访问冲突 (0xC0000005)",
-        0xC000001D: "非法指令 (0xC000001D)",
-        0xC0000374: "堆损坏 (0xC0000374)",
-        0xC0000409: "安全检查失败 (0xC0000409)",
+        0xC0000005: tr("Access violation (0xC0000005)"),
+        0xC000001D: tr("Illegal instruction (0xC000001D)"),
+        0xC0000374: tr("Heap corruption (0xC0000374)"),
+        0xC0000409: tr("Security check failure (0xC0000409)"),
     }.get(returncode & 0xFFFFFFFF)

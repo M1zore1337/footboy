@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from footboy.i18n import ArgumentParser, configure_cli_language, exception_message, localize, tr
 from footboy.probe.ocr import (
     FLIPS,
     STYLES,
@@ -22,21 +22,55 @@ from footboy.probe.ocr import (
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("frames", type=Path, help="NPZ with pts and frames arrays")
-    parser.add_argument("--output", type=Path, required=True, help="New local diagnostic directory")
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--count", type=int, default=4)
-    parser.add_argument("--budget", type=float, default=15)
-    parser.add_argument("--backend", choices=("auto", "tesseract", "rapidocr"), default="auto")
-    parser.add_argument("--tesseract-command")
-    parser.add_argument("--roi", nargs=4, type=float, metavar=("X", "Y", "W", "H"))
-    parser.add_argument("--flip", choices=FLIPS, default="none")
-    parser.add_argument("--style", choices=STYLES, default="standard")
-    parser.add_argument("--inverted", action="store_true")
+    configure_cli_language(argv)
+    parser = ArgumentParser(
+        description=tr(
+            "Diagnose a local keyframe NPZ without opening a stream or changing saved settings."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument("frames", type=Path, help=tr("NPZ with pts and frames arrays"))
+    parser.add_argument(
+        "--output", type=Path, required=True, help=tr("New local diagnostic directory")
+    )
+    parser.add_argument("--start", type=int, default=0, help=tr("First frame index (default: 0)"))
+    parser.add_argument(
+        "--count", type=int, default=4, help=tr("Number of frames, at least 3 (default: 4)")
+    )
+    parser.add_argument(
+        "--budget", type=float, default=15, help=tr("OCR time budget in seconds (default: 15)")
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "tesseract", "rapidocr"),
+        default="auto",
+        help=tr("OCR engine (default: auto)"),
+    )
+    parser.add_argument(
+        "--tesseract-command", help=tr("Executable path; by default search PATH, then tools")
+    )
+    parser.add_argument(
+        "--roi",
+        nargs=4,
+        type=float,
+        metavar=("X", "Y", "W", "H"),
+        help=tr("Clock region in normalized coordinates (0–1)"),
+    )
+    parser.add_argument(
+        "--flip", choices=FLIPS, default="none", help=tr("Frame orientation (default: none)")
+    )
+    parser.add_argument(
+        "--style",
+        choices=STYLES,
+        default="standard",
+        help=tr("OCR preprocessing style (default: standard)"),
+    )
+    parser.add_argument(
+        "--inverted", action="store_true", help=tr("Invert colors for clock recognition")
+    )
     args = parser.parse_args(argv)
     if args.start < 0 or args.count < 3 or not math.isfinite(args.budget) or args.budget <= 0:
-        parser.error("start must be nonnegative, count >= 3, and budget positive and finite")
+        parser.error(tr("start must be nonnegative, count >= 3, and budget positive and finite"))
     try:
         saved = (
             ProbeConfig(tuple(args.roi), args.flip, args.inverted, args.style) if args.roi else None
@@ -53,21 +87,21 @@ def main(argv: list[str] | None = None) -> int:
             or args.start + args.count > len(pts)
         ):
             raise ValueError(
-                "Expected matching PTS and uint8 grayscale/BGR frames in the chosen range"
+                tr("Expected matching PTS and uint8 grayscale/BGR frames in the chosen range")
             )
         frames = [
             (float(pts[index]), images[index])
             for index in range(args.start, args.start + args.count)
         ]
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        parser.error(str(exc))
+        parser.error(exception_message(exc))
 
     # Diagnostic frames and OCR text stay local, including when output is inside
     # a checkout. Refuse to replace an earlier run's artifacts.
     try:
         args.output.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
-        parser.error(str(exc))
+        parser.error(exception_message(exc))
     (args.output / ".gitignore").write_text("*\n", encoding="utf-8")
     last = OcrProgress("starting")
     with (args.output / "events.jsonl").open("w", encoding="utf-8") as stream:
@@ -80,9 +114,9 @@ def main(argv: list[str] | None = None) -> int:
                 if image is not None and image.size:
                     filename = f"{event.attempts:04d}-frame-{event.frame_index}-{kind}.png"
                     if not cv2.imwrite(str(args.output / filename), image):
-                        raise OSError(f"Cannot write diagnostic {filename}")
+                        raise OSError(tr("Cannot write diagnostic {0}", filename))
                     row[kind] = filename
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            stream.write(json.dumps(localize(row), ensure_ascii=False) + "\n")
             stream.flush()
 
         try:
@@ -98,9 +132,9 @@ def main(argv: list[str] | None = None) -> int:
                 "residual": result.residual,
             }
         except OcrError as exc:
-            summary = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+            summary = {"ok": False, "error": type(exc).__name__, "message": exception_message(exc)}
     summary.update(attempts=last.attempts, seconds=round(last.elapsed, 3))
-    output = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+    output = json.dumps(localize(summary), ensure_ascii=False, indent=2) + "\n"
     (args.output / "result.json").write_text(output, encoding="utf-8")
     print(output, end="")
     return 0 if summary["ok"] else 1

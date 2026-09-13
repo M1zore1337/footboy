@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from footboy.i18n import tr
+
 # HLS forwards only nonempty HTTP options to its segment/key requests.
 # FFmpeg only uses http:// proxy URLs; this non-HTTP marker forces direct access
 # while surviving that propagation, unlike an empty http_proxy option.
@@ -88,7 +90,7 @@ class Source:
             if name.lower() in {"user-agent", "host", "content-length", "connection"}:
                 continue
             if any(char in name + value for char in "\r\n"):
-                raise ValueError("请求头不能包含换行")
+                raise ValueError(tr("Headers must not contain line breaks"))
             if value:
                 lines.append(f"{name.title()}: {value}")
         cookie = self.cookie_header()

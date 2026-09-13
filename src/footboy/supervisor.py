@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from footboy.environment import binary_crash_reason
+from footboy.i18n import exception_message, tr
 from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer, MuxError, _sanitize_ffmpeg_line
 from footboy.probe.ocr import OcrProgress, ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
@@ -75,13 +76,13 @@ class Supervisor:
         stored = self.store.offset(self._offset_key)
         self.offset = config.initial_offset if config.initial_offset is not None else stored or 0.0
         if not math.isfinite(self.offset):
-            raise ValueError("偏移必须是有限数值")
+            raise ValueError(tr("Offset must be a finite number"))
         self.applied_offset: float | None = None
         self.aligned = config.initial_offset is not None and not config.auto_measure
         self.confidence: dict[str, Any] | None = {"method": "manual"} if self.aligned else None
         self._manual_offset = self.aligned
         self.last_verified_at: str | None = None
-        self.message = "尚未启动"
+        self.message = tr("Not started")
         self.phase = "INIT"
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
@@ -124,7 +125,10 @@ class Supervisor:
             self._run_loop()
         except Exception as exc:
             if not self._stop.is_set():
-                self._set_phase("ERROR", f"任务失败: {_sanitize_ffmpeg_line(str(exc))}")
+                self._set_phase(
+                    "ERROR",
+                    tr("Session failed: {0}", _sanitize_ffmpeg_line(exception_message(exc))),
+                )
         finally:
             self._stop.set()
             self.sniffer.stop()
@@ -136,7 +140,7 @@ class Supervisor:
             if server is not None:
                 server.stop()
             if self.phase != "ERROR":
-                self._set_phase("STOPPED", "任务已停止")
+                self._set_phase("STOPPED", tr("Session stopped"))
 
     def stop(self) -> None:
         self._stop.set()
@@ -144,7 +148,7 @@ class Supervisor:
         self._measurement_cancel.set()
         self._events.put(("stop", None))
         if self.phase not in {"STOPPED", "ERROR"}:
-            self._set_phase("STOPPING", "正在停止取流并刷新播放列表")
+            self._set_phase("STOPPING", tr("Stopping stream capture and flushing the playlist"))
 
     def request_offset_delta(self, delta_ms: int) -> None:
         self._queue_adjust(delta_ms)
@@ -156,13 +160,13 @@ class Supervisor:
         with self._lock:
             values = self.audio.public_dict()
             if not body or set(body) - set(values):
-                raise ValueError("音量设置字段无效")
+                raise ValueError(tr("Invalid audio settings"))
             values.update(body)
             audio = AudioMix(**values)
             if self.video is None or self._stop.is_set():
-                raise RuntimeError("请等待直播连接完成")
+                raise RuntimeError(tr("Wait for the streams to connect"))
             if audio.original_enabled and not self.video.has_audio:
-                raise ValueError("当前原直播不含音轨")
+                raise ValueError(tr("The match stream has no audio track"))
             self.audio = audio
             self._audio_revision += 1
             self._adjust_deadline = time.monotonic() + 1.5
@@ -178,20 +182,24 @@ class Supervisor:
         assert text is not None
         with self._lock:
             if self.config.video_direct:
-                raise ValueError("媒体直链没有页面线路；更换地址请停止后重新连接")
+                raise ValueError(
+                    tr(
+                        "Direct media URLs have no page stream options; stop and reconnect to change the URL"
+                    )
+                )
             if self._stop.is_set():
-                raise RuntimeError("任务正在停止")
+                raise RuntimeError(tr("The session is stopping"))
             if self.sniffer.running:
                 self.sniffer.select_line(text)
                 return
             if self.video is None or self._refresh_thread is not None or self._line_switch_pending:
-                raise RuntimeError("正在获取直播源，请等待线路列表出现后再选择")
+                raise RuntimeError(tr("Fetching streams; wait for the stream list before choosing"))
             self._line_switch_pending = True
             self._events.put(("switch_line", text))
 
     def request_roi(self, label: str, value: dict[str, Any]) -> None:
         if label not in {"video", "bili"}:
-            raise ValueError("source 必须为 video 或 bili")
+            raise ValueError(tr("source must be video or bili"))
         config = ProbeConfig.from_dict(value)
         key = self._video_probe_key if label == "video" else self._bili_probe_key
         with self._lock:
@@ -230,7 +238,9 @@ class Supervisor:
                 "last_verified_at": self.last_verified_at,
                 "message": self.message,
                 "ffmpeg": self.muxer.health.public_dict(),
-                "estimated_latency_seconds": "较慢源自身延迟 + HLS 缓冲约 6–10",
+                "estimated_latency_seconds": tr(
+                    "Slower source latency + approximately 6–10 seconds of HLS buffering"
+                ),
                 "video": self.video.public_dict() if self.video else None,
                 "bili": self.bili.public_dict() if self.bili else None,
                 "auto_measure": self.config.auto_measure,
@@ -269,7 +279,7 @@ class Supervisor:
 
     def _check_cancelled(self) -> None:
         if self._stop.is_set():
-            raise RuntimeError("任务已取消")
+            raise RuntimeError(tr("Session cancelled"))
 
     def _resolve_bili(self) -> Source:
         self._check_cancelled()
@@ -281,7 +291,9 @@ class Supervisor:
         self._check_cancelled()
         ffprobe_source(source, ffprobe=self.config.ffprobe)
         if not source.has_audio:
-            raise MediaProbeError("B站输入不含音频，请更换直播间或直链")
+            raise MediaProbeError(
+                tr("The Bilibili input has no audio; choose another room or direct media URL")
+            )
         return source
 
     def _sniff_video(
@@ -311,10 +323,12 @@ class Supervisor:
         return source
 
     def _bootstrap(self) -> None:
-        self._set_phase("RESOLVE", "正在解析并验收 B 站直播流")
+        self._set_phase("RESOLVE", tr("Resolving and validating the Bilibili live stream"))
         self.bili = self._resolve_bili()
         self._check_cancelled()
-        self._set_phase("SNIFF", "正在获取比赛画面，请在打开的浏览器里播放目标线路")
+        self._set_phase(
+            "SNIFF", tr("Fetching match video; play the desired stream in the browser window")
+        )
         if self.config.video_direct:
             self.video = _direct_source(self.config.video_page_url, self.config.video_headers)
             self.video.no_proxy = self.config.video_no_proxy
@@ -329,7 +343,7 @@ class Supervisor:
             and self._revision == 0
         ):
             revision = self._revision
-            self._set_phase("INIT", "正在估算两路起始时间轴")
+            self._set_phase("INIT", tr("Estimating the starting timelines of both streams"))
             try:
                 initial = estimate_initial_offset(self.video, self.bili, stop_event=self._stop)
                 with self._lock:
@@ -337,10 +351,17 @@ class Supervisor:
                         self.offset = initial
                         self.aligned = False
                         self.confidence = {"method": "timeline-estimate"}
-                        timeline_message = "；时间轴已粗略接续，比赛内容尚未对齐"
+                        timeline_message = tr(
+                            "; timelines roughly joined, but match content is not yet aligned"
+                        )
             except TimelineProbeError as exc:
-                logger.warning("起始时间轴采样失败：%s", _sanitize_ffmpeg_line(str(exc)))
-                timeline_message = "；起始时间轴采样失败，可能暂时无声，请重测或手动设置偏移"
+                logger.warning(
+                    tr("Initial timeline sampling failed: %s"),
+                    _sanitize_ffmpeg_line(exception_message(exc)),
+                )
+                timeline_message = tr(
+                    "; initial timeline sampling failed; audio may be temporarily silent, so remeasure or set an offset manually"
+                )
         self._check_cancelled()
         with self._lock:
             self._source_generation += 1
@@ -354,7 +375,9 @@ class Supervisor:
             if revision == self._revision and audio_revision == self._audio_revision:
                 self._adjust_deadline = None
         self._reset_health_window()
-        self._set_phase("RUN", "混流已启动；可随时手动调整声音时间" + timeline_message)
+        self._set_phase(
+            "RUN", tr("Muxing started; you can adjust audio timing at any time") + timeline_message
+        )
         if self.config.auto_measure:
             # Keep this check and the worker's revision snapshot atomic with
             # manual changes, including clicks made before playback was ready.
@@ -391,7 +414,7 @@ class Supervisor:
                     try:
                         self._apply_adjustment()
                     except Exception as exc:
-                        self._recover(f"调整失败: {exc}")
+                        self._recover(tr("Adjustment failed: {0}", exc))
             if now >= self._next_verify and self._adjust_deadline is None:
                 if self._refresh_thread is None and self.muxer.health.running:
                     self._start_measurement("verify")
@@ -399,7 +422,7 @@ class Supervisor:
 
     def _queue_adjust(self, delta_ms: int) -> None:
         if isinstance(delta_ms, bool) or not isinstance(delta_ms, int) or abs(delta_ms) > 300_000:
-            raise ValueError("delta_ms 必须是 ±300000 以内的整数")
+            raise ValueError(tr("delta_ms must be an integer between -300000 and 300000"))
         with self._lock:
             self.offset = round(self.offset + delta_ms / 1000.0, 3)
             self._revision += 1
@@ -408,11 +431,11 @@ class Supervisor:
             self._measurement_cancel.set()
             for progress in self._ocr_progress.values():
                 progress["state"] = "cancelled"
-                progress["reason"] = "已采用最新手动偏移"
+                progress["reason"] = tr("Using the latest manual offset")
             self.aligned = True
             self.confidence = {"method": "manual"}
             self._manual_offset = True
-            self.message = "手动偏移已更新，1.5 秒后应用"
+            self.message = tr("Manual offset updated; applying in 1.5 seconds")
             self._adjust_deadline = time.monotonic() + 1.5
             self.store.set_offset(self._offset_key, self.offset)
 
@@ -422,14 +445,16 @@ class Supervisor:
             value, revision = self.offset, self._revision
             audio_revision = self._audio_revision
             self.muxer.audio = self.audio
-        self._set_phase("ADJUST", f"正在应用偏移 D={value:.3f}s")
+        self._set_phase("ADJUST", tr("Applying offset D={0:.3f}s", value))
         self.muxer.restart(self.video, self.bili, value)
         with self._lock:
             self.applied_offset = value
             if revision == self._revision and audio_revision == self._audio_revision:
                 self._adjust_deadline = None
         self._reset_health_window()
-        self._set_phase("RUN", "偏移已应用，等待新分片后继续播放")
+        self._set_phase(
+            "RUN", tr("Offset applied; playback will continue when new segments arrive")
+        )
 
     def _start_measurement(self, mode: str) -> None:
         if self.video is None or self.bili is None or self._stop.is_set():
@@ -449,7 +474,9 @@ class Supervisor:
             revision, generation = self._revision, self._source_generation
             video, bili = self.video, self.bili
             self._next_verify = float("inf")
-            self.message = "正在采样两路比赛时钟，播放和手动调节继续可用"
+            self.message = tr(
+                "Sampling both match clocks; playback and manual adjustments remain available"
+            )
             self._ocr_progress = {label: {"state": "sampling"} for label in ("video", "bili")}
             self._ocr_images.clear()
 
@@ -576,7 +603,7 @@ class Supervisor:
             self._start_measurement(pending)
             return
         if revision != self._revision or generation != self._source_generation:
-            self.message = "已保留最新手动设置；过期的 OCR 结果已忽略"
+            self.message = tr("Kept the latest manual settings; ignored outdated OCR results")
             self._verify_candidate = None
             for progress in self._ocr_progress.values():
                 if progress.get("state") not in {
@@ -604,23 +631,28 @@ class Supervisor:
                     "rejected",
                 }:
                     progress["state"] = "stopped" if isinstance(error, StoppedClock) else "error"
-                    progress["reason"] = _sanitize_ffmpeg_line(str(error))
+                    progress["reason"] = _sanitize_ffmpeg_line(exception_message(error))
             if isinstance(error, StoppedClock):
-                self.message = f"检测到停表，保留 D={self.offset:.3f}s；60 秒后重试"
+                self.message = tr(
+                    "Clock stopped; keeping D={0:.3f}s and retrying in 60 seconds", self.offset
+                )
                 self.confidence = {"method": "ocr", "stopped": True}
                 self._schedule_verify(delay=60)
             else:
-                self.message = (
-                    f"未对齐，保留 D={self.offset:.3f}s：{_sanitize_ffmpeg_line(str(error))}"
+                self.message = tr(
+                    "Not aligned; keeping D={0:.3f}s: {1}",
+                    self.offset,
+                    _sanitize_ffmpeg_line(exception_message(error)),
                 )
                 self.confidence = None
                 self._needs_roi = error.needs_roi if isinstance(error, MeasurementError) else []
             if keep_manual:
                 self.aligned = True
                 self.confidence = {"method": "manual"}
-                self.message = (
-                    f"自动复核未完成，保留手动偏移 D={self.offset:.3f}s："
-                    f"{_sanitize_ffmpeg_line(str(error))}"
+                self.message = tr(
+                    "Automatic verification incomplete; keeping manual offset D={0:.3f}s: {1}",
+                    self.offset,
+                    _sanitize_ffmpeg_line(exception_message(error)),
                 )
             return
         assert result is not None
@@ -644,22 +676,25 @@ class Supervisor:
             self._verify_candidate = None
             self.aligned = True
             self.confidence = {"method": "manual"}
-            self.message = (
-                f"保留手动偏移 D={self.offset:.3f}s；OCR 建议调整 {difference:+.3f}s，"
-                "点击立即同步可重新自动对齐"
+            self.message = tr(
+                "Keeping manual offset D={0:.3f}s; OCR suggests {1:+.3f}s. Select Sync now to realign automatically",
+                self.offset,
+                difference,
             )
             return
         if mode == "verify":
             if abs(difference) <= 1.0:
                 self._verify_candidate = None
                 self.aligned = True
-                self.message = f"复核通过，偏移变化 {difference:+.3f}s"
+                self.message = tr("Verification passed; offset change {0:+.3f}s", difference)
                 return
             previous = self._verify_candidate
             if previous is None or abs(result.offset - previous) > 1.0:
                 self._verify_candidate = result.offset
                 self.aligned = False
-                self.message = f"检测到 {difference:+.3f}s 漂移，等待下一次复核确认"
+                self.message = tr(
+                    "Detected {0:+.3f}s drift; waiting for the next verification", difference
+                )
                 return
         self._verify_candidate = None
         with self._lock:
@@ -673,7 +708,7 @@ class Supervisor:
                 or abs(self.offset - self.applied_offset) > 0.001
             ):
                 self._adjust_deadline = time.monotonic() + 1.5
-            self.message = f"OCR 已锁定，D={self.offset:.3f}s"
+            self.message = tr("OCR locked, D={0:.3f}s", self.offset)
 
     def _schedule_verify(self, delay: float | None = None) -> None:
         self._next_verify = (
@@ -688,9 +723,9 @@ class Supervisor:
         assert self.video is not None
         previous = self.video
         if force_sniff and self.config.video_direct:
-            self.message = "当前使用直链；如需更换地址，请停止后重新连接"
+            self.message = tr("Using direct media URLs; stop and reconnect to change the URL")
             return
-        self._set_phase("SNIFF" if force_sniff else "RECOVER", "正在重新获取直播源")
+        self._set_phase("SNIFF" if force_sniff else "RECOVER", tr("Fetching live streams again"))
         with self._lock:
             self._measurement_cancel.set()
             self._source_generation += 1
@@ -740,7 +775,11 @@ class Supervisor:
         if error is not None:
             if forced and self.muxer.health.running:
                 self._set_phase(
-                    "RUN", f"换线失败，保留原线路和当前偏移：{_sanitize_ffmpeg_line(str(error))}"
+                    "RUN",
+                    tr(
+                        "Stream switch failed; keeping the original stream and current offset: {0}",
+                        _sanitize_ffmpeg_line(exception_message(error)),
+                    ),
                 )
                 self._schedule_verify()
                 return
@@ -749,7 +788,11 @@ class Supervisor:
             self._next_recover = time.monotonic() + delay
             self._set_phase(
                 "RUN" if forced and self.muxer.health.running else "RECOVER",
-                f"取流失败，保留设置并在 {delay} 秒后重试: {_sanitize_ffmpeg_line(str(error))}",
+                tr(
+                    "Stream capture failed; keeping settings and retrying in {0} seconds: {1}",
+                    delay,
+                    _sanitize_ffmpeg_line(exception_message(error)),
+                ),
             )
             return
         assert sources is not None
@@ -776,11 +819,13 @@ class Supervisor:
                     self._adjust_deadline = None
         except Exception as exc:
             self._next_recover = time.monotonic() + 5
-            self.message = f"混流重启失败，5 秒后重试: {exc}"
+            self.message = tr("Muxer restart failed; retrying in 5 seconds: {0}", exc)
             return
         self._recovery_attempts = 0
         self._reset_health_window()
-        self._set_phase("RUN", "已使用上次偏移恢复，源时间轴需要重新确认")
+        self._set_phase(
+            "RUN", tr("Resumed with the previous offset; the source timeline needs verification")
+        )
         with self._lock:
             # As in bootstrap, the manual-change decision and measurement
             # revision snapshot must be atomic with HTTP adjustment requests.
@@ -791,7 +836,9 @@ class Supervisor:
                 and self.confidence.get("method") == "manual"
             )
             if manual_changed and self._pending_measurement is None:
-                self.message = "线路已切换，保留切换期间的最新手动偏移"
+                self.message = tr(
+                    "Stream switched; keeping the latest manual offset set during the switch"
+                )
                 self._schedule_verify()
             elif self.config.auto_measure or self._pending_measurement == "manual":
                 if self._measurement_thread is not None:
@@ -817,10 +864,12 @@ class Supervisor:
                 self.aligned = False
                 self.confidence = None
                 raise MuxError(
-                    f"FFmpeg 异常终止（{crash}），已停止自动重试；"
-                    "请检查或更换 FFmpeg 构建后重新连接"
+                    tr(
+                        "FFmpeg crashed ({0}); automatic retries stopped. Check or replace the FFmpeg build, then reconnect",
+                        crash,
+                    )
                 )
-            self._recover(f"ffmpeg 已退出，code={code}")
+            self._recover(tr("FFmpeg exited, code={0}", code))
             return
         signature = self._latest_segment_signature()
         if signature is not None and signature != self._last_segment_signature:
@@ -829,7 +878,7 @@ class Supervisor:
         # D contains the PTS origin difference, so abs(D) is not buffer time.
         deadline = 150 if self._last_segment_signature is None else 30
         if now - self._last_segment_change > deadline:
-            self._recover(f"{deadline} 秒没有新 HLS 分片")
+            self._recover(tr("No new HLS segment for {0} seconds", deadline))
             return
         dts_count = self.muxer.health.non_monotonic_dts
         if dts_count - self._last_dts_count >= 20:

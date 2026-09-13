@@ -7,6 +7,7 @@ from typing import Any
 
 from footboy.diagnostics import redact_diagnostic
 from footboy.environment import binary_crash_reason, resolve_binary
+from footboy.i18n import tr
 
 from .models import DIRECT_HTTP_PROXY, Source
 
@@ -62,23 +63,27 @@ def ffprobe_source(
     except subprocess.TimeoutExpired:
         # TimeoutExpired includes the complete argv, including cookies and
         # authorization headers. Suppress that exception's traceback as well.
-        raise MediaProbeError(f"ffprobe 探测超时（{timeout:g} 秒）") from None
+        raise MediaProbeError(tr("ffprobe timed out after {0:g} seconds", timeout)) from None
     except OSError as exc:
-        raise MediaProbeError(f"ffprobe 无法启动: {exc.strerror or type(exc).__name__}") from None
+        raise MediaProbeError(
+            tr("Cannot start ffprobe: {0}", exc.strerror or type(exc).__name__)
+        ) from None
     if result.returncode != 0:
         crash = binary_crash_reason(result.returncode)
         if crash:
-            raise MediaProbeError(f"ffprobe 异常终止（{crash}），请检查或更换 FFmpeg/ffprobe 构建")
-        detail = result.stderr.strip().splitlines()[-1:] or ["未知错误"]
-        raise MediaProbeError(f"ffprobe 拒绝该线路: {redact_diagnostic(detail[0])}")
+            raise MediaProbeError(
+                tr("ffprobe crashed ({0}); check or replace the FFmpeg/ffprobe build", crash)
+            )
+        detail = result.stderr.strip().splitlines()[-1:] or [tr("Unknown error")]
+        raise MediaProbeError(tr("ffprobe rejected this stream: {0}", redact_diagnostic(detail[0])))
     try:
         streams: list[dict[str, Any]] = json.loads(result.stdout).get("streams", [])
     except (ValueError, AttributeError) as exc:
-        raise MediaProbeError("ffprobe 输出无法解析") from exc
+        raise MediaProbeError(tr("Cannot parse ffprobe output")) from exc
     video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
     audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
     if not video:
-        raise MediaProbeError("候选线路不含视频")
+        raise MediaProbeError(tr("The candidate stream has no video"))
     source.video_codec = str(video.get("codec_name") or "") or None
     source.width = int(video["width"]) if video.get("width") else None
     source.height = int(video["height"]) if video.get("height") else None

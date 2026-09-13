@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from footboy.i18n import tr
+
 logger = logging.getLogger(__name__)
 _GENERATED_MEDIA = re.compile(r"(?:seg_\d+(?:_\d+)?\.(?:ts|m4s)|init(?:_\d+)?\.mp4)(?:\.tmp)?")
 
@@ -65,7 +67,7 @@ class HlsOutputCleaner:
                     waiting[name] = self._unreferenced[name]
         self._unreferenced = waiting
         if failures:
-            logger.warning("无法回收 %s 个过期 HLS 文件，将稍后重试", failures)
+            logger.warning(tr("Could not remove %s expired HLS files; will retry later"), failures)
 
     def _playlist(self) -> tuple[set[str], float]:
         lines = (self.directory / "live.m3u8").read_text(encoding="utf-8").splitlines()

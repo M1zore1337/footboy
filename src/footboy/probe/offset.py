@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from footboy.i18n import exception_message, tr
 from footboy.sources.models import Source
 from footboy.state import StateStore
 
@@ -85,11 +86,11 @@ def measure_offset(
                 else collect_keyframes(source, stop_event=stop_event)
             )
             if stop_event is not None and stop_event.is_set():
-                raise OcrCancelled("测量已取消")
+                raise OcrCancelled(tr("Measurement cancelled"))
             if frames and on_preview is not None:
                 on_preview(label, frames[-1][1])
             if len(frames) < 3:
-                raise OcrError("至少需要 3 个关键帧才能锁定比赛时钟")
+                raise OcrError(tr("At least 3 keyframes are required to lock onto the match clock"))
             saved = None
             stored = state.source_probe(key) if state is not None and key else None
             if stored:
@@ -109,7 +110,9 @@ def measure_offset(
                     if isinstance(exc, StoppedClock)
                     else "error"
                 )
-                on_progress(label, OcrProgress(status, phase="sampling", reason=str(exc)))
+                on_progress(
+                    label, OcrProgress(status, phase="sampling", reason=exception_message(exc))
+                )
             raise
         result = probe_clock(
             frames,
@@ -136,8 +139,8 @@ def measure_offset(
             except Exception as exc:
                 errors[label] = exc
     if errors:
-        labels = {"video": "比赛画面", "bili": "B站直播间"}
-        message = "；".join(f"{labels[key]}：{value}" for key, value in errors.items())
+        labels = {"video": tr("Match video"), "bili": tr("Bilibili room")}
+        message = tr("; ").join(tr("{0}: {1}", labels[key], value) for key, value in errors.items())
         if any(isinstance(exc, OcrCancelled) for exc in errors.values()):
             raise OcrCancelled(message)
         if all(isinstance(exc, StoppedClock) for exc in errors.values()):
@@ -148,7 +151,7 @@ def measure_offset(
         )
     video_result, bili_result = results["video"], results["bili"]
     if abs(video_result.representative_clock - bili_result.representative_clock) > 300:
-        raise ValueError("两路同轮比赛时钟相差超过 300 秒，拒绝应用偏移")
+        raise ValueError(tr("Match clocks differ by more than 300 seconds; offset rejected"))
     if persist and state is not None and not (stop_event is not None and stop_event.is_set()):
         for key, result in ((video_key, video_result), (bili_key, bili_result)):
             if key:

@@ -6,6 +6,7 @@ from collections.abc import Iterator
 
 import numpy as np
 
+from footboy.i18n import tr
 from footboy.sources.models import Source
 
 
@@ -23,11 +24,11 @@ def keyframes(
 ) -> Iterator[tuple[float, np.ndarray]]:
     """Yield decoded keyframes with their unmodified source PTS in seconds."""
     if stop_event is not None and stop_event.is_set():
-        raise FrameProbeError("测量已取消")
+        raise FrameProbeError(tr("Measurement cancelled"))
     try:
         import av
     except ImportError as exc:
-        raise FrameProbeError("未安装 PyAV") from exc
+        raise FrameProbeError(tr("PyAV is not installed")) from exc
 
     started = time.monotonic()
     yielded = 0
@@ -36,15 +37,17 @@ def keyframes(
     try:
         container = av.open(source.url, options=source.pyav_options(), timeout=(8.0, 5.0))
     except Exception as exc:
-        raise FrameProbeError(f"无法打开 {source.domain} 视频流: {exc}") from exc
+        raise FrameProbeError(
+            tr("Cannot open the video stream from {0}: {1}", source.domain, exc)
+        ) from exc
     try:
         if not container.streams.video:
-            raise FrameProbeError(f"{source.domain} 视频流不含画面")
+            raise FrameProbeError(tr("The stream from {0} has no video", source.domain))
         stream = container.streams.video[0]
         stream.codec_context.skip_frame = "NONKEY"
         for frame in container.decode(stream):
             if stop_event is not None and stop_event.is_set():
-                raise FrameProbeError("测量已取消")
+                raise FrameProbeError(tr("Measurement cancelled"))
             elapsed = time.monotonic() - started
             if elapsed >= duration:
                 break
@@ -53,7 +56,11 @@ def keyframes(
                 continue
             pts_seconds = float(frame.pts * time_base)
             if last_pts is not None and pts_seconds < last_pts:
-                raise FrameProbeError("探针采样期间源 PTS 回退，拒绝使用不同时间轴")
+                raise FrameProbeError(
+                    tr(
+                        "Source PTS moved backwards during sampling; cannot combine different timelines"
+                    )
+                )
             if last_pts is not None and pts_seconds - last_pts < sample_interval:
                 continue
             yield pts_seconds, frame.to_ndarray(format="bgr24")
@@ -64,7 +71,9 @@ def keyframes(
     except FrameProbeError:
         raise
     except Exception as exc:
-        raise FrameProbeError(f"读取 {source.domain} 关键帧失败: {exc}") from exc
+        raise FrameProbeError(
+            tr("Failed to read keyframes from {0}: {1}", source.domain, exc)
+        ) from exc
     finally:
         container.close()
 
@@ -74,5 +83,11 @@ def collect_keyframes(
 ) -> list[tuple[float, np.ndarray]]:
     frames = list(keyframes(source, duration=duration, stop_event=stop_event))
     if len(frames) < 3:
-        raise FrameProbeError(f"{source.domain} 在探针窗口内只有 {len(frames)} 个可用关键帧")
+        raise FrameProbeError(
+            tr(
+                "Only {1} usable keyframes from {0} in the sampling window",
+                source.domain,
+                len(frames),
+            )
+        )
     return frames

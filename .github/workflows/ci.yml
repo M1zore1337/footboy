@@ -35,6 +35,7 @@ jobs:
       - run: ruff check src tests
       - run: ruff format --check src tests
       - run: node --check src/footboy/serve/static/app.js
+      - run: node --check src/footboy/serve/static/i18n.js
       - run: python -m pytest -ra -m "not slow"
       - run: python -m build
 

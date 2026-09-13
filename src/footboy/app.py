@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from footboy.environment import check_binary
+from footboy.i18n import exception_message, tr
 from footboy.sources.bili import BiliResolveError, _room_id
 from footboy.sources.lines import validate_line_text
 from footboy.supervisor import Supervisor, SupervisorConfig
@@ -33,11 +34,15 @@ class Application:
         config = session_config(self.defaults, body)
         with self._lock:
             if self._closed:
-                raise SessionConflict("控制台正在关闭")
+                raise SessionConflict(tr("The console is shutting down"))
             if self._thread is not None and self._thread.is_alive():
-                raise SessionConflict("已有任务正在运行或停止，请等待它结束后再连接")
+                raise SessionConflict(
+                    tr(
+                        "A session is running or stopping; wait for it to finish before reconnecting"
+                    )
+                )
             session = Supervisor(config)
-            session._set_phase("CHECK", "正在检查 FFmpeg 和 ffprobe")
+            session._set_phase("CHECK", tr("Checking FFmpeg and ffprobe"))
             self.session = session
             self._session_id = time.time_ns() // 1_000_000
             self._thread = threading.Thread(
@@ -51,12 +56,12 @@ class Application:
             check_binary(session.config.ffmpeg, minimum_major=6)
             check_binary(session.config.ffprobe)
         except RuntimeError as exc:
-            session._set_phase("ERROR", f"环境检查失败：{exc}")
+            session._set_phase("ERROR", tr("Environment check failed: {0}", exc))
             return
         if not session._stop.is_set():
             session.run(serve=False)
         else:
-            session._set_phase("STOPPED", "任务已停止")
+            session._set_phase("STOPPED", tr("Session stopped"))
 
     def request_stop(self) -> None:
         with self._lock:
@@ -73,9 +78,9 @@ class Application:
     def _active_session(self) -> Supervisor:
         with self._lock:
             if self.session is None or self._thread is None or not self._thread.is_alive():
-                raise SessionConflict("请先连接比赛画面和直播间")
+                raise SessionConflict(tr("Connect the match video and commentary stream first"))
             if self.session.phase == "STOPPING":
-                raise SessionConflict("任务正在停止")
+                raise SessionConflict(tr("The session is stopping"))
             return self.session
 
     def request_offset_delta(self, delta_ms: int) -> None:
@@ -120,8 +125,10 @@ class Application:
                     "confidence": None,
                     "last_verified_at": None,
                     "ffmpeg": {"running": False},
-                    "message": "输入比赛页面和 B 站直播间，开始连接",
-                    "estimated_latency_seconds": "较慢源自身延迟 + HLS 缓冲约 6–10",
+                    "message": tr("Enter the match page and Bilibili room to connect"),
+                    "estimated_latency_seconds": tr(
+                        "Slower source latency + approximately 6–10 seconds of HLS buffering"
+                    ),
                     "measurement": {"running": False, "needs_roi": [], "sources": {}},
                 }
             )
@@ -146,15 +153,15 @@ class Application:
 
 
 def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> SupervisorConfig:
-    video = _http_url(body.get("video_url"), "比赛地址")
-    bili = _http_url(body.get("bili_url"), "B站地址")
+    video = _http_url(body.get("video_url"), tr("Match URL"))
+    bili = _http_url(body.get("bili_url"), tr("Bilibili URL"))
     video_direct = _boolean(body, "video_direct", defaults.video_direct)
     bili_direct = _boolean(body, "bili_direct", defaults.bili_direct)
     if not bili_direct:
         try:
             _room_id(bili)
         except BiliResolveError as exc:
-            raise ValueError(str(exc)) from exc
+            raise ValueError(exception_message(exc)) from exc
     auto = _boolean(body, "auto_measure", defaults.auto_measure)
     offset = body.get("offset_seconds", defaults.initial_offset)
     if offset is not None:
@@ -163,7 +170,7 @@ def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> Supervis
             or not isinstance(offset, (float, int))
             or not math.isfinite(offset)
         ):
-            raise ValueError("初始偏移必须是有限数值")
+            raise ValueError(tr("The initial offset must be a finite number"))
         offset = float(offset)
     return replace(
         defaults,
@@ -186,35 +193,35 @@ def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> Supervis
 
 def _http_url(value: Any, label: str) -> str:
     if not isinstance(value, str) or len(value) > 16384:
-        raise ValueError(f"{label}必须是 HTTP(S) URL")
+        raise ValueError(tr("{0} must be an HTTP(S) URL", label))
     value = value.strip()
     parts = urlsplit(value)
     if parts.scheme not in {"http", "https"} or not parts.hostname:
-        raise ValueError(f"{label}必须是 HTTP(S) URL")
+        raise ValueError(tr("{0} must be an HTTP(S) URL", label))
     if parts.username or parts.password or any(char.isspace() for char in value):
-        raise ValueError(f"{label}不能含内嵌账号密码或空白字符")
+        raise ValueError(tr("{0} must not contain embedded credentials or whitespace", label))
     try:
         _ = parts.port
     except ValueError as exc:
-        raise ValueError(f"{label}端口无效") from exc
+        raise ValueError(tr("{0} has an invalid port", label)) from exc
     return value
 
 
 def _boolean(body: dict[str, Any], key: str, default: bool) -> bool:
     value = body.get(key, default)
     if not isinstance(value, bool):
-        raise ValueError(f"{key} 必须是布尔值")
+        raise ValueError(tr("{0} must be a boolean", key))
     return value
 
 
 def _headers(value: Any) -> dict[str, str]:
     if not isinstance(value, dict) or len(value) > 40:
-        raise ValueError("请求头必须是 JSON 对象")
+        raise ValueError(tr("Headers must be a JSON object"))
     result = {}
     for name, content in value.items():
         if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
-            raise ValueError("请求头名称无效")
+            raise ValueError(tr("Invalid header name"))
         if not isinstance(content, str) or any(c in content for c in "\r\n\0"):
-            raise ValueError("请求头值无效")
+            raise ValueError(tr("Invalid header value"))
         result[name] = content
     return result

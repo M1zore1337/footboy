@@ -1,5 +1,7 @@
 # 第三方许可说明
 
+**简体中文** | [English](THIRD_PARTY_NOTICES.en.md)
+
 Footboy（足小子）自身的代码采用根目录 [MIT License](LICENSE)。该许可不替代第三方组件的许可，也不授予输入媒体的版权或传播权。
 
 ## hls.js
