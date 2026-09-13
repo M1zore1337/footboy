@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from footboy.environment import binary_crash_reason, check_binary, resolve_binary
@@ -105,8 +107,40 @@ def test_local_tools_reach_check_probe_mux_and_ocr(local_tools, monkeypatch):
         get_tesseract_version=lambda: None,
     )
     monkeypatch.setitem(sys.modules, "pytesseract", module)
+    monkeypatch.setenv("OMP_THREAD_LIMIT", os.environ.get("OMP_THREAD_LIMIT", "1"))
     TesseractBackend()
     assert module.pytesseract.tesseract_cmd == tesseract
+
+
+@pytest.mark.parametrize("configured", [None, "2"], ids=["default", "user-setting"])
+def test_tesseract_children_inherit_thread_limit_without_overriding_user_settings(
+    monkeypatch, configured
+):
+    from footboy.probe.ocr import TesseractBackend
+
+    monkeypatch.setenv("OMP_THREAD_LIMIT", configured or "")
+    if configured is None:
+        monkeypatch.delenv("OMP_THREAD_LIMIT")
+    inherited = []
+
+    def child_environment(*args, **kwargs):
+        value = subprocess.check_output(
+            [sys.executable, "-c", "import os; print(os.environ.get('OMP_THREAD_LIMIT', 'unset'))"],
+            text=True,
+            timeout=5,
+        ).strip()
+        inherited.append(value)
+        return value
+
+    module = SimpleNamespace(
+        pytesseract=SimpleNamespace(tesseract_cmd="tesseract"),
+        get_tesseract_version=child_environment,
+        image_to_string=child_environment,
+    )
+    monkeypatch.setitem(sys.modules, "pytesseract", module)
+    backend = TesseractBackend()
+    backend.read(np.zeros((2, 2), dtype=np.uint8))
+    assert inherited == [configured or "1", configured or "1"]
 
 
 @pytest.mark.parametrize(

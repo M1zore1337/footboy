@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import statistics
 import threading
@@ -228,6 +229,10 @@ class TesseractBackend:
             import pytesseract  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
             raise OcrError("未安装 pytesseract") from exc
+        # Each source already has its own OCR worker. OpenMP teams inside both
+        # Tesseract processes can contend badly on small machines, especially
+        # after OpenCV has initialized its pool. Keep explicit user tuning.
+        os.environ.setdefault("OMP_THREAD_LIMIT", "1")
         pytesseract.pytesseract.tesseract_cmd = resolve_binary(command or "tesseract")
         try:
             pytesseract.get_tesseract_version()

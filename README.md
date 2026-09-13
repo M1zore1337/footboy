@@ -122,6 +122,7 @@ Footboy 控制台已就绪：
 
 > **实用技巧**：
 > - **OCR 引擎切换**：默认以 `--ocr auto` 启动，自动检测 Tesseract 或 RapidOCR；Python 3.10–3.12 亦可安装 `pip install ".[rapidocr]"` 并指定 `--ocr rapidocr`。
+> - **OCR 并发**：两路画面并行识别时，默认将 Tesseract 的 OpenMP 线程上限设为 1，减少低核数机器上的线程竞争；如需自行调优，可在启动前设置 `OMP_THREAD_LIMIT`，程序会保留该值。
 > - **仅本机访问**：若不希望局域网设备访问控制台，可指定 `footboy --host 127.0.0.1`。
 > - **Windows 执行权限**：若 PowerShell 提示禁止运行脚本，可使用管理员权限运行 `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`，或直接执行 `.\.venv\Scripts\footboy.exe`。
 
