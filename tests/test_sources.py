@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import signal
+import subprocess
+import traceback
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -67,6 +69,42 @@ def test_probe_crash_reports_binary_failure_instead_of_rejecting_the_source(monk
     )
     with pytest.raises(MediaProbeError, match="ffprobe 异常终止.*SIGSEGV"):
         ffprobe_source(Source("https://cdn.example/live.m3u8"))
+
+
+def test_probe_timeout_never_reports_argv_credentials_or_chained_exception(monkeypatch):
+    source = Source(
+        "https://cdn.example/live.m3u8?sign=private-signature",
+        headers={"Authorization": "Bearer private-auth"},
+        cookies=[{"name": "sid", "value": "private-cookie"}],
+    )
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("footboy.sources.media_probe.subprocess.run", timeout)
+    with pytest.raises(MediaProbeError, match="超时.*15") as captured:
+        ffprobe_source(source)
+    rendered = "".join(traceback.format_exception(captured.value))
+    assert "private-" not in rendered
+    assert "-headers" not in rendered and "-cookies" not in rendered
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "https://cdn.example/live.m3u8?sign=private-secret: Server returned 403",
+        "Request failed: Authorization: Bearer private-secret",
+        "Request failed: Cookie: sid=private-secret",
+    ],
+)
+def test_rejected_probe_diagnostics_are_redacted_before_reaching_the_sniffer(monkeypatch, detail):
+    monkeypatch.setattr(
+        "footboy.sources.media_probe.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stderr=detail, stdout=""),
+    )
+    with pytest.raises(MediaProbeError) as captured:
+        ffprobe_source(Source("https://cdn.example/live.m3u8"))
+    assert "private-secret" not in str(captured.value)
 
 
 def response(url, body="", content_type="application/vnd.apple.mpegurl", status=200):
@@ -157,6 +195,78 @@ def test_hls_activity_uses_exact_segment_uris_not_directory_prefix():
     sniffer._on_request(SimpleNamespace(url="https://cdn.example/live/a_1.ts"))
     assert sniffer._candidates[a].last_segment_at > 0
     assert sniffer._candidates[b].last_segment_at == 0
+
+
+@pytest.mark.parametrize("duration", [4, 6, 10])
+@pytest.mark.parametrize("target_tag", [True, False])
+@pytest.mark.parametrize("byte_ranges", [False, True], ids=["separate-files", "byte-ranges"])
+def test_long_hls_segments_can_be_selected_automatically(
+    monkeypatch, duration, target_tag, byte_ranges
+):
+    clock = [100.0]
+    monkeypatch.setattr("footboy.sources.sniffer.time.monotonic", lambda: clock[0])
+    sniffer = StreamSniffer(timeout=30)
+    sniffer._started = clock[0]
+    url = "https://cdn.example/live.m3u8"
+    target = f"#EXT-X-TARGETDURATION:{duration}\n" if target_tag else ""
+    body = "#EXTM3U\n" + target
+    for index in range(4):
+        body += f"#EXTINF:{duration},\n"
+        body += (
+            f"#EXT-X-BYTERANGE:1000@{index * 1000}\nstream.ts\n"
+            if byte_ranges
+            else f"seg_{index}.ts\n"
+        )
+    sniffer._on_response(response(url, body))
+    requested = set()
+
+    def step(milliseconds):
+        clock[0] += milliseconds / 1000
+        index = int((clock[0] - 100) // duration)
+        if index not in requested:
+            name = "stream.ts" if byte_ranges else f"seg_{index}.ts"
+            sniffer._on_request(
+                SimpleNamespace(
+                    url=f"https://cdn.example/{name}",
+                    headers={"Range": f"bytes={index * 1000}-{(index + 1) * 1000 - 1}"}
+                    if byte_ranges
+                    else {},
+                )
+            )
+            requested.add(index)
+
+    sniffer._page = SimpleNamespace(wait_for_timeout=step)
+    sniffer._context = object()
+    monkeypatch.setattr(sniffer, "_print_candidates", lambda *a: None)
+    monkeypatch.setattr(sniffer, "_confirm", lambda candidate: Source(candidate.url))
+    assert sniffer._selection_loop().url == url
+    assert len(requested) >= 2 and clock[0] < 120
+
+
+@pytest.mark.parametrize("retry_same_segment", [False, True])
+def test_one_hls_segment_or_repeated_retries_do_not_prove_playback(monkeypatch, retry_same_segment):
+    clock = [100.0]
+    monkeypatch.setattr("footboy.sources.sniffer.time.monotonic", lambda: clock[0])
+    sniffer = StreamSniffer(timeout=25)
+    sniffer._started = clock[0]
+    url = "https://cdn.example/live.m3u8"
+    body = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nonly.ts\n"
+    sniffer._on_response(response(url, body))
+    previous = [-1]
+
+    def step(milliseconds):
+        clock[0] += milliseconds / 1000
+        index = int((clock[0] - 100) // 6)
+        if index != previous[0] and (previous[0] == -1 or retry_same_segment):
+            sniffer._on_request(SimpleNamespace(url="https://cdn.example/only.ts"))
+            previous[0] = index
+
+    sniffer._page = SimpleNamespace(wait_for_timeout=step)
+    sniffer._context = object()
+    monkeypatch.setattr(sniffer, "_print_candidates", lambda *a: None)
+    monkeypatch.setattr(sniffer, "_confirm", lambda _: pytest.fail("No advancing live segments"))
+    with pytest.raises(SniffError, match="未确认可用直播线路"):
+        sniffer._selection_loop()
 
 
 def test_extensionless_and_cross_host_segments_are_resolved():

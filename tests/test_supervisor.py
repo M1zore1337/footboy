@@ -643,3 +643,48 @@ def test_failed_line_switch_keeps_original_source_and_offset(tmp_path, monkeypat
     supervisor._finish_refresh(None, RuntimeError("目标线路暂不可用"), True)
     assert supervisor.video is old and supervisor.offset == 2
     assert supervisor.phase == "RUN" and "保留原线路" in supervisor.message
+
+
+def test_manual_request_at_refresh_measurement_start_is_not_overwritten(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path, initial_offset=0)
+    supervisor.video = Source("https://video.example/live.flv")
+    supervisor.bili = Source("https://bili.example/live.flv")
+    supervisor._refresh_revision = supervisor._revision
+    supervisor._source_generation = 1
+    monkeypatch.setattr(supervisor.muxer, "restart", lambda *a: None)
+    adjusted = threading.Event()
+    adjustments = []
+    start_measurement = supervisor._start_measurement
+
+    def adjust():
+        supervisor.request_offset_delta(5000)
+        adjusted.set()
+
+    def concurrent_start(mode):
+        worker = threading.Thread(target=adjust, daemon=True)
+        adjustments.append(worker)
+        worker.start()
+        # Submit the HTTP-style request after the refresh's manual-change
+        # decision. It may wait briefly for the measurement snapshot lock.
+        adjusted.wait(0.2)
+        start_measurement(mode)
+
+    def measure(*args, **kwargs):
+        assert adjusted.wait(3)
+        return measurement(0)
+
+    monkeypatch.setattr(supervisor, "_start_measurement", concurrent_start)
+    monkeypatch.setattr("footboy.supervisor.measure_offset", measure)
+    try:
+        supervisor._finish_refresh((supervisor.video, supervisor.bili), None, True)
+        assert adjusted.wait(3)
+        action, payload = supervisor._events.get(timeout=3)
+        assert action == "measurement_done"
+        supervisor._finish_measurement(*payload)
+    finally:
+        for worker in adjustments:
+            worker.join(timeout=3)
+    assert supervisor.offset == 5
+    assert supervisor.store.offset("0@video.example") == 5
+    assert supervisor.confidence == {"method": "manual"}
+    assert supervisor._adjust_deadline is not None

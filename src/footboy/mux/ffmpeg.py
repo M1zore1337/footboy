@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from footboy.diagnostics import redact_diagnostic
 from footboy.environment import resolve_binary
 from footboy.probe.timeline import sample_audio_start
 from footboy.sources.models import DIRECT_HTTP_PROXY, Source
@@ -399,4 +400,4 @@ def _consume_stderr(stream: TextIO, health: MuxHealth) -> None:
 
 
 def _sanitize_ffmpeg_line(line: str) -> str:
-    return re.sub(r"(https?://[^\s?'\"]+)\?[^\s'\"]+", r"\1?<redacted>", line)
+    return redact_diagnostic(line)

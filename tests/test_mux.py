@@ -79,6 +79,26 @@ def test_stderr_query_tokens_are_redacted() -> None:
     assert "cdn.example" in sanitized
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Authorization: Bearer private-secret",
+        "proxy-authorization: Basic private-secret",
+        "Cookie: sid=private-secret; other=value",
+        "Set-Cookie: sid=private-secret; path=/",
+        "Authorization: Bearer private-secret\\r\\nReferer: https://example.com/",
+        "https://user:private-secret@cdn.example/live.flv?sign=private-secret",
+        "https://cdn.example/live.flv#private-secret",
+    ],
+)
+def test_stderr_credentials_are_redacted(line):
+    from io import StringIO
+
+    health = MuxHealth()
+    _consume_stderr(StringIO(line + "\n"), health)
+    assert "private-secret" not in str(health.public_dict())
+
+
 @pytest.mark.parametrize("cancel_before_sampling", [False, True])
 def test_cancelled_audio_sampling_never_launches_ffmpeg(
     tmp_path, monkeypatch, cancel_before_sampling

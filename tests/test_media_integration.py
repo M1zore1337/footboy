@@ -19,6 +19,7 @@ import av
 import numpy as np
 import pytest
 
+from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer
 from footboy.probe.frames import keyframes
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
@@ -411,6 +412,45 @@ def test_hevc_fmp4_keeps_init_files_immutable_across_restart(tmp_path, media_ser
         assert np.array_equal(
             first_picture(tmp_path / "video.mp4"), first_picture(output / "live.m3u8")
         )
+    finally:
+        mux.stop()
+
+
+@pytest.mark.parametrize("hevc", [False, True], ids=["mpegts", "fmp4"])
+def test_repeated_mux_restarts_do_not_accumulate_retired_outputs(tmp_path, hevc):
+    clip = tmp_path / ("video.mp4" if hevc else "video.flv")
+    make_clip(clip, 1000, hevc=hevc, duration=36)
+    video = Source(str(clip), video_codec="hevc" if hevc else "h264", audio_codec="aac")
+    output = tmp_path / "hls"
+    mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+    cleaner = HlsOutputCleaner(output)
+    extension = "m4s" if hevc else "ts"
+    now = 0
+    try:
+        mux.start(video, video, 0, fresh=True)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0
+        baseline = len(list(output.glob(f"seg_*.{extension}")))
+        assert baseline == 12
+        for _ in range(3):
+            before = set(output.iterdir())
+            mux.restart(video, video, 0)
+            wait_for(lambda: mux.poll() is not None)
+            assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+            survivors = [
+                path for path in before if path.exists() and path.suffix == f".{extension}"
+            ]
+            assert survivors
+            picture = first_picture(output / "live.m3u8")
+            cleaner.collect(mux.generation, now=now)
+            assert all(path.exists() for path in survivors)
+            now += 61
+            cleaner.collect(mux.generation, now=now)
+            assert not any(path.exists() for path in survivors)
+            assert len(list(output.glob(f"seg_*.{extension}"))) == baseline
+            assert len(list(output.glob("init_*.mp4"))) == int(hevc)
+            assert np.array_equal(picture, first_picture(output / "live.m3u8"))
+            now += 1
     finally:
         mux.stop()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -14,7 +15,11 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.sources.lines import validate_line_text
+
+logger = logging.getLogger(__name__)
+OUTPUT_CLEANUP_INTERVAL = 5.0
 
 MIME_TYPES = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -53,6 +58,9 @@ class ControlServer:
         self.access_token = ""
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
+        self._cleanup_stop = threading.Event()
+        self._cleaner = HlsOutputCleaner(self.hls_dir)
 
     def start(self) -> None:
         if self._httpd is not None:
@@ -67,6 +75,11 @@ class ControlServer:
             target=self._httpd.serve_forever, name="footboy-http", daemon=True
         )
         self._thread.start()
+        self._cleanup_stop.clear()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, name="hls-cleanup", daemon=True
+        )
+        self._cleanup_thread.start()
         addresses = ["127.0.0.1", *_lan_ipv4_addresses()] if self.host == "0.0.0.0" else [self.host]
         print(f"本次控制密钥：{self.access_token}")
         print("控制页（仅将含密钥的链接交给可信操作者）：")
@@ -79,6 +92,10 @@ class ControlServer:
             print("若其他设备无法访问，请在 Windows 防火墙首次提示中允许专用网络访问。")
 
     def stop(self) -> None:
+        self._cleanup_stop.set()
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=2)
+            self._cleanup_thread = None
         if self._httpd:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -86,6 +103,19 @@ class ControlServer:
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
+
+    def _cleanup_loop(self) -> None:
+        # The server outlives individual sessions, so retired files are still
+        # reclaimed while a session is stopped or waiting to recover.
+        while not self._cleanup_stop.is_set():
+            try:
+                health = self.controller.public_status().get("ffmpeg") or {}
+                generation = health.get("generation") if health.get("running") else None
+                self._cleaner.collect(generation)
+            except Exception as exc:
+                logger.warning("HLS 文件回收暂不可用（%s），将稍后重试", type(exc).__name__)
+            if self._cleanup_stop.wait(OUTPUT_CLEANUP_INTERVAL):
+                return
 
 
 def _handler_factory(

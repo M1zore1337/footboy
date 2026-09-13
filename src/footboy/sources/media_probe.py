@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from footboy.diagnostics import redact_diagnostic
 from footboy.environment import binary_crash_reason, resolve_binary
 
 from .models import DIRECT_HTTP_PROXY, Source
@@ -58,14 +59,18 @@ def ffprobe_source(
             check=False,
             creationflags=flags,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise MediaProbeError(f"ffprobe 启动或探测失败: {exc}") from exc
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired includes the complete argv, including cookies and
+        # authorization headers. Suppress that exception's traceback as well.
+        raise MediaProbeError(f"ffprobe 探测超时（{timeout:g} 秒）") from None
+    except OSError as exc:
+        raise MediaProbeError(f"ffprobe 无法启动: {exc.strerror or type(exc).__name__}") from None
     if result.returncode != 0:
         crash = binary_crash_reason(result.returncode)
         if crash:
             raise MediaProbeError(f"ffprobe 异常终止（{crash}），请检查或更换 FFmpeg/ffprobe 构建")
         detail = result.stderr.strip().splitlines()[-1:] or ["未知错误"]
-        raise MediaProbeError(f"ffprobe 拒绝该线路: {detail[0]}")
+        raise MediaProbeError(f"ffprobe 拒绝该线路: {redact_diagnostic(detail[0])}")
     try:
         streams: list[dict[str, Any]] = json.loads(result.stdout).get("streams", [])
     except (ValueError, AttributeError) as exc:

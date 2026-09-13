@@ -781,21 +781,24 @@ class Supervisor:
         self._recovery_attempts = 0
         self._reset_health_window()
         self._set_phase("RUN", "已使用上次偏移恢复，源时间轴需要重新确认")
-        manual_changed = (
-            refresh_revision is not None
-            and refresh_revision != self._revision
-            and self.confidence is not None
-            and self.confidence.get("method") == "manual"
-        )
-        if manual_changed and self._pending_measurement is None:
-            self.message = "线路已切换，保留切换期间的最新手动偏移"
-            self._schedule_verify()
-        elif self.config.auto_measure or self._pending_measurement == "manual":
-            if self._measurement_thread is not None:
-                self._pending_measurement = "initial"
-            else:
-                pending, self._pending_measurement = self._pending_measurement, None
-                self._start_measurement(pending or "initial")
+        with self._lock:
+            # As in bootstrap, the manual-change decision and measurement
+            # revision snapshot must be atomic with HTTP adjustment requests.
+            manual_changed = (
+                refresh_revision is not None
+                and refresh_revision != self._revision
+                and self.confidence is not None
+                and self.confidence.get("method") == "manual"
+            )
+            if manual_changed and self._pending_measurement is None:
+                self.message = "线路已切换，保留切换期间的最新手动偏移"
+                self._schedule_verify()
+            elif self.config.auto_measure or self._pending_measurement == "manual":
+                if self._measurement_thread is not None:
+                    self._pending_measurement = "initial"
+                else:
+                    pending, self._pending_measurement = self._pending_measurement, None
+                    self._start_measurement(pending or "initial")
 
     def _reset_health_window(self) -> None:
         self._last_segment_change = time.monotonic()

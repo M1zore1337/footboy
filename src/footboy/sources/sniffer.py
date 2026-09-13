@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import queue
 import re
@@ -44,6 +45,9 @@ class Candidate:
     segments: set[str] = field(default_factory=set)
     request_open: bool = False
     browser_blocked: bool = False
+    segment_duration: float = 2.0
+    last_segment_key: tuple[str, str | None] | None = None
+    last_progress_at: float = 0.0
 
     def active(self, now: float) -> bool:
         # A continuously downloaded FLV has no child segment requests; its own
@@ -51,7 +55,25 @@ class Candidate:
         if self.kind == "flv":
             return self.request_open
         last_activity = self.last_segment_at
-        return last_activity > 0 and now - last_activity <= 3.0
+        return last_activity > 0 and now - last_activity <= max(3.0, 2 * self.segment_duration)
+
+    def observe_segment(self, url: str, now: float, byte_range: str | None = None) -> None:
+        if now < self.last_segment_at:
+            return
+        key = (url, byte_range)
+        if key != self.last_segment_key:
+            self.last_segment_key = key
+            self.last_progress_at = now
+        self.last_segment_at = now
+
+    def ready_for_auto_select(self, now: float) -> bool:
+        if self.stable_since is None or now - self.stable_since < 10:
+            return False
+        # A longer activity window must not turn a single downloaded segment
+        # (or repeated retries of that segment) into proof of live playback.
+        return (
+            self.kind == "flv" or self.browser_blocked or self.last_progress_at > self.stable_since
+        )
 
     @property
     def display_url(self) -> str:
@@ -74,7 +96,7 @@ class StreamSniffer:
         self._abort = threading.Event()
         self._page: Any = None
         self._context: Any = None
-        self._recent_requests: dict[str, float] = {}
+        self._recent_requests: dict[str, tuple[float, str | None]] = {}
         self._started = 0.0
         self._lines: list[str] = []
         self._selected_line: str | None = None
@@ -322,6 +344,7 @@ class StreamSniffer:
 
         kind: str | None = None
         segments: set[str] = set()
+        segment_duration = 2.0
         if ".m3u8" in lower_url or content_type in PLAYLIST_TYPES:
             try:
                 body = response.body().decode("utf-8", errors="replace")
@@ -335,6 +358,7 @@ class StreamSniffer:
                 return
             kind = "hls"
             segments = _playlist_segments(url, body)
+            segment_duration = _playlist_segment_duration(body)
         elif ".flv" in lower_url or content_type in FLV_TYPES:
             kind = "flv"
 
@@ -362,22 +386,40 @@ class StreamSniffer:
                 candidate.segments = segments
                 candidate.request_open = kind == "flv"
                 candidate.browser_blocked = False
-                candidate.last_segment_at = max(
-                    (self._recent_requests.get(segment, 0) for segment in segments), default=0
-                )
+                candidate.segment_duration = segment_duration
+                for when, segment, byte_range in sorted(
+                    (
+                        self._recent_requests[segment][0],
+                        segment,
+                        self._recent_requests[segment][1],
+                    )
+                    for segment in segments
+                    if segment in self._recent_requests
+                ):
+                    candidate.observe_segment(segment, when, byte_range)
 
     def _on_request(self, request: Any) -> None:
         now = time.monotonic()
+        byte_range = next(
+            (
+                value
+                for name, value in getattr(request, "headers", {}).items()
+                if name.lower() == "range"
+            ),
+            None,
+        )
         with self._lock:
             self._request_generations[id(request)] = self._generation
-            self._recent_requests[request.url] = now
+            self._recent_requests[request.url] = (now, byte_range)
             if len(self._recent_requests) > 500:
                 self._recent_requests = {
-                    url: when for url, when in self._recent_requests.items() if now - when < 20
+                    url: activity
+                    for url, activity in self._recent_requests.items()
+                    if now - activity[0] < 20
                 }
             for candidate in self._candidates.values():
                 if request.url in candidate.segments:
-                    candidate.last_segment_at = now
+                    candidate.observe_segment(request.url, now, byte_range)
 
     def _on_request_finished(self, request: Any) -> None:
         with self._lock:
@@ -453,6 +495,7 @@ class StreamSniffer:
                 identifier=self._next_identifier,
                 segments=segments,
                 browser_blocked=True,
+                segment_duration=_playlist_segment_duration(body) if kind == "hls" else 2.0,
             )
             self._next_identifier += 1
             self.message = "已获取浏览器拦截的媒体请求，等待 ffprobe 验收"
@@ -506,7 +549,7 @@ class StreamSniffer:
                 chosen = next((c for c in ranked if c.identifier == int(command)), None)
             if chosen is None and ranked and command != "c" and self._auto_select:
                 best = ranked[0]
-                if best.stable_since is not None and now - best.stable_since >= 10:
+                if best.ready_for_auto_select(now):
                     chosen = best
             if chosen is not None:
                 try:
@@ -633,6 +676,21 @@ def _playlist_segments(url: str, body: str) -> set[str]:
             if match:
                 result.add(urljoin(url, match.group(1)))
     return result
+
+
+def _playlist_segment_duration(body: str) -> float:
+    durations = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith(("#EXT-X-TARGETDURATION:", "#EXTINF:")):
+            continue
+        try:
+            value = float(line.partition(":")[2].partition(",")[0])
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0:
+            durations.append(value)
+    return max(durations, default=2.0)
 
 
 def _live_playlist(body: str) -> bool:

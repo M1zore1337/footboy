@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
 
+from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.serve.http import FILE_CHUNK_SIZE, ControlServer
 
 
@@ -84,6 +86,34 @@ def api_request(running_server, path, *, data=None, headers=None, method=None):
         },
         method=method,
     )
+
+
+def test_server_reclaims_retired_files_after_session_stops(tmp_path, monkeypatch):
+    controller = FakeController()
+    monkeypatch.setattr(
+        controller,
+        "public_status",
+        lambda: {"state": "STOPPED", "ffmpeg": {"running": False, "generation": 2}},
+    )
+    retired, current = tmp_path / "seg_1_1.ts", tmp_path / "seg_2_1.ts"
+    retired.write_bytes(b"old segment")
+    current.write_bytes(b"last playable segment")
+    (tmp_path / "live.m3u8").write_text("#EXTM3U\n#EXTINF:0.01,\nseg_2_1.ts\n#EXT-X-ENDLIST\n")
+    server = ControlServer(controller, tmp_path, host="127.0.0.1", port=0)
+    server._cleaner = HlsOutputCleaner(tmp_path, grace_period=0.01)
+    monkeypatch.setattr("footboy.serve.http.OUTPUT_CLEANUP_INTERVAL", 0.01)
+    server.start()
+    worker = server._cleanup_thread
+    try:
+        deadline = time.monotonic() + 3
+        while retired.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not retired.exists()
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.port}/{current.name}") as response:
+            assert response.read() == b"last playable segment"
+    finally:
+        server.stop()
+    assert not worker.is_alive()
 
 
 def test_status_is_private_and_hls_remains_public(running_server) -> None:
