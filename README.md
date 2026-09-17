@@ -106,6 +106,42 @@ Footboy 核心依赖 **Python 3.10+** 与 **FFmpeg 6.0+**。自动 OCR 同步推
 
 ### 2. 安装与运行 Footboy
 
+在项目目录中执行一键启动脚本，**首次启动会自动完成初始化**：
+
+```bash
+# macOS / Linux
+./start.sh
+
+# 可选：先单独初始化，暂不启动服务
+./setup.sh
+```
+
+```powershell
+# Windows PowerShell / CMD
+.\start.bat
+
+# 可选：先单独初始化
+.\setup.bat
+```
+
+脚本会检查 Python 3.10+、FFmpeg 6.0+ 和 ffprobe，自动创建项目内的 `.venv`，安装 Footboy、Tesseract 的 Python 接口和 Playwright Chromium，并实际启动无头浏览器验证安装。**FFmpeg 和 Tesseract 本体仍按上一步安装**，也可以放在 `tools/`；缺少 Tesseract 不会阻止手动同步。
+
+后续启动会复用环境；`pyproject.toml` 变更、依赖缺失或 Chromium 被清理时会自动重新初始化。安装中断后可直接重试；主动运行 `setup` 脚本可重新安装和检查环境。无需激活虚拟环境，源码修改会在下次启动时生效。
+
+```bash
+./start.sh --host 127.0.0.1 --port 8090     # 启动参数原样传给 footboy
+./start.sh --no-auto-measure               # 只做手动同步
+./start.sh --check                         # 检查 FFmpeg / ffprobe 后退出
+./setup.sh --with-deps                     # Linux：同时安装 Chromium 系统库，可能请求 sudo
+```
+
+Windows 使用相同参数，将 `./start.sh` / `./setup.sh` 换成 `.\start.bat` / `.\setup.bat`。如需指定 Python，在运行脚本前将环境变量 `FOOTBOY_PYTHON` 设为 Python 3.10+ 可执行文件的路径（不附加参数）；已有 `.venv` 会继续复用。
+
+脚本始终以项目根目录为工作目录，`hls_out/`、`state.json` 以及相对路径参数都以此为准。服务在当前终端运行，按 `Ctrl+C` 停止。首次安装需要联网下载依赖和 Chromium，后续环境检查无需联网。
+
+<details>
+<summary>手动安装方式</summary>
+
 ```bash
 # 1. 创建并激活虚拟环境
 # macOS / Linux
@@ -122,6 +158,8 @@ python -m playwright install chromium                 # Linux 缺失系统库改
 footboy --check                                       # 验证 FFmpeg 与 ffprobe 可用
 footboy                                               # 启动服务（默认监听 0.0.0.0:8080）
 ```
+
+</details>
 
 终端将打印带有访问密钥的专属控制链接，例如：
 ```text
@@ -390,8 +428,9 @@ python -m pip install -e ".[dev,tesseract]"
 git config core.hooksPath .githooks                  # 启用内置 Git Commit 钩子检查
 
 # 执行质量检查套件
-ruff check src tests                                 # 代码静态规范审查
-ruff format --check src tests                        # 格式规范审查
+ruff check src scripts tests                         # 代码静态规范审查
+ruff format --check src scripts tests                # 格式规范审查
+bash -n setup.sh && bash -n start.sh                 # 启动脚本语法校验
 node --check src/footboy/serve/static/app.js         # 前端脚本语法校验
 node --check src/footboy/serve/static/i18n.js        # 语言表与切换脚本校验
 python -m pytest -ra -m "not slow"                   # 快速单元测试（秒级回归）

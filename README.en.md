@@ -93,6 +93,42 @@ For portable installations or systems without administrator access, see [Externa
 
 ### 2. Install Footboy
 
+Run the launcher from the repository checkout. **The first launch sets up the environment automatically:**
+
+```bash
+# macOS / Linux
+./start.sh
+
+# Optional: set up without starting the server
+./setup.sh
+```
+
+```powershell
+# Windows PowerShell / CMD
+.\start.bat
+
+# Optional: set up without starting the server
+.\setup.bat
+```
+
+The scripts check Python 3.10+, FFmpeg 6.0+ and ffprobe, create a local `.venv`, install Footboy with the Tesseract Python interface and Playwright Chromium, and launch a headless browser to verify the installation. **Install the FFmpeg and Tesseract executables as described above**, or place them in `tools/`. Missing Tesseract does not prevent manual synchronization.
+
+Later launches reuse the environment. Changes to `pyproject.toml`, missing dependencies or a missing Chromium installation trigger setup again. Rerun after an interrupted installation; run the setup script explicitly to reinstall and check the environment. Activation is unnecessary, and source changes take effect on the next launch.
+
+```bash
+./start.sh --lang en --host 127.0.0.1 --port 8090
+./start.sh --lang en --no-auto-measure    # Manual sync only
+./start.sh --lang en --check              # Check FFmpeg / ffprobe and exit
+./setup.sh --lang en --with-deps          # Linux: install Chromium system libraries; may request sudo
+```
+
+All launch arguments are passed to `footboy`. On Windows, use `.\start.bat` / `.\setup.bat` with the same arguments. To select a Python interpreter, set `FOOTBOY_PYTHON` to its executable path (without arguments); an existing `.venv` is still reused. Setup messages also support `--lang en` and `FOOTBOY_LANG=en`.
+
+The scripts always use the repository root as the working directory, including for `hls_out/`, `state.json` and relative path arguments. The server runs in the current terminal; press `Ctrl+C` to stop it. Initial installation needs internet access to download packages and Chromium; subsequent environment checks work offline.
+
+<details>
+<summary>Manual installation</summary>
+
 From a checkout of this repository, create and activate a virtual environment:
 
 ```bash
@@ -118,6 +154,8 @@ footboy --lang en
 ```
 
 For manual sync only, install the base package with `python -m pip install .` and start with `--no-auto-measure`. On Linux, if Chromium is missing system libraries, use `python -m playwright install --with-deps chromium`.
+
+</details>
 
 The terminal prints a fresh control token and links such as:
 
@@ -383,8 +421,9 @@ These reports distinguish synthetic media tests, offline recordings, and live-so
 python -m pip install -e ".[dev,tesseract]"
 git config core.hooksPath .githooks
 
-ruff check src tests
-ruff format --check src tests
+ruff check src scripts tests
+ruff format --check src scripts tests
+bash -n setup.sh && bash -n start.sh
 node --check src/footboy/serve/static/app.js
 node --check src/footboy/serve/static/i18n.js
 python -m pytest -ra -m "not slow and not browser"
