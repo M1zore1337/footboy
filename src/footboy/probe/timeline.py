@@ -16,10 +16,15 @@ class TimelineProbeError(RuntimeError):
 def _sample_packet(source: Source, kind: str, stop_event: threading.Event) -> tuple[float, float]:
     import av
 
-    started = time.monotonic()
     if stop_event.is_set():
         raise TimelineProbeError(tr("Timeline sampling cancelled"))
     try:
+        source = source.for_reader()
+        if stop_event.is_set():
+            raise TimelineProbeError(tr("Timeline sampling cancelled"))
+        # A new signature can take time to resolve. Anchor the sample to opening
+        # its connection, not to the earlier API request.
+        started = time.monotonic()
         with av.open(source.url, options=source.pyav_options(), timeout=(8.0, 5.0)) as container:
             streams = container.streams.video if kind == "video" else container.streams.audio
             if not streams:
@@ -35,7 +40,9 @@ def _sample_packet(source: Source, kind: str, stop_event: threading.Event) -> tu
                         # Transport and source latency remain unknown; matching
                         # the live edges is only an initial timeline estimate.
                         return pts, started
-    except (OSError, ValueError) as exc:
+    except TimelineProbeError:
+        raise
+    except Exception as exc:
         raise TimelineProbeError(tr("Cannot read the source timeline: {0}", exc)) from exc
     raise TimelineProbeError(tr("Timeline sampling returned no valid PTS"))
 

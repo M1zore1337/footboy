@@ -58,12 +58,19 @@ def parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         description=tr("P0: validate two live inputs, offset, and HLS using direct media URLs."),
     )
     result.add_argument("--video-url", required=True, help=tr("Direct match media URL"))
-    result.add_argument("--bili-url", required=True, help=tr("Direct commentary media URL"))
+    result.add_argument(
+        "--commentary-url",
+        "--bili-url",
+        dest="bili_url",
+        metavar="URL",
+        required=True,
+        help=tr("Direct commentary media URL"),
+    )
     result.add_argument(
         "--offset",
         required=True,
         type=float,
-        help=tr("Offset D in seconds; positive values delay Bilibili audio"),
+        help=tr("Offset D in seconds; positive values delay commentary audio"),
     )
     result.add_argument(
         "--video-header",
@@ -78,7 +85,9 @@ def parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         help=tr("Bypass proxies for the match media stream"),
     )
     result.add_argument(
+        "--commentary-header",
         "--bili-header",
+        dest="bili_header",
         action="append",
         default=[],
         metavar="NAME:VALUE",

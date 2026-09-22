@@ -17,7 +17,7 @@ from footboy.i18n import tr
 
 from .lines import LINE_SELECTOR, is_line_label, normalize_line_text, validate_line_text
 from .media_probe import MediaProbeError, ffprobe_source
-from .models import Source
+from .models import Source, merge_headers
 
 PLAYLIST_TYPES = {
     "application/vnd.apple.mpegurl",
@@ -85,11 +85,21 @@ class Candidate:
 
 class StreamSniffer:
     def __init__(
-        self, *, ffprobe: str | Path = "ffprobe", timeout: float = 300, no_proxy: bool = False
+        self,
+        *,
+        ffprobe: str | Path = "ffprobe",
+        timeout: float = 300,
+        no_proxy: bool = False,
+        headers: dict[str, str] | None = None,
+        cookies: list[dict[str, Any]] | None = None,
+        require_audio: bool = False,
     ) -> None:
         self.ffprobe = ffprobe
         self.timeout = timeout
         self.no_proxy = no_proxy
+        self.headers = dict(headers or {})
+        self.cookies = list(cookies or [])
+        self.require_audio = require_audio
         self._candidates: dict[str, Candidate] = {}
         self._lock = threading.RLock()
         self._commands: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -158,7 +168,7 @@ class StreamSniffer:
                     playwright, PlaywrightError, headless=headless, no_proxy=self.no_proxy
                 )
                 try:
-                    self._context = browser.new_context()
+                    self._context = self._create_context(browser)
                     self._page = self._context.new_page()
                     main_page = self._page
                     self._context.on("page", lambda page: self._close_popup(page, main_page))
@@ -187,7 +197,7 @@ class StreamSniffer:
                         if response is not None and response.status >= 400:
                             raise SniffError(
                                 tr(
-                                    "The match page denied access (HTTP {0}); cannot list streams",
+                                    "The source page denied access (HTTP {0}); cannot list streams",
                                     response.status,
                                 )
                             )
@@ -284,6 +294,18 @@ class StreamSniffer:
                 page.close()
             except Exception:
                 pass
+
+    def _create_context(self, browser: Any) -> Any:
+        options: dict[str, Any] = {}
+        if self.headers:
+            options["extra_http_headers"] = self.headers
+            agent = Source("", headers=self.headers).header("user-agent")
+            if agent:
+                options["user_agent"] = agent
+        context = browser.new_context(**options)
+        if self.cookies:
+            context.add_cookies(self.cookies)
+        return context
 
     def _discover_lines(self) -> None:
         if self._page is None:
@@ -657,13 +679,17 @@ class StreamSniffer:
         cookies = self._context.cookies([candidate.url, *candidate.segments])
         source = Source(
             url=candidate.url,
-            headers=dict(candidate.headers),
+            headers=merge_headers(candidate.headers, self.headers),
             cookies=cookies,
             kind=candidate.kind,
             line_text=candidate.line_text,
             no_proxy=self.no_proxy,
         )
         probed = ffprobe_source(source, ffprobe=self.ffprobe, timeout=15)
+        if self.require_audio and not probed.has_audio:
+            raise MediaProbeError(
+                tr("The commentary input has no audio; choose another room or direct media URL")
+            )
         if self._abort.is_set():
             raise SniffError(tr("Stream discovery cancelled"))
         if generation != self._generation or self._pending_line:
@@ -764,5 +790,24 @@ def _request_headers(request: Any) -> dict[str, str]:
     return {
         name: value
         for name, value in headers.items()
-        if name.lower() in {"user-agent", "referer", "origin"}
+        # Transfer application headers (including Authorization and platform
+        # tokens), leaving cookies scoped in the browser jar. Range/cache and
+        # transport negotiation belong to the new media client's own requests.
+        if name.lower()
+        not in {
+            "cookie",
+            "host",
+            "connection",
+            "content-length",
+            "accept-encoding",
+            "range",
+            "if-range",
+            "if-match",
+            "if-none-match",
+            "if-modified-since",
+            "if-unmodified-since",
+            "proxy-authorization",
+            "transfer-encoding",
+        }
+        and not name.startswith(":")
     }

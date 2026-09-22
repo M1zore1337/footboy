@@ -139,7 +139,7 @@ def measure_offset(
             except Exception as exc:
                 errors[label] = exc
     if errors:
-        labels = {"video": tr("Match video"), "bili": tr("Bilibili room")}
+        labels = {"video": tr("Match video"), "bili": tr("Commentary source")}
         message = tr("; ").join(tr("{0}: {1}", labels[key], value) for key, value in errors.items())
         if any(isinstance(exc, OcrCancelled) for exc in errors.values()):
             raise OcrCancelled(message)

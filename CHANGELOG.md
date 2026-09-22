@@ -2,6 +2,17 @@
 
 每次 Git 提交都同步记录实际变更、验证结果与已知限制。
 
+## [多平台解说源] - 2026-09-22
+
+- 解说源扩展到多平台直播间：保留 B 站专用解析，增加 Streamlink、yt-dlp 提取与网页嗅探兜底，支持斗鱼、虎牙等平台和 HTTP(S) 媒体直链；提取结果仍需通过媒体探测。
+- Web 控制台与中英文提示改用通用“解说”名称。CLI 新增 `--commentary-room`、`--commentary-direct`、`--commentary-cookies`，直链工具新增 `--commentary-url`、`--commentary-header`；原 `--bili-*` 参数继续可用。启动 API 新增 `commentary_url`、`commentary_direct`、`commentary_headers`，兼容旧字段及已有配置。
+- 基础依赖增加 `streamlink>=8.6.1`，确保包含斗鱼插件，仍兼容 Python 3.10+；暂约束 `urllib3<2.8`，避免当前 Streamlink 与 yt-dlp 的 URL 处理补丁冲突。一键初始化会补装兼容依赖；中英文 README 补充平台示例、Cookie/请求头、升级方式和支持范围。
+- 修复斗鱼鉴权直链被多个读取器复用时的截断问题：媒体探测、时间轴采样、OCR、音频采样及混流分别取得新的签名地址，保留请求上下文和源 PTS。运行时解析回调不进入序列化或公开状态。
+- 解说 HLS 使用正确的解复用选项；浏览器回退保留动态鉴权头；Cookie 文件支持会话 Cookie，并兼容 FFmpeg 的根路径 Cookie 代理行为，避免无关域的同名 Cookie 覆盖当前源。
+- 公开斗鱼、虎牙房间的取流、持续 HLS 输出与实际音频包解码通过；斗鱼在混流期间并发取帧后持续播放，无重连或 DTS 错误。范围与条件见[验证记录](docs/validation/validation-commentary-platforms-2026-09-22.md)。
+- 完整回归 **503 项通过、0 跳过**，包含真实本地媒体与浏览器流程，耗时 240.82 秒；Ruff、格式、JavaScript / Shell 语法及差异检查通过。使用文档统一使用房间号占位符，验证记录不包含真实房间号或地址。
+- 本轮支持可访问的公开直播及用户已有权限的媒体流，不保证所有平台或房间可用。未开播、登录/地区限制、反爬、签名失效及上游提取器适配情况仍影响可用性；不支持仅 DRM/WebRTC 可播放的流或纯音频解说，自动 OCR 仍要求两路显示同场比赛时钟。
+
 ## [首次配置与一键启动] - 2026-09-17
 
 - 新增 macOS/Linux 的 `setup.sh`、`start.sh` 和 Windows 的 `setup.bat`、`start.bat`，共用初始化逻辑。首次启动自动创建 `.venv`，安装项目、Tesseract Python 接口和 Playwright Chromium；支持单独初始化、指定 Python、外部程序路径及启动参数透传。

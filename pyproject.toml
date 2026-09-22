@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "footboy"
 version = "0.1.4"
-description = "Footboy (足小子): synchronize football video with Bilibili live audio over LAN HLS."
+description = "Footboy (足小子): synchronize football video with live commentary audio over LAN HLS."
 readme = "README.md"
 authors = [
   { name = "M1zore1337", email = "251878200+M1zore1337@users.noreply.github.com" },
@@ -38,6 +38,9 @@ dependencies = [
   "numpy>=1.24",
   "opencv-python>=4.8",
   "playwright>=1.40",
+  "streamlink>=8.6.1",
+  # Streamlink and yt-dlp URL patches conflict with urllib3 2.8's percent decoding.
+  "urllib3>=2,<2.8",
   "yt-dlp>=2024.1",
 ]
 

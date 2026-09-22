@@ -293,7 +293,7 @@ function updateStatus(status) {
   $('alignment').classList.toggle('warning', !active || !aligned || Boolean(confidence?.stopped));
   setText($('offset-note'), !active ? t("Connect to adjust") : status.adjust_pending
     ? t('Pending · Playing at {0}s', Number(status.applied_offset_seconds ?? offset).toFixed(3))
-    : t("Positive values delay Bilibili audio"));
+    : t("Positive values delay commentary audio"));
   setText($('ffmpeg-status'), status.ffmpeg?.running ? t("Running") : active ? t("Waiting to start") : t("Not running"));
   $('health-light').classList.toggle('on', Boolean(status.ffmpeg?.running));
   setText($('confidence'), confidence?.video_samples != null
@@ -431,7 +431,7 @@ function attachPlayer(generation) {
   detachPlayer(); playerGeneration = generation;
   const source = `/live.m3u8?g=${encodeURIComponent(generation)}`;
   setText($('player-state'), t("Buffering"));
-  setText($('player-message'), t("Original video quality · Bilibili commentary"));
+  setText($('player-message'), t("Original video quality · Live commentary"));
   // Chromium can advertise native HLS while failing to parse live TS streams.
   // Keep native playback on Apple browsers and use MSE elsewhere when available.
   const nativeHls = Boolean(player.canPlayType('application/vnd.apple.mpegurl'));

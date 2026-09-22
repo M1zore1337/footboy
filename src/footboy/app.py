@@ -9,8 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from footboy.environment import check_binary
-from footboy.i18n import exception_message, tr
-from footboy.sources.bili import BiliResolveError, _room_id
+from footboy.i18n import tr
 from footboy.sources.lines import validate_line_text
 from footboy.supervisor import Supervisor, SupervisorConfig
 
@@ -125,7 +124,7 @@ class Application:
                     "confidence": None,
                     "last_verified_at": None,
                     "ffmpeg": {"running": False},
-                    "message": tr("Enter the match page and Bilibili room to connect"),
+                    "message": tr("Enter the match page and commentary room to connect"),
                     "estimated_latency_seconds": tr(
                         "Slower source latency + approximately 6–10 seconds of HLS buffering"
                     ),
@@ -148,20 +147,20 @@ class Application:
                 "video_no_proxy": self.defaults.video_no_proxy,
                 "video_line_text": self.defaults.video_line_text,
                 "bili_direct": self.defaults.bili_direct,
+                "commentary_direct": self.defaults.bili_direct,
             }
             return value
 
 
 def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> SupervisorConfig:
     video = _http_url(body.get("video_url"), tr("Match URL"))
-    bili = _http_url(body.get("bili_url"), tr("Bilibili URL"))
+    bili = _http_url(_commentary_value(body, "url"), tr("Commentary URL"))
     video_direct = _boolean(body, "video_direct", defaults.video_direct)
-    bili_direct = _boolean(body, "bili_direct", defaults.bili_direct)
-    if not bili_direct:
-        try:
-            _room_id(bili)
-        except BiliResolveError as exc:
-            raise ValueError(exception_message(exc)) from exc
+    bili_direct = _boolean(
+        {"commentary_direct": _commentary_value(body, "direct", defaults.bili_direct)},
+        "commentary_direct",
+        defaults.bili_direct,
+    )
     auto = _boolean(body, "auto_measure", defaults.auto_measure)
     offset = body.get("offset_seconds", defaults.initial_offset)
     if offset is not None:
@@ -185,10 +184,22 @@ def session_config(defaults: SupervisorConfig, body: dict[str, Any]) -> Supervis
         else None,
         bili_direct=bili_direct,
         video_headers=_headers(body.get("video_headers", defaults.video_headers)),
-        bili_headers=_headers(body.get("bili_headers", defaults.bili_headers)),
+        bili_headers=_headers(_commentary_value(body, "headers", defaults.bili_headers)),
         auto_measure=auto,
         initial_offset=offset,
     )
+
+
+def _commentary_value(body: dict[str, Any], suffix: str, default: Any = None) -> Any:
+    """Accept the public commentary names and the original Bilibili API fields."""
+    name, legacy = f"commentary_{suffix}", f"bili_{suffix}"
+    if (
+        name in body
+        and legacy in body
+        and (type(body[name]) is not type(body[legacy]) or body[name] != body[legacy])
+    ):
+        raise ValueError(tr("{0} and {1} must agree when both are provided", name, legacy))
+    return body.get(name, body.get(legacy, default))
 
 
 def _http_url(value: Any, label: str) -> str:

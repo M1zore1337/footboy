@@ -44,7 +44,7 @@ def test_command_uses_copyts_and_signed_itsoffset(tmp_path) -> None:
     assert offset_index < command.index(bili.url)
     assert "-re" not in command
     assert "-start_at_zero" not in command
-    assert command[command.index("-cookies") + 1] == "token=v; path=/; domain=video.example;\r\n"
+    assert command[command.index("-cookies") + 1] == "token=v; domain=video.example;\r\n"
     assert command[command.index("-c:v") + 1] == "copy"
     assert command[command.index("-c:a") + 1] == "copy"
     assert command[command.index("-hls_segment_type") + 1] == "mpegts"
@@ -59,6 +59,20 @@ def test_hevc_uses_fmp4_and_non_aac_is_transcoded(tmp_path) -> None:
     assert "-hls_fmp4_init_filename" in command
     assert command[command.index("-c:a") + 1] == "aac"
     assert "128k" in command
+
+
+def test_hls_commentary_gets_demuxer_options_and_its_own_request_context(tmp_path):
+    video, commentary = _sources()
+    commentary.url = "https://cdn.huya.example/live.m3u8"
+    commentary.kind = "hls"
+    commentary.headers = {"Referer": "https://www.huya.com/room", "User-Agent": "CommentaryUA"}
+    commentary.cookies = [{"name": "sid", "value": "fixture", "domain": "cdn.huya.example"}]
+    command = build_ffmpeg_command(video, commentary, 2.5, tmp_path)
+    second_input = command[command.index(video.url) + 1 : command.index(commentary.url)]
+    assert second_input[second_input.index("-allowed_extensions") + 1] == "ALL"
+    assert second_input[second_input.index("-user_agent") + 1] == "CommentaryUA"
+    assert "https://www.huya.com/room" in second_input[second_input.index("-headers") + 1]
+    assert "sid=fixture" in second_input[second_input.index("-cookies") + 1]
 
 
 def test_stderr_health_parser_handles_carriage_return_stats() -> None:

@@ -8,7 +8,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Platform: Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#跨设备与局域网观看)
 
-把看球网站的比赛画面与 B 站直播间的解说音源同步组合，输出局域网 HLS 串流。
+把看球网站的比赛画面与 B 站、斗鱼、虎牙等直播平台的解说音源同步组合，输出局域网 HLS 串流。
 
 ![Footboy 控制台](docs/images/webui-1440.png)
 
@@ -23,10 +23,11 @@
 
 > **项目初衷**：平时看球习惯看第三方看球网站的画面，同时听 B 站主播解说；但两路直播往往有数秒甚至几十秒的时延差，手动暂停对齐既麻烦又容易再次漂移。Footboy 通过 OCR 识别两路画面的比赛走表，自动计算时间轴偏差并混流，输出局域网 HLS 串流供手机、电视或平板观看。
 >
-> *注：目前仅针对作者自己常用的看球网站与 B 站直播间进行了实测，后续会考虑拓展对更多直播网站与平台的支持。*
+> *既有直播实测主要覆盖作者常用的看球网站与 B 站直播间；现已补充斗鱼、虎牙的取流和持续混流验证，见[多平台验证记录](docs/validation/validation-commentary-platforms-2026-09-22.md)。各平台的可用性仍取决于直播状态、访问权限和上游提取器，详见[解说平台与访问方式](#解说平台与访问方式)。*
 
 ### 核心特性
 
+- **多平台解说源**：保留 B 站专用解析，通过 Streamlink、yt-dlp 接入斗鱼、虎牙等平台，并提供网页嗅探和 HTTP(S) 媒体直链入口。
 - **视频原画复制**：画面始终复制原画质（Stream Copy），音频按需转为 AAC 混流，占用低。
 - **自动 / 手动时钟同步**：OCR 读取两路比赛计时自动对齐；支持交互框选 ROI、多方向翻转与六档手动微调（±0.1s / ±0.5s / ±2s）。
 - **微调优先与防抖**：微调按钮 1.5 秒连续点击防抖；手动设置优先，过期的定时测量不会覆盖手动偏移。
@@ -39,7 +40,7 @@
 flowchart TD
     subgraph Input ["1. 直播源接入"]
         V["看球网站页面 / 媒体直链<br/>(视频画面)"]
-        B["B 站直播间 / 媒体直链<br/>(解说音频)"]
+        B["B 站、斗鱼、虎牙等直播间 / 媒体直链<br/>(解说音频)"]
     end
 
     subgraph Core ["2. Footboy 混流核心"]
@@ -73,6 +74,7 @@ flowchart TD
 - [语言切换](#语言切换)
 - [外部依赖准备](#外部依赖准备)
 - [连接与观看指南](#连接与观看指南)
+- [解说平台与访问方式](#解说平台与访问方式)
 - [跨设备与局域网观看](#跨设备与局域网观看)
 - [常见问题 (FAQ)](#常见问题-faq)
 - [同步原理](#同步原理)
@@ -124,9 +126,11 @@ Footboy 核心依赖 **Python 3.10+** 与 **FFmpeg 6.0+**。自动 OCR 同步推
 .\setup.bat
 ```
 
-脚本会检查 Python 3.10+、FFmpeg 6.0+ 和 ffprobe，自动创建项目内的 `.venv`，安装 Footboy、Tesseract 的 Python 接口和 Playwright Chromium，并实际启动无头浏览器验证安装。**FFmpeg 和 Tesseract 本体仍按上一步安装**，也可以放在 `tools/`；缺少 Tesseract 不会阻止手动同步。
+脚本会检查 Python 3.10+、FFmpeg 6.0+ 和 ffprobe，自动创建项目内的 `.venv`，安装 Footboy、Streamlink、yt-dlp、Tesseract 的 Python 接口和 Playwright Chromium，并实际启动无头浏览器验证安装。**FFmpeg 和 Tesseract 本体仍按上一步安装**，也可以放在 `tools/`；缺少 Tesseract 不会阻止手动同步。
 
 后续启动会复用环境；`pyproject.toml` 变更、依赖缺失或 Chromium 被清理时会自动重新初始化。安装中断后可直接重试；主动运行 `setup` 脚本可重新安装和检查环境。无需激活虚拟环境，源码修改会在下次启动时生效。
+
+从旧版本升级后，一键启动会补装新增的 Streamlink 依赖。手动安装用户请在原虚拟环境、项目根目录重新运行 `python -m pip install -e ".[tesseract]"`。平台改版导致解析失败时，可用 `python -m pip install --upgrade -e ".[tesseract]" streamlink yt-dlp` 更新提取器，同时保留项目声明的兼容约束。
 
 ```bash
 ./start.sh --host 127.0.0.1 --port 8090     # 启动参数原样传给 footboy
@@ -241,11 +245,11 @@ footboy \
 ### 核心操作流程
 
 ```
-[输入比赛页与B站地址] ➔ [点击连接 (弹出嗅探窗口)] ➔ [OCR自动对齐或框选ROI] ➔ [局域网同看 / 独立音量微调]
+[输入比赛页与解说直播间地址] ➔ [点击连接 (按需弹出嗅探窗口)] ➔ [OCR自动对齐或框选ROI] ➔ [局域网同看 / 独立音量微调]
 ```
 
-1. **输入直播地址**：在 Web 控制台输入比赛页面 URL 和 B 站直播间 URL（若是 m3u8/flv 媒体直链，请勾选“媒体直链”）。
-2. **嗅探连接**：点击「连接」。运行 Footboy 的主机将自动弹出 Chromium 窗口进行流媒体与鉴权 Cookie 捕获（支持 iframe 线路智能嗅探）。
+1. **输入直播地址**：在 Web 控制台输入比赛页面 URL 和解说直播间 URL，例如 B 站、斗鱼或虎牙（若是 m3u8/flv 媒体直链，请勾选“媒体直链”）。
+2. **解析连接**：点击「连接」。解说地址先尝试平台提取器；需要网页嗅探时，运行 Footboy 的主机将弹出 Chromium 窗口进行流媒体与鉴权 Cookie 捕获（支持 iframe 线路）。
 3. **时钟对齐**：
    - **自动对齐**：若两路画面均有清晰的同场比赛走表，Footboy 将在几秒内自动识别并完成 PTS 时钟对齐。
    - **区域框选 (ROI)**：若由于比分牌样式特殊导致未识别，点击画面选择视频方向，框选计时牌区域并保存，系统将立即进行单帧试读与连续验证。
@@ -255,7 +259,7 @@ footboy \
    - 🐢 **解说滞后（声音比画面慢）** ➔ 点击 **`-0.1s` / `-0.5s` / `-2s`**（提前声音，减少延迟）。
    > 💡 **连续点击防抖**：连续点击微调按钮将在停顿 1.5 秒后合并应用，无需担心频繁重启混流。手动调整后，定时复核仅提供建议，不会覆盖你的手动偏移；点击「立即同步」或重设 ROI 后将重新自动对齐。
 5. **音量混音与换线**：
-   - 可单独调整 B 站解声音量，或开启/静音原比赛现场声，兼顾现场环境音与主播解说。
+   - 可单独调整解说音量，或开启/静音原比赛现场声，兼顾现场环境音与主播解说。
    - 比赛卡顿？在控制台直接输入或下拉选择备用线路（如“高清直播⑤”），系统探测成功后自动无缝切换，无需重新打开网页。
 
 ### 安全与访问控制
@@ -263,6 +267,33 @@ footboy \
 - **动态控制密钥**：每次启动自动生成 32 位安全 Token。所有控制 API、状态查询及采样截图均需验证 Token。
 - **URL 片段防泄漏**：首次通过浏览器访问 `#token=...` 后，页面脚本会自动抹去浏览器地址栏中的 Token 片段，防止历史记录泄密。
 - **网络边界**：Web 控制台严格校验 Origin 防御 CSRF。HLS 串流地址（`/live.m3u8`）无需 Token，以便各类电视盒子与播放器免鉴权拉流。
+
+## 解说平台与访问方式
+
+解说源不再限定为 B 站。B 站继续使用专用解析器；其他直播间依次尝试 Streamlink、yt-dlp，未能获取可用流时再尝试 Chromium 网页嗅探。支持范围可参考 [Streamlink 插件列表](https://streamlink.github.io/plugins.html) 和 [yt-dlp 网站列表](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)，实际仍需获得 FFmpeg 能读取、同时含有画面与音轨的 HTTP(S) 媒体流。
+
+| 输入方式 | 示例 | 使用方法 |
+| :--- | :--- | :--- |
+| B 站直播间 | `https://live.bilibili.com/ROOM_ID` | 直接填入解说地址 |
+| 斗鱼直播间 | `https://www.douyu.com/ROOM_ID` | 直接填入解说地址 |
+| 虎牙直播间 | `https://www.huya.com/ROOM_ID` | 直接填入解说地址，房间别名也可尝试 |
+| 其他直播平台 | 平台的完整直播间页面 URL | 由提取器或网页嗅探尝试解析 |
+| 媒体直链 | `https://media.example.com/live.m3u8` / `live.flv` | 勾选解说“媒体直链”，或加 `--commentary-direct` |
+
+将 `ROOM_ID` 替换为实际正在直播的房间号；命令行用法：
+
+```bash
+footboy --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
+  --commentary-room "https://www.douyu.com/ROOM_ID"
+
+footboy --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
+  --commentary-room "https://www.huya.com/ROOM_ID" \
+  --commentary-cookies cookies.txt
+```
+
+`--commentary-cookies` 接受 Netscape 格式的 Cookie 文件，用于需要你已有登录会话的解说源。需要 `Referer`、`User-Agent` 等请求头时，可在控制 API 的 `POST /api/start` 中传入 `commentary_headers` 对象；手工直链工具支持重复指定 `--commentary-header '名称:值'`。浏览器嗅探也会捕获实际请求所需的 Cookie 和请求头。
+
+这不代表所有平台、所有房间都能播放。未开播、失效的签名直链、地区或登录限制、平台反爬和提取器暂未适配都可能导致失败；仅能通过 DRM 或 WebRTC 播放的流不受支持。先确认房间在主机浏览器中正常播放；必要时更新提取器、提供有效 Cookie 或使用可访问的媒体直链。当前解说源需同时含有画面与音轨，纯音频流暂不支持。解说画面不显示同场比赛计时牌时，请关闭自动测量（`--no-auto-measure`），用手动偏移对齐。
 
 ---
 
@@ -308,6 +339,7 @@ Footboy 默认监听 `0.0.0.0:8080`，局域网内的所有设备都可以作为
 | **找不到 FFmpeg / ffprobe** | 系统未安装或未加入环境变量 | 通过包管理器安装（`brew`/`apt`/`winget`），或在启动时使用 `--ffmpeg` 和 `--ffprobe` 显式指定路径，使用 `footboy --check` 检查 |
 | **找不到 Tesseract 或模型** | 缺少 OCR 引擎或缺失英文模型 | 确认安装了 `tesseract` 且含 `eng.traineddata`；亦可改用 `--ocr rapidocr`，或使用 `--no-auto-measure` 转为纯手动调偏 |
 | **点击连接后为什么弹出浏览器？** | 目标平台有动态签名防盗链 | Footboy 内置 Playwright 嗅探器捕获真实媒体直链和 Cookie。无桌面服务器可使用 `--headless-sniff`（无头模式，但不支持页面交互） |
+| **斗鱼、虎牙等解说地址解析失败** | 房间未开播、提取器过期或访问条件不满足 | 先用主机浏览器确认可播放，更新 `streamlink` / `yt-dlp`；需要登录时指定 `--commentary-cookies`，也可使用可访问的媒体直链 |
 | **OCR 一直提示“未对齐”** | 计时牌遮挡、停表或文字特殊 | 1. 确保两路画面均有正在走动的同一比赛计时；<br/>2. 在控制台点击截图并框选 ROI 计时区域；<br/>3. 直接点击微调按钮，手动对齐即刻生效 |
 | **电视/播放器无法播放 HEVC** | 客户端硬件解码限制 | 控制台中优先切换为 H.264 线路，或在播放器（如 VLC/Kodi）中启用软件解码 |
 | **其他设备无法访问控制台或流** | 主机防火墙拦截入站连接 | 检查主机防火墙设置，放行 8080 端口；确认手机/电视与主机处于同一 Wi-Fi 局域网 |
@@ -325,8 +357,8 @@ Footboy 默认监听 `0.0.0.0:8080`，局域网内的所有设备都可以作为
 D = K_B - K_V
 ```
 
-- $V$ 代表比赛画面源，$B$ 代表 B 站解说音源。
-- FFmpeg 混流时，在 B 站音频输入上应用 `-itsoffset D`：**正值推后声音，负值提前声音**。
+- $V$ 代表比赛画面源，$B$ 代表解说音源。
+- FFmpeg 混流时，在解说音频输入上应用 `-itsoffset D`：**正值推后声音，负值提前声音**。
 - 换线后，新线路的源 PTS 起点会发生变化，系统将自动重新测量基线。
 
 ---
@@ -336,7 +368,7 @@ D = K_B - K_V
 ```bash
 footboy \
   --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
-  --bili-room "$FOOTBOY_BILI_ROOM_URL"
+  --commentary-room "$FOOTBOY_COMMENTARY_ROOM_URL"
 ```
 
 *（亦可直接运行 `footboy`，所有参数均可在 Web 控制台中动态录入）*
@@ -345,24 +377,35 @@ footboy \
 | :--- | :--- | :--- |
 | `--lang {zh-CN,en}` | `zh-CN` | CLI 输出语言；优先于 `FOOTBOY_LANG` 环境变量 |
 | `--video-page URL` | - | 比赛直播页面 URL |
-| `--bili-room URL` | - | B 站直播间 URL |
+| `--commentary-room URL` | - | 解说直播间 URL；与 `--video-page` 一起提供 |
 | `--video-line "名称"` | - | 按页面文字自动选线（例如：`高清直播⑤`；支持圈号数字） |
 | `--video-direct` | `false` | 将比赛地址直接作为媒体直链（m3u8/flv）处理 |
-| `--bili-direct` | `false` | 将 B 站地址直接作为媒体直链处理 |
+| `--commentary-direct` | `false` | 将解说地址直接作为媒体直链处理 |
 | `--video-no-proxy` | `false` | 比赛流请求直连，绕过系统代理 |
 | `--headless-sniff` | `false` | 无头浏览器嗅探（适合无图形界面的 Linux 服务器或 NAS） |
 | `--ocr {auto,rapidocr,tesseract}` | `auto` | OCR 引擎选择；`auto` 自动检测已安装的引擎 |
 | `--tesseract-command PATH` | `tesseract` | 自定义 Tesseract 可执行文件路径 |
 | `--no-auto-measure` | `false` | 禁用 OCR 自动对齐，完全使用手动微调 |
-| `--offset 秒数` | - | 初始音频偏移秒数（正值推后 B 站解说） |
-| `--bili-cookies FILE` | - | Netscape 格式的 B 站 Cookie 路径 |
+| `--offset 秒数` | - | 初始音频偏移秒数（正值推后解说） |
+| `--commentary-cookies FILE` | - | 解说源的 Netscape 格式 Cookie 文件路径 |
 | `--ffmpeg PATH` / `--ffprobe PATH` | `ffmpeg` / `ffprobe` | 自定义 FFmpeg / ffprobe 程序路径 |
 | `--host HOST` / `--port PORT` | `0.0.0.0` / `8080` | Web 服务监听地址与端口 |
 | `--state-file FILE` | `state.json` | 用户配置持久化文件（按域名保存 ROI 和历史偏移） |
 | `--output-dir DIR` | `hls_out` | 局域网 HLS 分片存储目录 |
 | `--check` | - | 检查本地 FFmpeg 与 ffprobe 环境并直接退出 |
 
-*手工直链极速验证工具：`footboy-p0 --video-url "http://.../v.m3u8" --bili-url "http://.../a.m3u8" --offset 1.5`*
+旧参数 `--bili-room`、`--bili-direct`、`--bili-cookies` 继续可用，与对应的 `--commentary-*` 参数完全等价，也可用于其他平台。
+
+手工直链验证工具（将示例地址替换为实际媒体 URL）：
+
+```bash
+footboy-p0 --video-url "https://media.example.com/video.m3u8" \
+  --commentary-url "https://media.example.com/audio.m3u8" \
+  --commentary-header "Referer:https://www.huya.com/ROOM_ID" \
+  --offset 1.5
+```
+
+`footboy-p0` 的旧参数 `--bili-url`、`--bili-header` 同样保留。
 
 ---
 
@@ -378,7 +421,7 @@ footboy \
 | 接口端点 | 方法 | 说明 |
 | :--- | :--- | :--- |
 | `GET /api/status` | 获取当前播放状态、源元数据、OCR 读取结果及对齐偏移 |
-| `POST /api/start` | `video_url`、`bili_url` 必填；可选 `video_direct`、`bili_direct`、`video_no_proxy`、`video_line_text`、`auto_measure`、`offset_seconds`、`video_headers`、`bili_headers` |
+| `POST /api/start` | `video_url`、`commentary_url` 必填；可选 `video_direct`、`commentary_direct`、`video_no_proxy`、`video_line_text`、`auto_measure`、`offset_seconds`、`video_headers`、`commentary_headers` |
 | `POST /api/stop` | 停止当前混流与嗅探任务 |
 | `POST /api/offset` | `{"delta_ms": 500}` 相对微调当前偏移毫秒数 |
 | `POST /api/remeasure` | 强制重新采样画面并执行 OCR 重新对齐 |
@@ -389,6 +432,8 @@ footboy \
 | `POST /api/roi` | `{"source":"video","roi":[0.1,0.1,0.2,0.1],"flip":"none","inverted":false}` |
 | `GET /api/snapshot/{video,bili}.jpg` | 获取两路直播当前关键帧截图 |
 | `GET /api/ocr/{video,bili}/{crop,processed}.png?v=版本` | 获取最新 OCR 裁剪区域图与二值化预处理调试图 |
+
+`POST /api/start` 也接受旧字段 `bili_url`、`bili_direct`、`bili_headers`；它们现在同样适用于其他解说平台。状态、截图、ROI 和持久化设置中的 `bili` 标识保持兼容。
 
 </details>
 
@@ -412,7 +457,8 @@ footboy \
 ## 测试与验证状态
 
 - **流媒体封装**：H.264 视频采用 MPEG-TS HLS 分片；HEVC（H.265）视频采用 fMP4 HLS 分片。Safari 原生兼容，现代浏览器优先加载内置的 `hls.js`。
-- **自动化测试**：代码库包含 **240+ 项自动化测试**（覆盖 URL 鉴权、PTS 计算、停表保护、Cookie 穿透、状态回滚与浏览器全流程回归）。
+- **自动化测试**：代码库包含 **500+ 项自动化测试**（覆盖多平台解析、URL 鉴权、PTS 计算、停表保护、Cookie 穿透、状态回滚与浏览器全流程回归）。
+- **多平台直播验证**：[斗鱼、虎牙持续混流与并发取帧](docs/validation/validation-commentary-platforms-2026-09-22.md)。
 - **历史验证记录**：
   - 功能基线：[基线报告](docs/validation/validation.md) \| [v0.1.1](docs/validation/validation-0.1.1.md) \| [v0.1.2](docs/validation/validation-0.1.2.md) \| [v0.1.3](docs/validation/validation-0.1.3.md) \| [v0.1.4](docs/validation/validation-0.1.4.md)
   - OCR 精度调优记录：[第一轮比对](docs/validation/validation-ocr-2026-09-13.md) \| [第二轮比对](docs/validation/validation-ocr-round-2-2026-09-13.md) \| [同步实测](docs/validation/validation-ocr-sync-2026-09-13.md)

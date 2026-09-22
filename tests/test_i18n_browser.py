@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -32,7 +33,7 @@ class LanguageController:
             "offset_seconds": 0,
             "ffmpeg": {"running": False},
             "capabilities": {"session_controls": True, "roi": True, "switch_line": True},
-            "message": tr("Enter the match page and Bilibili room to connect"),
+            "message": tr("Enter the match page and commentary room to connect"),
         }
         frame = np.full((180, 320, 3), (64, 120, 32), dtype=np.uint8)
         self.jpeg = cv2.imencode(".jpg", frame)[1].tobytes()
@@ -48,7 +49,7 @@ class LanguageController:
             session_id=1,
             message=tr("Manual offset updated; applying in 1.5 seconds"),
             video={"domain": "video.example.invalid", "line_text": body["video_line_text"]},
-            bili={"domain": "live.bilibili.com"},
+            bili={"domain": urlsplit(body["bili_url"]).hostname},
             sniffer={
                 "running": True,
                 "lines": ["高清直播⑤"],
@@ -90,8 +91,11 @@ def console(tmp_path):
         server.stop()
 
 
-@pytest.mark.parametrize("width", [1440, 390])
-def test_language_switch_preserves_inputs_session_and_roi(console, width):
+@pytest.mark.parametrize(
+    ("width", "commentary_url"),
+    [(1440, "https://www.douyu.com/1"), (390, "https://www.huya.com/1")],
+)
+def test_language_switch_preserves_inputs_session_and_roi(console, width, commentary_url):
     from playwright.sync_api import expect, sync_playwright
 
     controller, url = console
@@ -109,18 +113,22 @@ def test_language_switch_preserves_inputs_session_and_roi(console, width):
         expect(page.locator("html")).to_have_attribute("lang", "en")
         expect(page).to_have_title("Footboy · Live Sync Console")
         expect(page.locator("#status-message")).to_have_text(
-            "Enter the match page and Bilibili room to connect"
+            "Enter the match page and commentary room to connect"
         )
         expect(page.locator("#video-url")).to_have_attribute(
             "placeholder", "Paste the full match page or media URL"
         )
+        expect(page.locator("#bili-url")).to_have_attribute(
+            "placeholder", "Paste the full commentary live room URL"
+        )
         expect(page.locator("#copy-link")).to_have_attribute("aria-label", "Copy playback URL")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.locator("#video-url").fill("https://video.example.invalid/match")
-        page.locator("#bili-url").fill("https://live.bilibili.com/1")
+        page.locator("#bili-url").fill(commentary_url)
         page.locator("#video-line-text").fill("高清直播⑤")
         page.locator("#language").select_option("zh-CN")
         expect(page.locator("#video-url")).to_have_value("https://video.example.invalid/match")
+        expect(page.locator("#bili-url")).to_have_value(commentary_url)
         expect(page.locator("#video-line-text")).to_have_value("高清直播⑤")
         page.locator("#language").select_option("en")
         page.locator("#start").click()
@@ -146,6 +154,7 @@ def test_language_switch_preserves_inputs_session_and_roi(console, width):
         )
         expect(page.locator("#roi-x")).to_have_value(re.compile(r"15(?:\.0)?"))
         assert len(controller.starts) == 1
+        assert controller.starts[0]["bili_url"] == commentary_url
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
         other = browser.new_page()

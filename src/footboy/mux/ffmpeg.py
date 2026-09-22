@@ -205,7 +205,7 @@ def _input_options(source: Source, *, video_input: bool) -> list[str]:
     cookies = source.ffmpeg_cookies()
     if cookies:
         options.extend(["-cookies", cookies])
-    if video_input and source.kind == "hls":
+    if source.kind == "hls":
         options.extend(["-allowed_extensions", "ALL"])
     if not video_input and source.url.startswith(("http://", "https://")):
         options.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"])
@@ -334,11 +334,12 @@ class FfmpegMuxer:
             flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self._check_cancelled()
             try:
-                mux_video = video
-                if video.kind == "hls" and video.url.startswith(("http://", "https://")):
-                    buffered = _BufferedVideoInput(video, self.ffmpeg, health)
+                mux_video, mux_commentary = video.for_reader(), bili.for_reader()
+                self._check_cancelled()
+                if mux_video.kind == "hls" and mux_video.url.startswith(("http://", "https://")):
+                    buffered = _BufferedVideoInput(mux_video, self.ffmpeg, health)
                     mux_video = replace(
-                        video,
+                        mux_video,
                         url="pipe:0",
                         kind="mpegts",
                         headers={},
@@ -347,7 +348,7 @@ class FfmpegMuxer:
                     )
                 command = build_ffmpeg_command(
                     mux_video,
-                    bili,
+                    mux_commentary,
                     offset,
                     self.output_dir,
                     ffmpeg=self.ffmpeg,

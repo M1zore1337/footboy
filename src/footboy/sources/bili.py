@@ -5,6 +5,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any
 
 from footboy.i18n import tr
 
-from .models import Source
+from .models import Source, merge_headers
 
 API_URL = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
 DEFAULT_UA = (
@@ -28,6 +29,7 @@ class BiliResolveError(RuntimeError):
 @dataclass(slots=True)
 class BiliResolver:
     cookies_file: Path | None = None
+    headers: dict[str, str] | None = None
 
     def resolve(self, room_url: str) -> Source:
         _room_id(room_url)
@@ -58,6 +60,9 @@ class BiliResolver:
             "socket_timeout": 15,
             "retries": 1,
             "extractor_retries": 1,
+            "http_headers": merge_headers(
+                {"User-Agent": DEFAULT_UA, "Referer": room_url}, self.headers
+            ),
         }
         if self.cookies_file:
             options["cookiefile"] = str(self.cookies_file)
@@ -79,7 +84,12 @@ class BiliResolver:
                 for key in ("ext", "protocol", "format_id", "format", "url")
             ).lower()
             height = item.get("height")
-            if not url or "flv" not in marker:
+            if (
+                not url
+                or "flv" not in marker
+                or item.get("acodec") == "none"
+                or item.get("vcodec") == "none"
+            ):
                 continue
             if isinstance(height, (int, float)) and height > 1080:
                 continue
@@ -93,12 +103,12 @@ class BiliResolver:
                 float(item.get("tbr") or 0),
             ),
         )
-        headers = {
-            str(key): str(value)
-            for key, value in (chosen.get("http_headers") or info.get("http_headers") or {}).items()
-        }
-        headers.setdefault("Referer", room_url)
-        headers.setdefault("User-Agent", DEFAULT_UA)
+        headers = merge_headers(
+            {"User-Agent": DEFAULT_UA, "Referer": room_url},
+            info.get("http_headers"),
+            chosen.get("http_headers"),
+            self.headers,
+        )
         return Source(
             url=str(chosen["url"]),
             headers=headers,
@@ -108,7 +118,7 @@ class BiliResolver:
             width=int(chosen["width"]) if chosen.get("width") else None,
             height=int(chosen["height"]) if chosen.get("height") else None,
             audio_codec=_clean_codec(chosen.get("acodec")),
-            has_audio=chosen.get("acodec") not in (None, "none"),
+            has_audio=True if _clean_codec(chosen.get("acodec")) else None,
         )
 
     def _resolve_api(self, room_url: str) -> Source:
@@ -124,10 +134,10 @@ class BiliResolver:
                 "ptype": "8",
             }
         )
-        headers = {
-            "User-Agent": DEFAULT_UA,
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
+        headers = merge_headers(
+            {"User-Agent": DEFAULT_UA, "Referer": f"https://live.bilibili.com/{room_id}"},
+            self.headers,
+        )
         request = urllib.request.Request(f"{API_URL}?{params}", headers=headers)
         jar = self._cookie_jar()
         if jar is not None:
@@ -179,9 +189,17 @@ class BiliResolver:
             return None
         jar = MozillaCookieJar(str(self.cookies_file))
         try:
-            jar.load(ignore_discard=True, ignore_expires=False)
-        except (OSError, ValueError) as exc:
-            raise BiliResolveError(tr("Cannot read the Netscape cookies file: {0}", exc)) from exc
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in list(jar):
+                # Browser exports commonly use 0 for session cookies.
+                if cookie.expires == 0:
+                    cookie.expires = None
+                elif cookie.is_expired():
+                    jar.clear(cookie.domain, cookie.path, cookie.name)
+        except (OSError, ValueError):
+            raise BiliResolveError(tr("Cannot read the Netscape cookies file")) from None
         return jar
 
     def _cookies_as_dicts(self) -> list[dict[str, Any]]:

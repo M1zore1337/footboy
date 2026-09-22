@@ -22,6 +22,7 @@ import pytest
 from footboy.mux.cleanup import HlsOutputCleaner
 from footboy.mux.ffmpeg import AudioMix, FfmpegMuxer
 from footboy.probe.frames import keyframes
+from footboy.sources.live import LiveResolver
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 
@@ -529,6 +530,144 @@ def test_live_restart_produces_new_segments_and_closes_process(tmp_path, media_s
         mux.stop()
     assert not mux.health.running
     assert "#EXT-X-ENDLIST" in (output / "live.m3u8").read_text()
+
+
+def test_hls_commentary_cookie_file_reaches_probe_decoder_and_mux(tmp_path, media_server):
+    base, requests = media_server
+    make_clip(tmp_path / "video.flv", 1000)
+    make_clip(tmp_path / "commentary.flv", 990)
+    playlist = tmp_path / "commentary.m3u8"
+    key = tmp_path / "commentary-key.bin"
+    key.write_bytes(bytes(range(16)))
+    key_info = tmp_path / "commentary-key.txt"
+    key_info.write_text(f"{base}/commentary-key.bin\n{key}\n", encoding="utf-8")
+    subprocess.run(
+        [
+            str(FFMPEG),
+            "-v",
+            "error",
+            "-copyts",
+            "-i",
+            str(tmp_path / "commentary.flv"),
+            "-c",
+            "copy",
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "vod",
+            "-hls_key_info_file",
+            str(key_info),
+            "-hls_segment_filename",
+            str(tmp_path / "commentary-%03d.ts"),
+            str(playlist),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    reference = tmp_path / "commentary-reference.m3u8"
+    reference.write_text(
+        playlist.read_text().replace(f"{base}/commentary-key.bin", "commentary-key.bin"),
+        encoding="utf-8",
+    )
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text(
+        "# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tsid\tfixture\n"
+        "unrelated.example\tFALSE\t/\tFALSE\t0\tprivate\tmust-not-be-sent\n"
+        "unrelated.example\tFALSE\t/\tFALSE\t0\tsid\tmust-not-replace-session\n"
+    )
+    commentary = LiveResolver(
+        cookies_file=cookies_file,
+        headers={"Referer": "https://page.example/", "User-Agent": "FootboyTest"},
+    ).resolve(base + "/commentary.m3u8")
+    ffprobe_source(commentary, ffprobe=str(FFPROBE))
+    assert commentary.kind == "hls" and commentary.has_audio
+    frames = list(keyframes(commentary, duration=3, max_frames=1))
+    assert frames
+    video = source(base + "/video.flv")
+    output = tmp_path / "hls"
+    mux = FfmpegMuxer(output, ffmpeg=str(FFMPEG))
+    try:
+        mux.start(video, commentary, 10)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        result = first_pts(output / "live.m3u8")
+        expected = first_pts(tmp_path / "video.flv")["video"] - (first_pts(reference)["audio"] + 10)
+        assert result["video"] - result["audio"] == pytest.approx(expected, abs=0.025)
+        assert np.array_equal(
+            first_picture(tmp_path / "video.flv"), first_picture(output / "live.m3u8")
+        )
+        assert all(row.get("Cookie") == "sid=fixture" for row in requests)
+        assert all(row.get("Referer") == "https://page.example/" for row in requests)
+        assert mux.health.non_monotonic_dts == 0
+    finally:
+        mux.stop()
+
+
+def test_probe_timeline_ocr_and_mux_use_independent_signed_requests(tmp_path):
+    from footboy.probe.timeline import sample_audio_start
+
+    video_file, commentary_file = tmp_path / "video.flv", tmp_path / "commentary.flv"
+    make_clip(video_file, 1000)
+    make_clip(commentary_file, 990)
+    content = commentary_file.read_bytes()
+    available, used, rejected = set(), [], []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path not in available:
+                rejected.append(self.path)
+                self.send_error(403, "Each signed URL permits one reader")
+                return
+            available.remove(self.path)
+            used.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/x-flv")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            try:
+                self.wfile.write(content)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    issued = []
+
+    def fresh():
+        path = f"/commentary.flv?reader={len(issued)}"
+        issued.append(path)
+        available.add(path)
+        return Source(base + path, kind="flv")
+
+    commentary = Source(base + "/expired.flv", kind="flv", no_proxy=True, reader_factory=fresh)
+    mux = FfmpegMuxer(tmp_path / "hls", ffmpeg=str(FFMPEG))
+    try:
+        assert ffprobe_source(commentary, ffprobe=str(FFPROBE)) is commentary
+        assert commentary.has_audio and commentary.audio_codec == "aac"
+        assert sample_audio_start(commentary) > 989
+        assert list(keyframes(commentary, duration=3, max_frames=1))
+        mux.start(Source(str(video_file), video_codec="h264"), commentary, 10)
+        wait_for(lambda: mux.poll() is not None)
+        assert mux.health.returncode == 0, list(mux.health.stderr_tail)
+        assert set(first_pts(tmp_path / "hls/live.m3u8")) == {"video", "audio"}
+        assert len(used) == len(issued) == 4
+        assert not rejected and not available
+        assert commentary.reader_factory is fresh
+    finally:
+        mux.stop()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
 
 
 @pytest.mark.parametrize("encrypted", [False, True], ids=["plain", "aes128"])

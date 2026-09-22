@@ -24,7 +24,7 @@ from footboy.i18n import ArgumentParser, configure_cli_language, tr  # noqa: E40
 DEPENDENCY_CHECK = """
 import sys
 from pathlib import Path
-import av, cv2, numpy, pytesseract, yt_dlp, footboy
+import av, cv2, numpy, pytesseract, streamlink, yt_dlp, footboy
 from playwright.sync_api import sync_playwright
 if sys.version_info < (3, 10) or sys.prefix == sys.base_prefix:
     raise SystemExit(1)

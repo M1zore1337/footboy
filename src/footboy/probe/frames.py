@@ -30,11 +30,14 @@ def keyframes(
     except ImportError as exc:
         raise FrameProbeError(tr("PyAV is not installed")) from exc
 
-    started = time.monotonic()
     yielded = 0
     last_pts: float | None = None
     sample_interval = duration / max(1, max_frames - 1)
     try:
+        source = source.for_reader()
+        if stop_event is not None and stop_event.is_set():
+            raise FrameProbeError(tr("Measurement cancelled"))
+        started = time.monotonic()
         container = av.open(source.url, options=source.pyav_options(), timeout=(8.0, 5.0))
     except Exception as exc:
         raise FrameProbeError(

@@ -22,6 +22,7 @@ def ffprobe_source(
     ffprobe: str | Path = "ffprobe",
     timeout: float = 15,
 ) -> Source:
+    reader = source.for_reader()
     command = [
         resolve_binary(ffprobe),
         "-v",
@@ -29,17 +30,17 @@ def ffprobe_source(
         "-rw_timeout",
         "15000000",
         "-user_agent",
-        source.user_agent,
+        reader.user_agent,
     ]
-    headers = source.ffmpeg_headers(include_cookies=False)
+    headers = reader.ffmpeg_headers(include_cookies=False)
     if headers:
         command.extend(["-headers", headers])
-    cookies = source.ffmpeg_cookies()
+    cookies = reader.ffmpeg_cookies()
     if cookies:
         command.extend(["-cookies", cookies])
-    if source.kind == "hls":
+    if reader.kind == "hls":
         command.extend(["-allowed_extensions", "ALL"])
-    if source.no_proxy:
+    if reader.no_proxy:
         command.extend(["-http_proxy", DIRECT_HTTP_PROXY])
     command.extend(
         [
@@ -47,7 +48,7 @@ def ffprobe_source(
             "stream=index,codec_type,codec_name,width,height",
             "-of",
             "json",
-            source.url,
+            reader.url,
         ]
     )
     flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))

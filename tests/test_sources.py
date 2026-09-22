@@ -4,6 +4,7 @@ import io
 import json
 import signal
 import subprocess
+import sys
 import traceback
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -14,7 +15,13 @@ from footboy.sources.bili import BiliResolveError, BiliResolver, _room_id
 from footboy.sources.lines import is_line_label, normalize_line_text
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
-from footboy.sources.sniffer import Candidate, SniffError, StreamSniffer, _playlist_segments
+from footboy.sources.sniffer import (
+    Candidate,
+    SniffError,
+    StreamSniffer,
+    _playlist_segments,
+    _request_headers,
+)
 
 
 def test_stopping_before_sniff_cannot_reopen_browser():
@@ -60,6 +67,72 @@ def test_sniffed_source_retains_direct_access_for_probe_and_subsequent_readers(m
     assert source.no_proxy and probed == [source]
     assert source.pyav_options()["http_proxy"]
     assert Source(**source.to_dict()).no_proxy
+
+
+def test_commentary_browser_preserves_authentication_and_user_agent(monkeypatch):
+    cookie = {"name": "sid", "value": "fixture", "domain": ".example", "path": "/"}
+    sniffer = StreamSniffer(
+        headers={"user-agent": "FixtureBrowser", "referer": "https://room.example/"},
+        cookies=[cookie],
+        require_audio=True,
+    )
+    options, cookies = {}, []
+    context = SimpleNamespace(add_cookies=cookies.extend, cookies=lambda _: cookies)
+
+    def new_context(**kwargs):
+        options.update(kwargs)
+        return context
+
+    sniffer._context = sniffer._create_context(SimpleNamespace(new_context=new_context))
+    assert options["user_agent"] == "FixtureBrowser"
+    assert options["extra_http_headers"] == sniffer.headers
+    assert cookies == [cookie]
+    seen = []
+
+    def probe(source, **kwargs):
+        seen.append(source)
+        source.has_audio = True
+        return source
+
+    monkeypatch.setattr("footboy.sources.sniffer.ffprobe_source", probe)
+    candidate = Candidate(
+        "https://cdn.example/live.m3u8", "hls", {"Referer": "https://old.example/"}, 0, 0
+    )
+    source = sniffer._confirm(candidate)
+    assert source is seen[0]
+    assert source.header("referer") == "https://room.example/"
+    assert sum(key.lower() == "referer" for key in source.headers) == 1
+    assert source.cookie_header() == "sid=fixture"
+
+
+def test_commentary_browser_rejects_video_without_audio(monkeypatch):
+    sniffer = StreamSniffer(require_audio=True)
+    sniffer._context = SimpleNamespace(cookies=lambda _: [])
+    monkeypatch.setattr("footboy.sources.sniffer.ffprobe_source", lambda source, **_: source)
+    with pytest.raises(MediaProbeError, match="不含音频"):
+        sniffer._confirm(Candidate("https://cdn.example/silent.m3u8", "hls", {}, 0, 0))
+
+
+def test_browser_media_auth_headers_survive_without_reusing_range_or_flat_cookies():
+    headers = _request_headers(
+        SimpleNamespace(
+            all_headers=lambda: {
+                "authorization": "Bearer fixture",
+                "x-playback-token": "fixture",
+                "referer": "https://room.example/",
+                "cookie": "sid=fixture",
+                "range": "bytes=0-99",
+                "if-none-match": '"cached"',
+                "accept-encoding": "gzip, br",
+                "host": "cdn.example",
+            }
+        )
+    )
+    assert headers == {
+        "authorization": "Bearer fixture",
+        "x-playback-token": "fixture",
+        "referer": "https://room.example/",
+    }
 
 
 def test_probe_crash_reports_binary_failure_instead_of_rejecting_the_source(monkeypatch):
@@ -119,7 +192,10 @@ def response(url, body="", content_type="application/vnd.apple.mpegurl", status=
     )
 
 
-def test_api_reads_live_status_at_top_level_and_returns_request_context(monkeypatch):
+@pytest.mark.parametrize(
+    "headers", [{}, {"Cookie": "sid=fixture", "referer": "https://room.example/"}]
+)
+def test_api_reads_live_status_at_top_level_and_returns_request_context(monkeypatch, headers):
     requests = []
     payload = {
         "code": 0,
@@ -161,16 +237,61 @@ def test_api_reads_live_status_at_top_level_and_returns_request_context(monkeypa
         return io.BytesIO(json.dumps(payload).encode())
 
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
-    source = BiliResolver()._resolve_api("https://live.bilibili.com/0")
+    source = BiliResolver(headers=headers)._resolve_api("https://live.bilibili.com/0")
     assert source.url == "https://cdn.example/room.flv?expires=123"
     params = parse_qs(urlsplit(requests[0].full_url).query)
     assert params["protocol"] == ["0,1"]
     assert params["qn"] == ["10000"]
-    assert source.header("referer") == "https://live.bilibili.com/0"
-    assert source.header("cookie") is None
+    assert source.header("referer") == headers.get("referer", "https://live.bilibili.com/0")
+    assert source.header("cookie") == headers.get("Cookie")
+    assert requests[0].get_header("Referer") == source.header("referer")
+    assert requests[0].get_header("Cookie") == source.header("cookie")
     payload["data"]["live_status"] = 2
     with pytest.raises(BiliResolveError, match="未开播或轮播"):
         BiliResolver()._resolve_api("https://live.bilibili.com/0")
+
+
+@pytest.mark.parametrize("audio_codec", [None, "aac"])
+def test_bili_extraction_merges_request_headers_and_leaves_unknown_audio_for_probe(
+    monkeypatch, audio_codec
+):
+    options = {}
+
+    class Downloader:
+        def __init__(self, value):
+            options.update(value)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, *, download):
+            assert not download
+            return {
+                "is_live": True,
+                "http_headers": {"Referer": url, "X-Base": "base"},
+                "formats": [
+                    {
+                        "url": "https://cdn.example/live.flv",
+                        "ext": "flv",
+                        "height": 1080,
+                        "acodec": audio_codec,
+                        "http_headers": {"User-Agent": "Extractor"},
+                    }
+                ],
+            }
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=Downloader))
+    headers = {"user-agent": "Custom", "referer": "https://room.example/", "Cookie": "sid=fixture"}
+    source = BiliResolver(headers=headers)._resolve_ytdlp("https://live.bilibili.com/123")
+    assert source.header("User-Agent") == "Custom"
+    assert source.header("Referer") == "https://room.example/"
+    assert source.header("X-Base") == "base"
+    assert source.header("Cookie") == "sid=fixture"
+    assert options["http_headers"] == headers
+    assert source.has_audio is (True if audio_codec else None)
 
 
 @pytest.mark.parametrize(

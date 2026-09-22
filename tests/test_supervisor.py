@@ -5,6 +5,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -13,6 +14,8 @@ import pytest
 from footboy.probe.ocr import ClockProbeResult, ClockSample, OcrProgress, ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetConfidence, OffsetMeasurement
 from footboy.probe.timeline import TimelineProbeError
+from footboy.sources.live import LiveResolveError
+from footboy.sources.media_probe import MediaProbeError
 from footboy.sources.models import Source
 from footboy.supervisor import Supervisor, SupervisorConfig
 
@@ -44,6 +47,148 @@ def finish(supervisor: Supervisor, value: float, mode="verify", error=None) -> N
         measurement(value) if error is None else None,
         error,
     )
+
+
+@pytest.mark.parametrize("room", ["https://www.douyu.com/123", "https://www.huya.com/room"])
+def test_commentary_rooms_are_validated_before_the_muxer_uses_them(tmp_path, monkeypatch, room):
+    supervisor = supervisor_at(tmp_path)
+    supervisor.config.bili_room_url = room
+    source = Source("https://cdn.example/live.m3u8", kind="hls")
+    probed = []
+
+    def probe(item, **kwargs):
+        probed.append(item)
+        item.has_audio = True
+        item.video_codec = "h264"
+        return item
+
+    def resolve(url, *, validate):
+        assert url == room
+        return validate(source)
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    supervisor.commentary_resolver = SimpleNamespace(resolve=resolve)
+    assert supervisor._resolve_bili() is source
+    assert probed == [source]
+    supervisor.bili = source
+    status = supervisor.public_status()
+    assert status["commentary"] == status["bili"] == source.public_dict()
+
+
+def test_unresolved_commentary_uses_an_independent_authenticated_browser(tmp_path, monkeypatch):
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text(
+        "# Netscape HTTP Cookie File\n.example\tTRUE\t/\tFALSE\t0\tsid\tfixture\n"
+    )
+    supervisor = supervisor_at(
+        tmp_path, cookies_file=cookies_file, bili_headers={"Referer": "https://room.example/"}
+    )
+    supervisor.config.bili_room_url = "https://room.example/live"
+    source = Source("https://cdn.example/live.flv", has_audio=True)
+
+    def unresolved(*args, **kwargs):
+        raise LiveResolveError("No plugin")
+
+    def sniff(url, **kwargs):
+        assert url == supervisor.config.bili_room_url
+        assert supervisor.commentary_sniffer.require_audio
+        assert supervisor.commentary_sniffer.headers == supervisor.config.bili_headers
+        assert supervisor.commentary_sniffer.cookies[0]["value"] == "fixture"
+        assert not supervisor.sniffer.running
+        return source
+
+    supervisor.commentary_resolver = SimpleNamespace(resolve=unresolved)
+    monkeypatch.setattr(supervisor.commentary_sniffer, "sniff", sniff)
+    assert supervisor._resolve_bili() is source
+
+
+def test_commentary_browser_selection_and_stop_reach_the_active_sniffer(tmp_path):
+    supervisor = supervisor_at(tmp_path)
+    supervisor.commentary_sniffer.running = True
+    supervisor.request_select_source(7)
+    assert supervisor.commentary_sniffer._commands.get_nowait() == "7"
+    assert supervisor.public_status()["sniffer"]["running"]
+    supervisor.stop()
+    assert supervisor.commentary_sniffer._abort.is_set()
+    assert supervisor.sniffer._abort.is_set()
+
+
+def test_cancelled_commentary_resolution_never_opens_fallback_browser(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path)
+
+    def unresolved(*args, **kwargs):
+        supervisor.stop()
+        raise LiveResolveError("Cancelled")
+
+    supervisor.commentary_resolver = SimpleNamespace(resolve=unresolved)
+    monkeypatch.setattr(
+        supervisor.commentary_sniffer,
+        "sniff",
+        lambda *a, **k: pytest.fail("Stopped sessions must not open a browser"),
+    )
+    with pytest.raises(RuntimeError, match="已取消"):
+        supervisor._resolve_bili()
+
+
+def test_direct_commentary_retains_cookie_file_and_rejects_silent_stream(tmp_path, monkeypatch):
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text(
+        "# Netscape HTTP Cookie File\n.example\tTRUE\t/\tFALSE\t0\tsid\tfixture\n"
+    )
+    supervisor = supervisor_at(tmp_path, bili_direct=True, cookies_file=cookies_file)
+    supervisor.config.bili_room_url = "https://cdn.example/live.m3u8"
+
+    def probe(source, **kwargs):
+        assert source.kind == "hls"
+        assert source.cookie_header() == "sid=fixture"
+        source.has_audio = False
+        return source
+
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    with pytest.raises(MediaProbeError, match="不含音频"):
+        supervisor._resolve_bili()
+
+
+def test_room_query_identity_is_distinct_and_does_not_save_raw_query(tmp_path):
+    supervisor = supervisor_at(tmp_path)
+    assert supervisor._bili_probe_key == "bili:0"
+    keys = []
+    for room in ("first-room", "second-room"):
+        supervisor.config.bili_room_url = f"https://www.youtube.com/watch?v={room}&token=private"
+        keys.append(supervisor._bili_probe_key)
+        supervisor.request_offset_delta(100)
+    assert keys[0] != keys[1]
+    assert "first-room" not in supervisor.config.state_file.read_text()
+    assert "private" not in supervisor.config.state_file.read_text()
+    supervisor.config.bili_room_url = "https://cdn.example/live.m3u8?token=private"
+    assert supervisor._bili_probe_key == "bili:cdn.example/live.m3u8"
+
+
+def test_recovery_resolves_the_commentary_room_again(tmp_path, monkeypatch):
+    supervisor = supervisor_at(tmp_path, video_direct=True, auto_measure=False)
+    supervisor.config.bili_room_url = "https://www.huya.com/room"
+    supervisor.video = Source("https://video.example/live.flv", has_audio=True)
+    urls, restarts = [], []
+
+    def probe(source, **kwargs):
+        source.has_audio = True
+        return source
+
+    def resolve(url, *, validate):
+        urls.append(url)
+        return validate(Source(f"https://cdn.example/renewed-{len(urls)}.flv"))
+
+    supervisor.commentary_resolver = SimpleNamespace(resolve=resolve)
+    monkeypatch.setattr("footboy.supervisor.ffprobe_source", probe)
+    monkeypatch.setattr(supervisor.muxer, "restart", lambda *args: restarts.append(args))
+    supervisor.bili = supervisor._resolve_bili()
+    supervisor._start_refresh()
+    supervisor._refresh_thread.join(2)
+    action, result = supervisor._events.get(timeout=2)
+    assert action == "refresh_done"
+    supervisor._finish_refresh(*result)
+    assert urls == [supervisor.config.bili_room_url] * 2
+    assert restarts[0][1].url.endswith("renewed-2.flv")
 
 
 def test_manual_offset_is_relative_and_debounced(tmp_path) -> None:

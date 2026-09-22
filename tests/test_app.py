@@ -27,7 +27,11 @@ def body(**changes):
     [
         {"video_url": "file:///etc/passwd"},
         {"video_url": "http://x.invalid:70000/"},
-        {"bili_url": "https://evil.example/live.bilibili.com/123"},
+        {"bili_url": "file:///etc/passwd"},
+        {"bili_url": "https://user:password@live.example/room"},
+        {"bili_url": "https://live.example:70000/room"},
+        {"commentary_url": "https://live.example/room"},
+        {"commentary_direct": "false"},
         {"auto_measure": "false"},
         {"video_no_proxy": "false"},
         {"video_line_text": ["高清直播5"]},
@@ -56,6 +60,59 @@ def test_direct_mode_carries_cookie_header_and_manual_mode(tmp_path) -> None:
     assert config.video_headers["Cookie"] == "sid=abc"
     assert config.initial_offset == -12.5
     assert config.auto_measure is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.douyu.com/12345",
+        "https://www.huya.com/example",
+        "https://www.twitch.tv/example",
+        "https://www.youtube.com/watch?v=example",
+        "https://live.bilibili.com/12345",
+        "https://live.example/room",
+        "https://cdn.example/live.m3u8?sign=temporary",
+    ],
+)
+@pytest.mark.parametrize("key", ["commentary_url", "bili_url"])
+def test_commentary_accepts_other_platforms_with_new_and_legacy_fields(tmp_path, url, key):
+    config = session_config(
+        defaults(tmp_path), {"video_url": "https://video.example/match", key: url}
+    )
+    assert config.bili_room_url == url
+    assert not config.bili_direct
+
+
+def test_commentary_aliases_carry_direct_mode_headers_and_defaults(tmp_path):
+    config = defaults(tmp_path)
+    config.bili_direct = True
+    config.bili_headers = {"Referer": "https://www.huya.com/"}
+    values = {
+        "video_url": "https://video.example/match",
+        "commentary_url": "https://cdn.example/live.m3u8",
+    }
+    result = session_config(config, values)
+    assert result.bili_direct
+    assert result.bili_headers == config.bili_headers
+    result = session_config(
+        config,
+        {**values, "commentary_direct": False, "commentary_headers": {"Cookie": "sid=fixture"}},
+    )
+    assert not result.bili_direct
+    assert result.bili_headers == {"Cookie": "sid=fixture"}
+    assert Application(config).public_status()["defaults"]["commentary_direct"] is True
+
+
+@pytest.mark.parametrize(
+    ("new", "legacy"),
+    [
+        ({"commentary_direct": False}, {"bili_direct": True}),
+        ({"commentary_headers": {"Cookie": "sid=first"}}, {"bili_headers": {}}),
+    ],
+)
+def test_conflicting_commentary_aliases_are_rejected(tmp_path, new, legacy):
+    with pytest.raises(ValueError):
+        session_config(defaults(tmp_path), body(**new, **legacy))
 
 
 def test_video_proxy_setting_inherits_cli_default_and_allows_web_override(tmp_path) -> None:

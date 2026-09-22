@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,6 +11,20 @@ from footboy.i18n import tr
 # FFmpeg only uses http:// proxy URLs; this non-HTTP marker forces direct access
 # while surviving that propagation, unlike an empty http_proxy option.
 DIRECT_HTTP_PROXY = "direct://"
+
+
+def merge_headers(*mappings: Mapping[str, str] | None) -> dict[str, str]:
+    """Combine request headers case-insensitively, with later values winning."""
+    result: dict[str, str] = {}
+    names: dict[str, str] = {}
+    for mapping in mappings:
+        for name, value in (mapping or {}).items():
+            previous = names.get(name.lower())
+            if previous is not None:
+                result.pop(previous)
+            names[name.lower()] = name
+            result[name] = value
+    return result
 
 
 @dataclass(slots=True)
@@ -25,6 +40,25 @@ class Source:
     has_audio: bool | None = None
     line_text: str | None = None
     no_proxy: bool = False
+    reader_factory: Callable[[], Source] | None = field(default=None, repr=False, compare=False)
+
+    def for_reader(self) -> Source:
+        """Obtain a separate signed URL for providers that forbid sharing one."""
+        if self.reader_factory is None:
+            return self
+        fresh = self.reader_factory()
+        return replace(
+            fresh,
+            reader_factory=None,
+            kind=fresh.kind if fresh.kind != "unknown" else self.kind,
+            video_codec=fresh.video_codec or self.video_codec,
+            width=fresh.width or self.width,
+            height=fresh.height or self.height,
+            audio_codec=fresh.audio_codec or self.audio_codec,
+            has_audio=fresh.has_audio if fresh.has_audio is not None else self.has_audio,
+            line_text=self.line_text,
+            no_proxy=self.no_proxy,
+        )
 
     @property
     def user_agent(self) -> str:
@@ -41,35 +75,40 @@ class Source:
                 return value
         return None
 
-    def cookie_header(self) -> str:
+    def _cookie_matches(self, item: dict[str, Any]) -> bool:
         parsed = urlparse(self.url)
         host, path = parsed.hostname or "", parsed.path or "/"
+        domain = str(item.get("domain") or host).lstrip(".").lower()
+        cookie_path = str(item.get("path") or "/")
+        return (
+            (host == domain or host.endswith("." + domain))
+            and (path == cookie_path or path.startswith(cookie_path.rstrip("/") + "/"))
+            and (not item.get("secure") or parsed.scheme == "https")
+        )
 
-        def matches(item: dict[str, Any]) -> bool:
-            domain = str(item.get("domain") or host).lstrip(".")
-            cookie_path = str(item.get("path") or "/")
-            return (
-                (host == domain or host.endswith("." + domain))
-                and (path == cookie_path or path.startswith(cookie_path.rstrip("/") + "/"))
-                and (not item.get("secure") or parsed.scheme == "https")
-            )
-
+    def cookie_header(self) -> str:
         return "; ".join(
             f"{item['name']}={item['value']}"
             for item in self.cookies
-            if item.get("name") and item.get("value") is not None and matches(item)
+            if item.get("name") and item.get("value") is not None and self._cookie_matches(item)
         )
 
     def ffmpeg_cookies(self) -> str:
         lines = []
         parsed = urlparse(self.url)
-        for item in self.cookies:
+        # libavformat's redirect jar keys cookies by name. Put the current
+        # source's cookies last so unrelated sites cannot replace its session.
+        for item in sorted(self.cookies, key=self._cookie_matches):
             name, value = item.get("name"), item.get("value")
             if not name or value is None:
                 continue
             path = str(item.get("path") or "/")
             domain = str(item.get("domain") or self.domain)
-            lines.append(f"{name}={value}; path={path}; domain={domain};")
+            # HTTP proxies make libavformat compare cookie paths against an
+            # absolute request URI. Omitting the root path preserves its scope
+            # while allowing the same cookie to work with and without a proxy.
+            scope = f"path={path}; " if path != "/" else ""
+            lines.append(f"{name}={value}; {scope}domain={domain};")
             host = (parsed.hostname or "").lower()
             cookie_domain = domain.lstrip(".").lower()
             if parsed.port is not None and (
@@ -81,7 +120,7 @@ class Source:
                 authority = (
                     f"[{domain}]" if ":" in domain and not domain.startswith("[") else domain
                 )
-                lines.append(f"{name}={value}; path={path}; domain={authority}:{parsed.port};")
+                lines.append(f"{name}={value}; {scope}domain={authority}:{parsed.port};")
         return "\r\n".join(lines) + ("\r\n" if lines else "")
 
     def ffmpeg_headers(self, *, include_cookies: bool = True) -> str:
@@ -127,4 +166,8 @@ class Source:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # Runtime resolver callbacks may hold locks and credentials; they are
+        # intentionally absent from both serialized and public source data.
+        value = asdict(replace(self, reader_factory=None))
+        value.pop("reader_factory")
+        return value

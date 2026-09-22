@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 import math
 import queue
@@ -22,8 +23,8 @@ from footboy.probe.ocr import OcrProgress, ProbeConfig, StoppedClock
 from footboy.probe.offset import MeasurementError, OffsetMeasurement, measure_offset
 from footboy.probe.timeline import TimelineProbeError, estimate_initial_offset
 from footboy.serve.http import ControlServer
-from footboy.sources.bili import BiliResolver
 from footboy.sources.lines import validate_line_text
+from footboy.sources.live import LiveResolveError, LiveResolver, cookies_as_dicts, direct_kind
 from footboy.sources.media_probe import MediaProbeError, ffprobe_source
 from footboy.sources.models import Source
 from footboy.sources.sniffer import StreamSniffer
@@ -69,7 +70,15 @@ class Supervisor:
         self.store = StateStore(config.state_file)
         self._stop = threading.Event()
         self.muxer = FfmpegMuxer(config.output_dir, ffmpeg=config.ffmpeg, stop_event=self._stop)
-        self.bili_resolver = BiliResolver(config.cookies_file)
+        self.commentary_resolver = LiveResolver(
+            cookies_file=config.cookies_file, headers=config.bili_headers, stop_event=self._stop
+        )
+        self.commentary_sniffer = StreamSniffer(
+            ffprobe=config.ffprobe,
+            timeout=120,
+            headers=config.bili_headers,
+            require_audio=True,
+        )
         self.sniffer = StreamSniffer(ffprobe=config.ffprobe, no_proxy=config.video_no_proxy)
         self.video: Source | None = None
         self.bili: Source | None = None
@@ -132,6 +141,7 @@ class Supervisor:
         finally:
             self._stop.set()
             self.sniffer.stop()
+            self.commentary_sniffer.stop()
             self._measurement_cancel.set()
             self.muxer.stop()
             for worker in (self._measurement_thread, self._refresh_thread):
@@ -145,6 +155,7 @@ class Supervisor:
     def stop(self) -> None:
         self._stop.set()
         self.sniffer.stop()
+        self.commentary_sniffer.stop()
         self._measurement_cancel.set()
         self._events.put(("stop", None))
         if self.phase not in {"STOPPED", "ERROR"}:
@@ -175,7 +186,8 @@ class Supervisor:
         self._events.put(("resniff", None))
 
     def request_select_source(self, identifier: int | None) -> None:
-        self.sniffer.select(identifier)
+        sniffer = self.commentary_sniffer if self.commentary_sniffer.running else self.sniffer
+        sniffer.select(identifier)
 
     def request_switch_line(self, text: str) -> None:
         text = validate_line_text(text)
@@ -243,10 +255,13 @@ class Supervisor:
                 ),
                 "video": self.video.public_dict() if self.video else None,
                 "bili": self.bili.public_dict() if self.bili else None,
+                "commentary": self.bili.public_dict() if self.bili else None,
                 "auto_measure": self.config.auto_measure,
                 "video_direct": self.config.video_direct,
                 "source_switching": self._line_switch_pending or self._refresh_thread is not None,
-                "sniffer": self.sniffer.public_status(),
+                "sniffer": (
+                    self.commentary_sniffer if self.commentary_sniffer.running else self.sniffer
+                ).public_status(),
                 "measurement": {
                     "running": self._measurement_thread is not None,
                     "needs_roi": list(self._needs_roi),
@@ -267,7 +282,7 @@ class Supervisor:
     @property
     def _offset_key(self) -> str:
         domain = urlsplit(self.config.video_page_url).hostname or "unknown"
-        return f"{_bili_room_id(self.config.bili_room_url)}@{domain.lower()}"
+        return f"{self._commentary_identity}@{domain.lower()}"
 
     @property
     def _video_probe_key(self) -> str:
@@ -275,24 +290,75 @@ class Supervisor:
 
     @property
     def _bili_probe_key(self) -> str:
-        return f"bili:{_bili_room_id(self.config.bili_room_url)}"
+        return f"bili:{self._commentary_identity}"
+
+    @property
+    def _commentary_identity(self) -> str:
+        url = self.config.bili_room_url
+        identity = _bili_room_id(url)
+        parts = urlsplit(url)
+        # Keep historical Bilibili/direct-link keys, but distinguish rooms
+        # identified by a query (e.g. YouTube /watch?v=...) without saving it.
+        if (
+            parts.query
+            and parts.hostname != "live.bilibili.com"
+            and not self.config.bili_direct
+            and direct_kind(url) is None
+        ):
+            identity += "?" + hashlib.sha256(parts.query.encode()).hexdigest()[:16]
+        return identity
 
     def _check_cancelled(self) -> None:
         if self._stop.is_set():
             raise RuntimeError(tr("Session cancelled"))
 
     def _resolve_bili(self) -> Source:
+        """Resolve commentary; retain the old method name for session compatibility."""
         self._check_cancelled()
-        source = (
-            _direct_source(self.config.bili_room_url, self.config.bili_headers)
-            if self.config.bili_direct
-            else self.bili_resolver.resolve(self.config.bili_room_url)
-        )
+        if self.config.bili_direct:
+            source = _direct_source(self.config.bili_room_url, self.config.bili_headers)
+            source.cookies = cookies_as_dicts(self.config.cookies_file)
+            return self._validate_commentary(source)
+        try:
+            return self.commentary_resolver.resolve(
+                self.config.bili_room_url, validate=self._validate_commentary
+            )
+        except LiveResolveError as extract_error:
+            self._check_cancelled()
+            if direct_kind(self.config.bili_room_url) is not None:
+                raise
+            self._set_phase(
+                self.phase,
+                tr(
+                    "Opening the commentary page to discover media; play the live stream in the browser"
+                ),
+            )
+            try:
+                self.commentary_sniffer.cookies = cookies_as_dicts(self.config.cookies_file)
+                source = self.commentary_sniffer.sniff(
+                    self.config.bili_room_url, headless=self.config.headless_sniff
+                )
+                self._check_cancelled()
+                return source
+            except Exception as browser_error:
+                self._check_cancelled()
+                raise LiveResolveError(
+                    _sanitize_ffmpeg_line(
+                        tr(
+                            "Cannot resolve the commentary stream. {0}; browser: {1}",
+                            exception_message(extract_error),
+                            exception_message(browser_error),
+                        )
+                    )
+                ) from None
+
+    def _validate_commentary(self, source: Source) -> Source:
         self._check_cancelled()
         ffprobe_source(source, ffprobe=self.config.ffprobe)
+        self._check_cancelled()
         if not source.has_audio:
             raise MediaProbeError(
-                tr("The Bilibili input has no audio; choose another room or direct media URL")
+                tr("The commentary input has no audio; choose another room or direct media URL")
             )
         return source
 
@@ -323,7 +389,7 @@ class Supervisor:
         return source
 
     def _bootstrap(self) -> None:
-        self._set_phase("RESOLVE", tr("Resolving and validating the Bilibili live stream"))
+        self._set_phase("RESOLVE", tr("Resolving and validating the commentary live stream"))
         self.bili = self._resolve_bili()
         self._check_cancelled()
         self._set_phase(
@@ -932,9 +998,7 @@ class Supervisor:
 
 
 def _direct_source(url: str, headers: dict[str, str]) -> Source:
-    path = urlsplit(url).path.lower()
-    kind = "hls" if ".m3u8" in path else "flv" if ".flv" in path else "unknown"
-    return Source(url=url, headers=dict(headers), kind=kind)
+    return Source(url=url, headers=dict(headers), kind=direct_kind(url) or "unknown")
 
 
 def _bili_room_id(url: str) -> str:

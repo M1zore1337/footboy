@@ -35,6 +35,7 @@ def capture_pcm(source: Source, *, duration: float = 90.0, sample_rate: int = 80
     except ImportError as exc:
         raise AudioCorrelationError(tr("PyAV is not installed")) from exc
     try:
+        source = source.for_reader()
         container = av.open(source.url, options=source.pyav_options())
     except Exception as exc:
         raise AudioCorrelationError(

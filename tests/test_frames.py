@@ -50,3 +50,19 @@ def test_pts_reset_during_capture_is_rejected_and_container_closed(monkeypatch):
     with pytest.raises(FrameProbeError, match="PTS 回退"):
         list(keyframes(Source("https://cdn.example/live.flv"), max_frames=4))
     assert closed == [True]
+
+
+def test_each_ocr_capture_opens_its_own_signed_url(monkeypatch):
+    closed, opened, _ = install_decoder(monkeypatch, [9000000])
+    counter = []
+
+    def fresh():
+        counter.append(True)
+        return Source(f"https://cdn.example/{len(counter)}.flv", headers={"Cookie": "sid=fixture"})
+
+    source = Source("https://cdn.example/consumed.flv", reader_factory=fresh)
+    assert list(keyframes(source, max_frames=1))
+    assert list(keyframes(source, max_frames=1))
+    assert [url for url, _ in opened] == ["https://cdn.example/1.flv", "https://cdn.example/2.flv"]
+    assert opened[1][1]["options"]["headers"] == "Cookie: sid=fixture\r\n"
+    assert len(closed) == 2

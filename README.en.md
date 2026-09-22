@@ -8,7 +8,7 @@
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Platform: Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#watching-on-other-devices)
 
-Synchronize football video from a match website with live commentary from Bilibili, then watch the combined HLS stream on your local network.
+Synchronize football video from a match website with live commentary from Bilibili, Douyu, Huya, and other platforms, then watch the combined HLS stream on your local network.
 
 ![Footboy console in English](docs/images/webui-en-1440.png)
 
@@ -23,10 +23,11 @@ Screenshots show the console before connecting any streams, with English selecte
 
 Footboy grew out of a simple viewing habit: watching a match on one website while listening to a favorite Bilibili commentator. The two streams can be seconds or tens of seconds apart, and manual alignment often drifts. Footboy reads the match clocks with OCR, calculates the difference between the source timelines, and combines the video and audio for phones, tablets, TVs, or desktop players.
 
-Live testing has focused on the match websites and Bilibili rooms used by the author. Compatibility with other sites and platforms varies.
+Earlier live testing focused on the match websites and Bilibili rooms used by the author. Douyu and Huya have now also been checked for extraction and continuous mixing; see the [validation report](docs/validation/validation-commentary-platforms-2026-09-22.md). Availability depends on the room's live status, access requirements, and upstream extractors. See [Commentary platforms and access](#commentary-platforms-and-access).
 
 ## Features
 
+- **Commentary from multiple platforms:** retain dedicated Bilibili extraction, use Streamlink and yt-dlp for Douyu, Huya, and other platforms, and offer browser discovery and HTTP(S) media URL input.
 - **Original video quality:** copy the video stream without re-encoding; convert audio to AAC as needed.
 - **Automatic or manual sync:** read both match clocks with OCR, select a clock region interactively, and adjust audio by ±0.1, ±0.5, or ±2 seconds.
 - **Manual adjustments take priority:** repeated clicks apply together after a 1.5-second pause. Periodic OCR checks do not overwrite a manual offset.
@@ -39,7 +40,7 @@ Live testing has focused on the match websites and Bilibili rooms used by the au
 flowchart TD
     subgraph Input ["1. Live sources"]
         V["Match page / direct media URL<br/>(video)"]
-        B["Bilibili room / direct media URL<br/>(commentary)"]
+        B["Bilibili / Douyu / Huya / other room or media URL<br/>(commentary)"]
     end
     subgraph Core ["2. Synchronization and muxing"]
         OCR["Read match clocks with OCR<br/>(automatic detection or selected region)"]
@@ -68,6 +69,7 @@ flowchart TD
 - [Choosing a language](#choosing-a-language)
 - [External dependencies](#external-dependencies)
 - [Connecting and synchronizing](#connecting-and-synchronizing)
+- [Commentary platforms and access](#commentary-platforms-and-access)
 - [Watching on other devices](#watching-on-other-devices)
 - [Troubleshooting](#troubleshooting)
 - [How synchronization works](#how-synchronization-works)
@@ -111,9 +113,11 @@ Run the launcher from the repository checkout. **The first launch sets up the en
 .\setup.bat
 ```
 
-The scripts check Python 3.10+, FFmpeg 6.0+ and ffprobe, create a local `.venv`, install Footboy with the Tesseract Python interface and Playwright Chromium, and launch a headless browser to verify the installation. **Install the FFmpeg and Tesseract executables as described above**, or place them in `tools/`. Missing Tesseract does not prevent manual synchronization.
+The scripts check Python 3.10+, FFmpeg 6.0+ and ffprobe, create a local `.venv`, install Footboy, Streamlink, yt-dlp, the Tesseract Python interface, and Playwright Chromium, and launch a headless browser to verify the installation. **Install the FFmpeg and Tesseract executables as described above**, or place them in `tools/`. Missing Tesseract does not prevent manual synchronization.
 
 Later launches reuse the environment. Changes to `pyproject.toml`, missing dependencies or a missing Chromium installation trigger setup again. Rerun after an interrupted installation; run the setup script explicitly to reinstall and check the environment. Activation is unnecessary, and source changes take effect on the next launch.
+
+When upgrading from an older version, the launch scripts install the new Streamlink dependency automatically. For a manual installation, activate the existing virtual environment and rerun `python -m pip install -e ".[tesseract]"` from the repository root. If a platform changes its player and extraction stops working, use `python -m pip install --upgrade -e ".[tesseract]" streamlink yt-dlp` to update the extractors while retaining the project's compatibility constraints.
 
 ```bash
 ./start.sh --lang en --host 127.0.0.1 --port 8090
@@ -245,8 +249,8 @@ footboy --lang en \
 
 ## Connecting and synchronizing
 
-1. **Enter both sources.** Supply the match page URL and the Bilibili live room URL. For a direct m3u8 or FLV URL, enable the corresponding direct-media option under **Direct URLs and initial offset**.
-2. **Select Connect and watch.** Footboy opens Chromium on the host computer to discover media requests and capture the required cookies. It also handles streams embedded in iframes.
+1. **Enter both sources.** Supply the match page URL and a commentary room URL, such as Bilibili, Douyu, or Huya. For a direct m3u8 or FLV URL, enable the corresponding direct-media option under **Direct URLs and initial offset**.
+2. **Select Connect and watch.** Footboy first tries platform extractors for commentary. When browser discovery is needed, it opens Chromium on the host computer to discover media requests and capture the required cookies. It also handles streams embedded in iframes.
 3. **Align the clocks.** If both streams show the same running match clock clearly, OCR can determine their timeline offset automatically. If detection fails, choose the correct orientation, drag around the complete clock, and select **Save and remeasure**. Single-frame readings are shown separately from the required consecutive-frame validation.
 4. **Fine-tune audio timing.** If commentary is ahead of the video, use **+0.1s / +0.5s / +2s** to delay it. If commentary is behind, use **−0.1s / −0.5s / −2s** to advance it. Repeated clicks apply together after a 1.5-second pause.
 5. **Adjust audio or change streams.** Control commentary and original match audio independently. Choose another match stream when needed; Footboy validates it before replacing the current input.
@@ -258,6 +262,33 @@ After a manual adjustment, periodic OCR checks offer suggestions without replaci
 - A new random control token is generated at every startup. Control APIs, status requests, and frame snapshots require it.
 - Opening a `#token=...` link stores the token in session storage and removes the fragment from the address bar.
 - Browser control requests must come from the same origin. The HLS URL, `/live.m3u8`, requires no token so that TVs and external players can use it directly.
+
+## Commentary platforms and access
+
+Bilibili keeps its dedicated resolver. Other commentary rooms are tried with Streamlink, then yt-dlp, followed by Chromium browser discovery when extraction cannot find a usable stream. The [Streamlink plugin list](https://streamlink.github.io/plugins.html) and [yt-dlp site list](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md) describe upstream coverage. Footboy still needs an HTTP(S) stream that FFmpeg can read and that includes both video and audio.
+
+| Input | Example | How to use it |
+| --- | --- | --- |
+| Bilibili room | `https://live.bilibili.com/ROOM_ID` | Enter it as the commentary URL |
+| Douyu room | `https://www.douyu.com/ROOM_ID` | Enter it as the commentary URL |
+| Huya room | `https://www.huya.com/ROOM_ID` | Enter it as the commentary URL; room aliases may also work |
+| Another live platform | The full room page URL | Footboy attempts extraction or browser discovery |
+| Direct media | `https://media.example.com/live.m3u8` / `live.flv` | Enable direct media for commentary, or add `--commentary-direct` |
+
+Replace `ROOM_ID` with an actual room that is currently live. For example:
+
+```bash
+footboy --lang en --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
+  --commentary-room "https://www.douyu.com/ROOM_ID"
+
+footboy --lang en --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
+  --commentary-room "https://www.huya.com/ROOM_ID" \
+  --commentary-cookies cookies.txt
+```
+
+`--commentary-cookies` accepts a Netscape-format cookie file for sources that require your existing login session. To provide request headers such as `Referer` or `User-Agent`, pass a `commentary_headers` object to `POST /api/start`. The direct-media tool accepts repeated `--commentary-header 'Name:Value'` options. Browser discovery also captures cookies and headers from actual media requests.
+
+Support does not guarantee that every platform or room will play. Offline rooms, expired signed URLs, regional or login restrictions, anti-bot measures, and extractor gaps can prevent access. Streams available only through DRM or WebRTC are unsupported. Confirm playback in a browser on the Footboy host, then update the extractors, provide valid cookies, or use an accessible media URL as needed. Commentary must currently include both video and audio; audio-only streams are unsupported. If the commentary video has no matching match clock, disable automatic measurement with `--no-auto-measure` and align manually.
 
 ## Watching on other devices
 
@@ -304,6 +335,7 @@ On macOS, check **System Settings → Network → Firewall**. Allow Python to re
 | FFmpeg or ffprobe cannot be found | Missing installation or PATH entry | Install them, or pass `--ffmpeg` / `--ffprobe`; verify with `footboy --lang en --check` |
 | Tesseract or its model is missing | OCR engine or English language data is absent | Install Tesseract with `eng.traineddata`, use `--ocr rapidocr` on a supported Python version, or start with `--no-auto-measure` |
 | A browser opens when connecting | The source requires dynamic media URLs and cookies | This is the stream discovery browser; use `--headless-sniff` on a server without a desktop, where page interaction is unavailable |
+| A Douyu, Huya, or other commentary URL fails | The room is offline, the extractor is outdated, or access requirements are unmet | Confirm playback in the host browser; update `streamlink` / `yt-dlp`, provide `--commentary-cookies` if login is needed, or use an accessible media URL |
 | OCR stays “Not aligned” | The clock is obscured, stopped, or difficult to read | Confirm both streams show the same running match clock; select the full clock region, or align manually |
 | HEVC does not play on a TV or browser | Decoder support varies | Choose an H.264 stream, or use a player with suitable hardware/software decoding |
 | Another device cannot open the console or stream | Host firewall or network isolation | Allow TCP port 8080 and confirm both devices are on the same LAN |
@@ -317,7 +349,7 @@ match clock = source PTS + K
 D = K_B - K_V
 ```
 
-Here, `V` is the match video and `B` is the Bilibili commentary source. FFmpeg applies `-itsoffset D` to the Bilibili input: **positive values delay audio; negative values advance it**. Switching streams can change the source PTS origin, so the baseline must be measured again.
+Here, `V` is the match video and `B` is the commentary source. FFmpeg applies `-itsoffset D` to the commentary input: **positive values delay audio; negative values advance it**. Switching streams can change the source PTS origin, so the baseline must be measured again.
 
 ## Command-line options
 
@@ -326,40 +358,43 @@ You can launch an empty console or provide both sources on startup:
 ```bash
 footboy --lang en \
   --video-page "$FOOTBOY_VIDEO_PAGE_URL" \
-  --bili-room "$FOOTBOY_BILI_ROOM_URL"
+  --commentary-room "$FOOTBOY_COMMENTARY_ROOM_URL"
 ```
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `--lang {zh-CN,en}` | `zh-CN` | CLI language; overrides `FOOTBOY_LANG` |
 | `--video-page URL` | — | Match page URL |
-| `--bili-room URL` | — | Bilibili live room URL; provide together with `--video-page` |
+| `--commentary-room URL` | — | Commentary room URL; provide together with `--video-page` |
 | `--video-line "LABEL"` | — | Select the label as shown on the match page; circled numbers are supported |
 | `--video-direct` | `false` | Treat the match URL as a direct media URL |
-| `--bili-direct` | `false` | Treat the commentary URL as a direct media URL |
+| `--commentary-direct` | `false` | Treat the commentary URL as a direct media URL |
 | `--video-no-proxy` | `false` | Bypass proxies for the match source |
 | `--headless-sniff` | `false` | Discover streams without showing a browser window |
 | `--ocr {auto,rapidocr,tesseract}` | `auto` | OCR backend |
 | `--tesseract-command PATH` | `tesseract` | Custom Tesseract executable |
 | `--no-auto-measure` | `false` | Disable startup and periodic automatic OCR |
 | `--offset SECONDS` | — | Initial signed audio offset; positive values delay commentary |
-| `--bili-cookies FILE` | — | Netscape-format cookie file |
+| `--commentary-cookies FILE` | — | Netscape-format cookie file for the commentary source |
 | `--ffmpeg PATH` / `--ffprobe PATH` | `ffmpeg` / `ffprobe` | Custom executables |
 | `--host HOST` / `--port PORT` | `0.0.0.0` / `8080` | Console listen address and port |
 | `--state-file FILE` | `state.json` | Persist clock regions, orientation, and offsets |
 | `--output-dir DIR` | `hls_out` | HLS output directory |
 | `--check` | — | Check FFmpeg and ffprobe, then exit |
 
+The legacy options `--bili-room`, `--bili-direct`, and `--bili-cookies` remain equivalent aliases and can also be used with other platforms.
+
 For direct-stream validation:
 
 ```bash
 footboy-p0 --lang en \
   --video-url "http://example.invalid/video.m3u8" \
-  --bili-url "http://example.invalid/audio.m3u8" \
+  --commentary-url "http://example.invalid/audio.m3u8" \
+  --commentary-header "Referer:https://www.huya.com/ROOM_ID" \
   --offset 1.5
 ```
 
-Replace the example URLs with your actual media sources.
+Replace the example URLs with your actual media sources. The legacy `footboy-p0` options `--bili-url` and `--bili-header` remain supported.
 
 ## Control API and offline diagnostics
 
@@ -371,7 +406,7 @@ Every `/api/*` request requires `Authorization: Bearer <current-control-token>`.
 | Endpoint | Purpose or request body |
 | --- | --- |
 | `GET /api/status` | Session state, sources, OCR results, and current offset |
-| `POST /api/start` | Required: `video_url`, `bili_url`. Optional: `video_direct`, `bili_direct`, `video_no_proxy`, `video_line_text`, `auto_measure`, `offset_seconds`, `video_headers`, `bili_headers` |
+| `POST /api/start` | Required: `video_url`, `commentary_url`. Optional: `video_direct`, `commentary_direct`, `video_no_proxy`, `video_line_text`, `auto_measure`, `offset_seconds`, `video_headers`, `commentary_headers` |
 | `POST /api/stop` | Stop the current session |
 | `POST /api/offset` | `{"delta_ms":500}` adjusts the current offset in milliseconds |
 | `POST /api/remeasure` | Capture new frames and realign with OCR |
@@ -382,6 +417,8 @@ Every `/api/*` request requires `Authorization: Bearer <current-control-token>`.
 | `POST /api/roi` | `{"source":"video","roi":[0.1,0.1,0.2,0.1],"flip":"none","inverted":false}` |
 | `GET /api/snapshot/{video,bili}.jpg` | Latest captured frame |
 | `GET /api/ocr/{video,bili}/{crop,processed}.png?v=VERSION` | Latest OCR crop or preprocessed image |
+
+`POST /api/start` also accepts the legacy `bili_url`, `bili_direct`, and `bili_headers` fields for any commentary platform. Status, snapshot, ROI, and saved settings retain their `bili` identifiers for compatibility.
 
 </details>
 
@@ -406,7 +443,7 @@ The tool records candidate priorities, crop and preprocessing PNGs, raw OCR text
 
 H.264 video uses MPEG-TS HLS segments; HEVC uses fMP4 HLS. Safari can use native playback; other supported browsers use the bundled `hls.js` player when available.
 
-The test suite covers authentication, PTS calculations, stopped clocks, cookie handling, state recovery, media processing, and browser workflows. Localization checks cover CLI selection, per-client API messages, language persistence, and preserving active edits while switching languages.
+The 500+ tests cover platform extraction, authentication, PTS calculations, stopped clocks, cookie handling, state recovery, media processing, and browser workflows. Localization checks cover CLI selection, per-client API messages, language persistence, and preserving active edits while switching languages. Real Douyu/Huya mixing and concurrent frame sampling are documented in the [platform validation report](docs/validation/validation-commentary-platforms-2026-09-22.md).
 
 Historical validation reports are retained in Chinese:
 

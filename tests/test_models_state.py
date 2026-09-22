@@ -23,9 +23,40 @@ def test_source_serializes_request_context_without_duplicate_user_agent() -> Non
     assert source.ffmpeg_headers() == (
         "Referer: https://page.example/\r\nOrigin: https://page.example\r\nCookie: sid=abc\r\n"
     )
-    assert source.ffmpeg_cookies() == "sid=abc; path=/; domain=.example;\r\n"
+    assert source.ffmpeg_cookies() == "sid=abc; domain=.example;\r\n"
     assert "secret" not in json.dumps(source.public_dict())
     assert "abc" not in json.dumps(source.public_dict())
+
+
+def test_reader_factory_keeps_verified_metadata_and_is_never_serialized():
+    issued = []
+
+    def issue():
+        source = Source(f"https://cdn.example/{len(issued)}.flv", headers={"X-Token": "new"})
+        issued.append(source)
+        return source
+
+    original = Source(
+        "https://cdn.example/consumed.flv",
+        kind="flv",
+        video_codec="h264",
+        audio_codec="aac",
+        width=1920,
+        height=1080,
+        has_audio=True,
+        no_proxy=True,
+        reader_factory=issue,
+    )
+    first, second = original.for_reader(), original.for_reader()
+    assert first.url != second.url != original.url
+    assert first.video_codec == "h264" and first.audio_codec == "aac" and first.has_audio
+    assert first.kind == "flv" and first.no_proxy and first.width == 1920
+    assert first.header("X-Token") == "new"
+    assert first.for_reader() is first and second.reader_factory is None
+    assert len(issued) == 2
+    assert "reader_factory" not in original.to_dict()
+    assert "reader_factory" not in original.public_dict()
+    assert json.loads(json.dumps(original.to_dict()))["url"] == original.url
 
 
 def test_state_store_round_trip(tmp_path) -> None:

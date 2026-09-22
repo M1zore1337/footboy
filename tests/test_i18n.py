@@ -65,7 +65,9 @@ def test_cli_english_errors_include_translated_nested_causes(monkeypatch, capsys
     with pytest.raises(SystemExit) as error:
         main(["--lang", "en", "--video-page", "https://example.invalid/match"])
     assert error.value.code == 2
-    assert "Provide both --video-page and --bili-room, or omit both" in capsys.readouterr().err
+    assert (
+        "Provide both --video-page and --commentary-room, or omit both" in capsys.readouterr().err
+    )
 
 
 def test_worker_messages_can_be_rendered_concurrently_without_changing_user_data():
